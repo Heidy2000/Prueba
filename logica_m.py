@@ -49,12 +49,6 @@ COLS_REGLAS = ["orden", "patron", "proveedor", "concepto", "confianza", "observa
 # placa colombiana estándar: carro/moto/volqueta (ABC123), remolque antiguo (123ABC) y moto (ABC12D)
 PLACA_ESTANDAR = re.compile(r"^(?:[A-Z]{3}\d{3}|\d{3}[A-Z]{3}|[A-Z]{3}\d{2}[A-Z])$")
 
-# columnas que acompañan a cada movimiento (si existen) para rastrear el valor hasta SAP
-COLS_DETALLE = ["clave", "fecha", "anio", "mes", "documento", "tercero", "texto", "cuenta", "cuenta_nombre", "cc",
-                "cc_nombre", "codigo", "rubro", "sub_rubro_sap", "sub_rubro", "placa_detectada", "placa", "placa_estado",
-                "concepto", "ambito", "concepto_sugerido", "confianza", "regla", "tipo_clasif", "origen", "llave", "valor"]
-
-
 # ================================================================== texto y placas
 def sin_tildes(x) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", str(x)) if unicodedata.category(c) != "Mn")
@@ -1635,7 +1629,7 @@ SISPO_REQUERIDAS = {                            # clave normalizada de la column
 # faltan: el IdKardex se reemplaza por «FILA-n» (n = número de fila del Excel, único y estable) y la referencia queda vacía, o sea
 # PENDIENTE DE CLASIFICACIÓN. La pantalla bloquea la aplicación y `_sispo_aplicar` rechaza los identificadores «FILA-n».
 SISPO_OPCIONALES = {"CIERRE": "cierre", "EMPRESAAGENCIA": "empresa_txt", "TIPOMOVIMIENTO": "tipo_mov",
-                    "IDKARDEX": "id_kardex", "CODIGOARTICULO": "codigo"}
+                    "IDKARDEX": "id_kardex", "CODIGOARTICULO": "codigo", "GRUPO": "grupo", "CONCEPTO": "concepto"}
 PREFIJO_ID_SINTETICO = "FILA-"
 
 
@@ -1703,7 +1697,7 @@ def sispo_leer(archivo) -> pd.DataFrame:
     if faltan:
         raise ValueError("Al SISPO le faltan columnas: " + ", ".join(faltan) + ".")
     d = pd.DataFrame({k: datos.iloc[:, i] for k, i in mapa.items()})
-    for c in ("cierre", "empresa_txt", "tipo_mov", "cc_nombre", "codigo"):
+    for c in ("cierre", "empresa_txt", "tipo_mov", "cc_nombre", "codigo", "grupo", "concepto"):
         if c not in d:
             d[c] = ""
     if "id_kardex" in d:
@@ -1711,7 +1705,7 @@ def sispo_leer(archivo) -> pd.DataFrame:
     else:                                                                     # sin IdKardex: id sintético = fila del Excel
         d["id_kardex"] = [f"{PREFIJO_ID_SINTETICO}{fila + 2 + k}" for k in range(len(d))]
         d = d[d["cuenta"].notna()].copy()                                     # sin id, una fila sin «Nombre Cta» está vacía
-    for c in ("id_kardex", "centro_costo", "cc_codigo", "cc_nombre", "cuenta", "bodega", "articulo", "empresa_txt", "tipo_mov"):
+    for c in ("id_kardex", "centro_costo", "cc_codigo", "cc_nombre", "cuenta", "bodega", "articulo", "empresa_txt", "tipo_mov", "grupo", "concepto"):
         d[c] = d[c].map(lambda x: " ".join(_como_texto(x).split()))
     d["codigo"] = d["codigo"].map(_cod_articulo)
     d["cierre"] = d["cierre"].map(lambda x: _como_texto(x).strip()[:-2] if re.fullmatch(r"\d+\.0", _como_texto(x).strip()) else _como_texto(x).strip())

@@ -6,9 +6,9 @@ Módulos (menú de la izquierda):
 - Flujo de caja:  flujo de caja calculado desde los movimientos de bancos de SAP, proyectado y detalle por tercero
 - Cartera:        cartera de usuarios: comparativo de un mes contra otro, edades, deterioro y castigo
 - Combustible:    relación de combustible de ALDC y ALSM
--Mantenimiento:    Detallado por placa de mantenimiento y combustible
+- Mantenimiento:  Detallado por placa de mantenimiento y combustible
 - Nómina:         presupuesto de personal vs nómina ejecutada (cargos, personas, conceptos)
-- Administración: carga de archivos, asignaciones, homologaciones y respaldo (solo el administrador)
+- Administración: carga de archivos (incluido el SISPO y los datos de Mantenimiento y Operaciones), asignaciones, homologaciones y respaldo (solo el administrador)
 """
 import os
 from pathlib import Path
@@ -29,6 +29,7 @@ import mod_nomina
 import mod_presupuesto
 import nomina
 import mod_mantenimiento
+import sispo_fuente
 import operaciones as Operaciones
 from ui import ADMIN, ahora
 
@@ -100,6 +101,7 @@ def conectar():
     CREATE TABLE IF NOT EXISTS cargas(fecha TEXT, usuario TEXT, tipo TEXT, archivo TEXT, detalle TEXT);
     """)
     con.crear_tablas(cartera.ddl(con.motor))
+    con.crear_tablas(sispo_fuente.ddl(con.motor))
 
     # columnas agregadas en versiones posteriores (bases creadas antes las reciben vacías)
     nuevas = {
@@ -157,7 +159,7 @@ MODULOS = [  # (nombre, ícono, sección del menú, función)
     ("Cartera", ":material/request_quote:", "Finanzas", mod_cartera.mostrar),
     ("Combustible", ":material/local_gas_station:", "Operación", mod_combustible.mostrar),
     ("Mantenimiento", ":material/build:", "Operación", mod_mantenimiento.mostrar),
-    ("Operaciones", ":material/build:", "Operación", Operaciones.mostrar),
+    ("Operaciones", ":material/engineering:", "Operación", Operaciones.mostrar),
     ("Nómina", ":material/badge:", "Talento humano", mod_nomina.mostrar),
     ("Administración", ":material/settings:", "Control", mod_admin.mostrar),
 ]

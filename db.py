@@ -18,7 +18,7 @@ import pandas as pd
 # tablas con identificador de fila (en SQLite es el rowid implícito; en PostgreSQL una columna id)
 CON_ID = ("ejecucion", "reglas_fijas", "cargas")
 # tablas que no van en el respaldo .db: pesadas y se rehacen cargando de nuevo los archivos de origen
-SIN_RESPALDO = ("cartera_archivo",)
+SIN_RESPALDO = ("cartera_archivo", "sispo_archivo")
 
 
 class Base:

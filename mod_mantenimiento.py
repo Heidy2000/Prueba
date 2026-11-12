@@ -1511,7 +1511,7 @@ GRUPO_CON, GRUPO_SIN = "Placas con presupuesto", "Otras placas"
 def _tab_ts(S):
     """Tecnomecánica y SOAT: dos conceptos independientes, cada uno con sus propios indicadores, grupos y detalle por placa."""
     if S.ts_scen.empty:
-        st.warning("Aún no hay presupuesto de Tecnomecánica y SOAT cargado. El administrador lo carga en «Datos base». "
+        st.warning("Aún no hay presupuesto de Tecnomecánica y SOAT cargado. El administrador lo carga en Administración, pestaña «Mantenimiento y Operaciones». "
                    "Mientras tanto se muestra solo la ejecución.", icon=":material/warning:")
     d = S.vistas["ts_placa_concepto"]
     t = pd.DataFrame({"concepto": L.CONCEPTOS_TS}).merge(
@@ -1784,6 +1784,51 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
     return res
 
 
+def admin_base_maestra(ctx):
+    """Carga de la base maestra de referencias y conceptos (se usa desde Administración)."""
+    _exigir_admin(ctx)
+    maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
+    if maestro.empty:
+        st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Codigo Articulo», «Articulo» y «CONCEPTO ASIGNADO».",
+                   icon=":material/warning:")
+    else:
+        st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} conceptos · última actualización "
+                f"{maestro['fecha'].max()}.".replace(",", "."), icon=":material/database:")
+    up_m = st.file_uploader("Base maestra (.xlsx): adjúntala la primera vez o cuando quieras actualizarla", type=["xlsx"],
+                            key="mt_sispo_up_maestro")
+    if up_m:
+        try:
+            nuevo, im = L.sispo_maestro_leer(up_m)
+        except Exception as e:
+            st.error(f"No pude leer la base maestra: {e}")
+            nuevo, im = None, None
+        if nuevo is not None:
+            if im["conflictos"]:
+                st.error(f"{len(im['conflictos'])} referencias tienen dos conceptos distintos en el archivo (no se adivina cuál): "
+                         + ", ".join(im["conflictos"][:10]), icon=":material/error:")
+            if im["sin_dato"]:
+                st.warning(f"{im['sin_dato']} filas sin código o sin concepto no se cargan.")
+            c_m1, c_m2 = st.columns([1, 2], vertical_alignment="center")
+            reemplazar = c_m2.checkbox("Reemplazar toda la base (borra las referencias que no estén en este archivo)", key="mt_sispo_reemplazar")
+            if c_m1.button(f"Cargar {len(nuevo)} referencias", key="mt_sispo_cargar_maestro", disabled=bool(im["conflictos"]),
+                           icon=":material/upload:"):
+                _sispo_cargar_maestro(ctx, nuevo, reemplazar, getattr(up_m, "name", "base maestra"))
+                st.success("Base maestra actualizada. Los periodos ya aplicados conservan sus conceptos hasta que los reasignes en Mantenimiento.")
+                st.rerun()
+
+
+def _sispo_elegir(ctx):
+    """El SISPO guardado en Administración que se va a procesar (el más reciente por defecto), o None si no hay."""
+    import sispo_fuente
+    g = sispo_fuente.listar(ctx.leer)
+    if g.empty:
+        return None
+    nombres = {(r.empresa, int(r.periodo)): f"{r.empresa} · {MESES_L[int(r.periodo) % 100 - 1].capitalize()} {int(r.periodo) // 100} · {r.archivo}"
+               for r in g.itertuples()}
+    clave = st.selectbox("SISPO guardado", list(nombres), format_func=nombres.get, key="mt_sispo_guardado")
+    return sispo_fuente.abrir(ctx.leer, *clave)
+
+
 def _sispo_panel(S):
     """Pantalla del proceso mensual: base maestra, SISPO del mes, validación, conciliación y aplicación. Solo administrador."""
     _exigir_admin(S.ctx)
@@ -1795,44 +1840,23 @@ def _sispo_panel(S):
         st.caption("Reemplaza el movimiento genérico «Salida de inventario <mes>» de SAP por el detalle de SISPO: una línea por referencia "
                    "y placa, con el concepto de la base maestra. Se hace CUENTA POR CUENTA (" + "; ".join(L.SISPO_CUENTAS) + "): cada "
                    "salida de SISPO solo se asigna a la cuenta de su propio «Nombre Cta» y reemplaza únicamente los genéricos de SAP "
-                   "de esa misma clase de coste. Cada mes se adjunta el SISPO de ESE mes; no se reutiliza el anterior. Una cuenta solo "
+                   "de esa misma clase de coste. Cada mes se usa el SISPO de ESE mes, cargado en Administración. Una cuenta solo "
                    "se aplica si su valor total de SISPO coincide al centavo con lo que SAP tiene como genérico (se compara solo por valor, "
                    "no por centro de coste); las que no cuadran quedan sin tocar y se informan.")
         maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
         st.markdown("**1. Base maestra de referencias y conceptos**")
         if maestro.empty:
-            st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Codigo Articulo», «Articulo» y «CONCEPTO ASIGNADO».",
+            st.warning("Aún no hay base maestra cargada: se carga en Administración, pestaña «Mantenimiento y Operaciones».",
                        icon=":material/warning:")
         else:
             st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} conceptos · última actualización "
                     f"{maestro['fecha'].max()}.".replace(",", "."), icon=":material/database:")
-        up_m = st.file_uploader("Base maestra (.xlsx): adjúntala la primera vez o cuando quieras actualizarla", type=["xlsx"],
-                                key="mt_sispo_up_maestro")
-        if up_m:
-            try:
-                nuevo, im = L.sispo_maestro_leer(up_m)
-            except Exception as e:
-                st.error(f"No pude leer la base maestra: {e}")
-                nuevo, im = None, None
-            if nuevo is not None:
-                if im["conflictos"]:
-                    st.error(f"{len(im['conflictos'])} referencias tienen dos conceptos distintos en el archivo (no se adivina cuál): "
-                             + ", ".join(im["conflictos"][:10]), icon=":material/error:")
-                if im["sin_dato"]:
-                    st.warning(f"{im['sin_dato']} filas sin código o sin concepto no se cargan.")
-                c_m1, c_m2 = st.columns([1, 2], vertical_alignment="center")
-                reemplazar = c_m2.checkbox("Reemplazar toda la base (borra las referencias que no estén en este archivo)", key="mt_sispo_reemplazar")
-                if c_m1.button(f"Cargar {len(nuevo)} referencias", key="mt_sispo_cargar_maestro", disabled=bool(im["conflictos"]),
-                               icon=":material/upload:"):
-                    _sispo_cargar_maestro(ctx, nuevo, reemplazar, getattr(up_m, "name", "base maestra"))
-                    st.success("Base maestra actualizada. Los periodos ya aplicados conservan sus conceptos hasta que los reasignes (abajo).")
-                    st.rerun()
         st.markdown("**2. SISPO del mes**")
-        up = st.file_uploader("SISPO del periodo que vas a procesar (.xlsx)", type=["xlsx"], key="mt_sispo_up")
+        up = _sispo_elegir(ctx)
         if up is None:
-            st.info("Adjunta el SISPO del mes. No se reutiliza el de meses anteriores.", icon=":material/upload_file:")
+            st.info("No hay SISPO guardado. Se carga en Administración, pestaña «Mantenimiento y Operaciones».", icon=":material/upload_file:")
         elif maestro.empty:
-            st.error("Primero carga la base maestra.")
+            st.error("Primero carga la base maestra (Administración, pestaña «Mantenimiento y Operaciones»).")
         else:
             try:
                 a = _sispo_analizar(S, up, maestro[["codigo", "articulo", "concepto"]])
@@ -2387,6 +2411,9 @@ def _admin_datos(ctx):
                 _admin_ts(ctx, e, oficial)
 
 
+admin_datos_base = _admin_datos            # lo usa Administración
+
+
 def _admin_placas(ctx):
     _exigir_admin(ctx)
     st.markdown("**1. Listado oficial de placas** (único para todas las compañías)  \nExcel con las columnas PLACA, NÚMERO INTERNO y "
@@ -2673,14 +2700,12 @@ def _mostrar(ctx):
         zona_encabezado.html(E.encabezado(
             "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
             "Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT · Contenedores: presupuesto vs ejecución · valores en pesos", [(vista_emp, "filtro")]))
-        st.warning(f"No hay presupuesto de flota cargado para **{escenario}** en ninguna compañía. El administrador lo carga abajo, "
-                   "en «Datos base».", icon=":material/warning:")
-        if es_admin:
-            _admin_datos(ctx)
+        st.warning(f"No hay presupuesto de flota cargado para **{escenario}** en ninguna compañía. El administrador lo carga en "
+                   "Administración, pestaña «Mantenimiento y Operaciones».", icon=":material/warning:")
         return
     if oficial.empty:
         st.warning("No hay listado oficial de placas: todos los movimientos aparecen como «SIN PLACA IDENTIFICADA». "
-                   "El administrador lo carga en «Datos base».", icon=":material/warning:")
+                   "El administrador lo carga en Administración, pestaña «Mantenimiento y Operaciones».", icon=":material/warning:")
 
     # selector GLOBAL de placa: filtra los datos de Placas y Tecnomecánica/SOAT (los generales no se atribuyen a placas)
     ts_placas = {p for d in datos_e.values() for p in d.ts_per["placa"]}
@@ -2794,7 +2819,7 @@ def _mostrar(ctx):
         valid.loc[len(valid)] = ["Flota del rubro = Flota del módulo (Placas + Generales + Tecnomecánica/SOAT)",
                                  "✔ Correcto" if abs(dp_) < 1 and abs(de_) < 1 else "⚠ Revisar",
                                  f"Diferencia en presupuesto: {E.pesos(dp_)}; en ejecución: {E.pesos(de_)}. La pestaña Mantenimiento lee el rubro "
-                                 "cargado en Presupuesto; Flota lee el detalle por placa cargado en «Datos base»."]
+                                 "cargado en Presupuesto; Flota lee el detalle por placa cargado en Administración."]
 
     # ------------------------------------------------------------------ descargas y validaciones (solo administrador)
     if es_admin:
@@ -2831,7 +2856,6 @@ def _mostrar(ctx):
     if es_admin:
         _reclasificacion(S)
         _avanzado(S, reglas, bool(reglas_db.empty))
-        _admin_datos(ctx)
         with st.expander("¿Qué sub-rubros hay en la base?", icon=":material/search:"):
             _diagnostico(pd.concat([d.ppto_base for d in datos_e.values()], ignore_index=True),
                          pd.concat([d.ejec for d in datos_e.values()], ignore_index=True))

@@ -1,4 +1,5 @@
 """Módulo Administración (solo Financiera): carga de archivos, dueños, historial y respaldo."""
+import io
 from datetime import datetime
 
 import pandas as pd
@@ -14,7 +15,12 @@ import eeff
 import flujo
 import estilo as E
 import lineas
-from ui import ADMIN, EMPRESAS, MESES, SIN_DUENO, a_excel, ahora, empresa_de_nombre, titulo_tarjeta
+import logica_m as L
+import mod_mantenimiento
+import operaciones
+import sispo_fuente
+import sispo_oper
+from ui import ADMIN, EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, ahora, empresa_de_nombre, titulo_tarjeta
 
 
 COLS_EJEC = ["anio", "mes", "fecha", "codigo", "rubro", "sub_rubro", "cc", "cc_nombre", "cuenta", "cuenta_nombre",
@@ -1972,13 +1978,110 @@ def _cargar_cartera(ctx):
                 st.rerun()
 
 
+def _sispo_validar(contenido: bytes):
+    """Lee el SISPO con el lector único y devuelve (análisis, error). Exige lo que necesitan Mantenimiento y Operaciones."""
+    try:
+        d = L.sispo_leer(io.BytesIO(contenido))
+        sispo_oper.leer(io.BytesIO(contenido))                      # Operaciones exige además Grupo, IdKardex y Codigo Articulo
+    except Exception as e:
+        return None, str(e)
+    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
+    return dict(d=d, info=info, periodos=L.sispo_periodos(lin), empresa=L.sispo_empresa_probable(lin) if len(lin) else None), None
+
+
+def _cargar_sispo(ctx):
+    """SISPO del mes: se carga y se guarda UNA vez aquí; Mantenimiento y Operaciones lo toman de lo guardado."""
+    with st.container(key="card_adm_sispo"):
+        titulo_tarjeta("SISPO del mes", "Un solo archivo alimenta Mantenimiento y Operaciones. Cargar otro del mismo mes y compañía lo reemplaza.")
+        g = sispo_fuente.listar(ctx.leer)
+        if g.empty:
+            st.caption("Todavía no hay SISPO guardado.")
+        else:
+            st.dataframe(g.assign(tamano=(g["tamano"] / 1024 / 1024).round(2)), hide_index=True, width="stretch", column_config={
+                "empresa": "Compañía", "periodo": st.column_config.NumberColumn("Periodo", format="%d"), "archivo": "Archivo",
+                "usuario": "Usuario", "fecha": "Cargado", "tamano": st.column_config.NumberColumn("MB", format="%.2f")})
+        f = st.file_uploader("SISPO del mes (.xlsx)", type=["xlsx"], key="adm_sispo_up")
+        if f:
+            contenido = f.getvalue()
+            llave = (f.name, len(contenido))
+            memo = st.session_state.get("_adm_sispo_memo")
+            if memo and memo[0] == llave:
+                a, error = memo[1]
+            else:
+                with st.spinner("Leyendo el SISPO…"):
+                    a, error = _sispo_validar(contenido)
+                st.session_state["_adm_sispo_memo"] = (llave, (a, error))
+            if error:
+                st.error(f"No pude leer el SISPO: {error}")
+            elif a["info"]["en_cuenta"] == 0:
+                st.error("El SISPO no trae movimientos de las cuentas que usan Mantenimiento y Operaciones.")
+            else:
+                c1, c2, c3 = st.columns(3)
+                inferida = a["empresa"]
+                empresa = c1.selectbox("Compañía", list(EMPRESAS), index=list(EMPRESAS).index(inferida) if inferida else 0, key="adm_sispo_emp",
+                                       help="Se propone según «EmpresaAgencia» del archivo.")
+                bloqueos = []
+                if inferida and inferida != empresa:
+                    bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
+                periodo = None
+                if len(a["periodos"]) != 1:
+                    bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, a["periodos"])) or "ninguno") + ".")
+                else:
+                    periodo = int(a["periodos"][0])
+                    c2.metric("Periodo (cierre)", f"{MESES_L[periodo % 100 - 1].capitalize()} {periodo // 100}")
+                c3.metric("Registros", f"{a['info']['total']:,}".replace(",", "."))
+                for b in bloqueos:
+                    st.error(b, icon=":material/block:")
+                existe = periodo is not None and not g[(g["empresa"] == empresa) & (g["periodo"] == periodo)].empty
+                if st.button("Reemplazar el guardado" if existe else "Guardar SISPO", type="primary", icon=":material/upload:",
+                             disabled=bool(bloqueos), key="adm_sispo_guardar"):
+                    sispo_fuente.guardar(ctx.con, empresa, periodo, f.name, ctx.usuario, ahora().strftime("%Y-%m-%d %H:%M"), contenido)
+                    ctx.registrar_carga(ctx.usuario, "SISPO", f.name, f"{empresa} {periodo} · {a['info']['total']} registros")
+                    st.session_state.pop("_adm_sispo_memo", None)
+                    st.success("SISPO guardado. Mantenimiento y Operaciones lo toman de aquí.")
+                    st.rerun()
+        if not g.empty:
+            opciones = [f"{r.empresa} · {r.periodo}" for r in g.itertuples()]
+            c_sel, c_ok, c_btn = st.columns([2, 2, 1], vertical_alignment="bottom")
+            elegido = c_sel.selectbox("Archivo a quitar", opciones, key="adm_sispo_quitar")
+            ok = c_ok.checkbox("Confirmo quitar este archivo guardado", key="adm_sispo_quitar_ok",
+                               help="Solo borra el archivo guardado; lo ya aplicado en Mantenimiento y Operaciones no se toca.")
+            if c_btn.button("Quitar", icon=":material/delete:", disabled=not ok, key="adm_sispo_quitar_btn"):
+                emp, per_ = elegido.split(" · ")
+                sispo_fuente.borrar(ctx.con, emp, int(per_))
+                st.rerun()
+
+
+def _cargar_mantenimiento_operaciones(ctx):
+    """Todas las cargas de Mantenimiento y Operaciones en un solo lugar."""
+    s1, s2, s3 = st.tabs(["SISPO del mes", "Base maestra", "Presupuestos y datos base"], on_change="rerun", key="adm_mo")
+    with s1:
+        if s1.open:
+            _cargar_sispo(ctx)
+    with s2:
+        if s2.open:
+            with st.container(key="card_adm_maestra"):
+                titulo_tarjeta("Base maestra de referencias y conceptos", "Mantenimiento la usa para asignar concepto a cada referencia del SISPO.")
+                mod_mantenimiento.admin_base_maestra(ctx)
+    with s3:
+        if s3.open:
+            with st.container(key="card_adm_mo_datos"):
+                titulo_tarjeta("Mantenimiento · placas, presupuesto de flota, histórico y Tecnomecánica/SOAT")
+                mod_mantenimiento.admin_datos_base(ctx)
+            with st.container(key="card_adm_op_ppto"):
+                titulo_tarjeta("Operaciones · libro «3.1 operaciones»", "Se carga por compañía.")
+                for tab, e in zip(st.tabs([f"{e} · {EMPRESAS[e]}" for e in EMPRESAS]), EMPRESAS):
+                    with tab:
+                        operaciones.admin_presupuesto(ctx, e)
+
+
 def mostrar(ctx):
     con, leer, usuario, registrar_carga = ctx.con, ctx.leer, ctx.usuario, ctx.registrar_carga
     anio = (leer("SELECT MAX(anio) a FROM presupuesto")["a"][0] or datetime.now().year)
     st.html(E.encabezado("Administración", "Carga de archivos, asignación por gerencia, historial y respaldo", []))
-    t1, t2, t6, t8, t3, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
-                                          "Combustible", "Nómina", "Historial y respaldo"], on_change="rerun",
-                                         key="adm_tabs")
+    t1, t2, t6, t8, t3, t9, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
+                                              "Combustible", "Mantenimiento y Operaciones", "Nómina",
+                                              "Historial y respaldo"], on_change="rerun", key="adm_tabs")
     with t6:
         if t6.open:   # solo se calcula la pestaña abierta
             _empresa_adm(ctx)
@@ -2029,6 +2132,10 @@ def mostrar(ctx):
     with t3:
         if t3.open:   # solo se calcula la pestaña abierta
             _cargar_combustible(ctx)
+
+    with t9:
+        if t9.open:   # solo se calcula la pestaña abierta
+            _cargar_mantenimiento_operaciones(ctx)
 
     with t4:
         if t4.open:   # solo se calcula la pestaña abierta

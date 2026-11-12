@@ -5,7 +5,9 @@ Filtros previos (se aplican a los datos ORIGINALES del SISPO, antes de clasifica
   1. Centro de costo (código) en DB010500 Staf Operaciones, DB010504 Barrido Manual, DB010515 Proyecto Aguas de Bogotá,
      DB010501 Recolección Domiciliaria, DB010509 Planeación.
   2. Grupo [5] - INSUMOS o [7] - HERRAMIENTAS, salvo las referencias que CRUZAN con un ítem del presupuesto (por la columna «Concepto» del
-     SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos).
+     SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos). Toda la cuenta
+     OTROS de esos centros también entra, de cualquier grupo: SAP la carga completa en 3.1. Lo que no es grupo 5/7 ni cruza va a Herramientas
+     (donde SAP carga el genérico) con la observación de `observacion()`.
   3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Otros).
   4. Se excluye «Staf Mantenimiento» aunque pase lo anterior (por nombre, también con coincidencias parciales).
 Reglas por hoja, sobre lo que pasó los filtros:
@@ -59,44 +61,23 @@ MAPEO_INICIAL = {
     "7015019018": "Cabo pala", "7015019022": "Cabos rastrillos",
 }
 
-_REQ = {"NOMBRECTA": "cuenta", "GRUPO": "grupo", "FECHAMOVIMIENTO": "fecha", "ARTICULO": "articulo", "CANTIDADSALIDA": "cantidad",
-        "COSTOTOTALCONIVA": "costo_con_iva", "CODIGOARTICULO": "codigo", "IDKARDEX": "id_kardex"}
-_OPC = {"CIERRE": "cierre", "EMPRESAAGENCIA": "empresa_txt", "TIPOMOVIMIENTO": "tipo_mov", "BODEGA": "bodega",
-        "CENTRODECOSTOS": "cc_codigo", "CONCEPTO": "concepto"}
+COLUMNAS = ["cuenta", "grupo", "fecha", "articulo", "cantidad", "costo_con_iva", "codigo", "id_kardex", "cierre", "empresa_txt", "tipo_mov",
+            "bodega", "cc_codigo", "cc_nombre", "concepto"]
 
 
 # ================================================================== lectura y clasificación
 def leer(archivo) -> pd.DataFrame:
-    """Lee el SISPO tal como viene (busca la fila de encabezados: el archivo trae una fila de filtro encima) y devuelve las columnas
-    necesarias con nombres internos y números ya convertidos. Si falta una columna obligatoria, lo dice."""
-    crudo = pd.read_excel(archivo, header=None, dtype=object)
-    fila = next((i for i in range(min(len(crudo), 30))
-                 if {"NOMBRECTA", "COSTOTOTALCONIVA"} <= {L._canon(c) for c in crudo.iloc[i].tolist()}), None)
-    if fila is None:
-        raise ValueError("No encontré la fila de encabezados del SISPO (debe tener «Nombre Cta» y «Costo Total Con Iva»).")
-    enc = [L._canon(c) for c in crudo.iloc[fila].tolist()]
-    datos = crudo.iloc[fila + 1:].reset_index(drop=True)
-    mapa = {interno: enc.index(k) for k, interno in {**_REQ, **_OPC}.items() if k in enc}
-    j = next((k for k, c in enumerate(enc) if c.startswith("NOMBRECENTRODE")), None)     # el encabezado viene cortado en el archivo
-    if j is not None:
-        mapa["cc_nombre"] = j
-    nombres = {"cuenta": "Nombre Cta", "grupo": "Grupo", "fecha": "Fecha Movimiento", "articulo": "Articulo", "cantidad": "Cantidad Salida",
-               "costo_con_iva": "Costo Total Con Iva", "codigo": "Codigo Articulo", "id_kardex": "IdKardex", "cc_nombre": "NOMBRE CENTRO DE C…"}
-    faltan = [n for k, n in nombres.items() if k not in mapa]
+    """Lee el SISPO con el lector único (`logica_m.sispo_leer`, el mismo de Mantenimiento) y deja las columnas que usa Operaciones. A diferencia
+    de Mantenimiento, aquí «Grupo», «IdKardex» y «Codigo Articulo» son obligatorios. El centro de costo se pasa a mayúsculas («db010500»
+    de C.C. MANUAL es el mismo centro que «DB010500»)."""
+    d = L.sispo_leer(archivo)
+    faltan = ["Grupo"] if d["grupo"].eq("").all() else []
+    marca = L.sispo_sin_columnas_clave(d)
+    faltan += (["IdKardex"] if marca["sin_id"] else []) + (["Codigo Articulo"] if marca["sin_codigo"] else [])
     if faltan:
         raise ValueError("Al SISPO le faltan columnas: " + ", ".join(f"«{n}»" for n in faltan) + ".")
-    d = pd.DataFrame({k: datos.iloc[:, i] for k, i in mapa.items()})
-    for c in ("cierre", "empresa_txt", "tipo_mov", "bodega", "cc_codigo", "concepto"):
-        if c not in d:
-            d[c] = ""
-    d = d[d["id_kardex"].notna() | d["cuenta"].notna()].copy()                             # filas realmente vacías fuera
-    for c in ("id_kardex", "cuenta", "grupo", "articulo", "empresa_txt", "tipo_mov", "bodega", "cc_codigo", "cc_nombre", "concepto"):
-        d[c] = d[c].map(lambda x: " ".join(L._como_texto(x).split()))
-    d["codigo"] = d["codigo"].map(L._cod_articulo)
-    d["cierre"] = d["cierre"].map(lambda x: L._como_texto(x).strip()[:-2] if L._como_texto(x).strip().endswith(".0") else L._como_texto(x).strip())
-    d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
-    for c in ("cantidad", "costo_con_iva"):
-        d[c] = d[c].map(L._num_co)
+    d = d[COLUMNAS].copy()
+    d["cc_codigo"] = d["cc_codigo"].str.upper()
     return d.reset_index(drop=True)
 
 
@@ -113,8 +94,9 @@ def _mascaras(d: pd.DataFrame) -> dict:
         salida = d["tipo_mov"].map(L._canon).str.startswith("SALIDA")
     else:
         salida = pd.Series(True, index=d.index)
+    es_otros = d["cuenta"].map(L.clase20) == L.clase20(CUENTA_OTROS)       # SAP carga TODA la cuenta OTROS del centro en 3.1: sin filtro de grupo
     return {"salida": salida, "centro": _codigo_cc(d["cc_codigo"]).isin(CENTROS_AUTORIZADOS),
-            "grupo": d["grupo"].map(L._canon).isin(GRUPOS_AUTORIZADOS) | cruza,
+            "grupo": d["grupo"].map(L._canon).isin(GRUPOS_AUTORIZADOS) | cruza | es_otros,
             "cuenta": d["cuenta"].map(L.clase20).isin(cuentas),
             "staf_mtto": ~d["cc_nombre"].map(L._canon).str.contains(PATRON_EXCLUIDO, regex=True)}
 
@@ -145,7 +127,7 @@ def depurar(d: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     """Filtros previos sobre el SISPO original, en este orden. Devuelve (líneas que pasan todos, embudo [(paso, filas que quedan)])."""
     m = _mascaras(d)
     embudo, ok = [("Filas del archivo", len(d))], pd.Series(True, index=d.index)
-    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (5 códigos)"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto)"),
+    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (5 códigos)"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto o cuenta OTROS)"),
                             ("cuenta", "Cuenta ÚTILES, PAPELERÍA Y OTROS u OTROS"), ("staf_mtto", "Sin Staf Mantenimiento")):
         ok &= m[clave]
         embudo.append((etiqueta, int(ok.sum())))
@@ -176,10 +158,23 @@ def clasificar(d: pd.DataFrame, mapa: dict | None = None, presup: set | None = N
               HOJA_CONSUMIBLES: ((grupo == GRUPO_INSUMOS) | (dep["cruza"] & (grupo != GRUPO_HERRAMIENTAS))) & c_otros & sale & ~bolsa,
               HOJA_OTROS: bolsa & sale}
     solapes = int((sum(m.astype(int) for m in reglas.values()) > 1).sum())
+    resto = c_otros & sale & ~(sum(m.astype(int) for m in reglas.values()) > 0)              # otros grupos con cuenta OTROS (ver `observacion`)
+    reglas[HOJA_HERRAMIENTAS] = reglas[HOJA_HERRAMIENTAS] | resto
     hoja = pd.Series("", index=d.index)
     for h, m in reglas.items():                                                           # el último que se escribe manda
         hoja.loc[m[m].index] = h
     return d.assign(hoja=hoja), solapes
+
+
+def observacion(lin: pd.DataFrame) -> pd.Series:
+    """Texto para las líneas que entraron solo por la cuenta OTROS: su grupo no es 5 ni 7 y no cruzan con un ítem del presupuesto. Va a
+    Herramientas porque ahí SAP carga el genérico. Se calcula al mostrar (grupo y cuenta ya están guardados)."""
+    vacio = pd.Series("", index=lin.index)
+    if lin is None or lin.empty or "grupo" not in lin or "cuenta" not in lin:
+        return vacio
+    cruza = lin["cruza"].astype(bool) if "cruza" in lin else pd.Series(False, index=lin.index)
+    fuera = ~lin["grupo"].map(L._canon).isin(GRUPOS_AUTORIZADOS) & ~cruza & (lin["cuenta"].map(L.clase20) == L.clase20(CUENTA_OTROS))
+    return vacio.where(~fuera, "Grupo " + lin["grupo"].astype(str) + ": entra por la cuenta OTROS")
 
 
 def total_otros_c(d: pd.DataFrame) -> int:
@@ -247,12 +242,6 @@ def hoja_por_item(lin: pd.DataFrame, mapa: dict, item_hoja: dict) -> pd.DataFram
 
 
 # ================================================================== aplicar al libro de ejecución
-def _es_generico_otros(df: pd.DataFrame) -> pd.Series:
-    if df.empty:
-        return pd.Series(False, index=df.index)
-    return df["texto"].fillna("").map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False) & (L.cuenta_sap(df) == CUENTA_OTROS)
-
-
 def _columnas_vacias() -> pd.DataFrame:
     return pd.DataFrame(columns=["empresa", "anio", "mes", "fecha", "documento", "tercero", "texto", "cuenta_nombre", "cc", "cc_nombre", "valor",
                                  "cantidad", "hoja", "gerencia", "sub_rubro_sap", "sispo", "codigo_articulo", "item", "item_vista", "grupo"])
@@ -269,67 +258,6 @@ def _vista_lin(l: pd.DataFrame, mapa: dict) -> tuple[pd.Series, pd.Series]:
 def _vista_item(articulo: pd.Series, codigo: pd.Series, mapa: dict) -> tuple[pd.Series, pd.Series]:
     item = codigo.map(lambda c: mapa.get(str(c), ""))
     return item, item.where(item != "", articulo.astype(str) + " · sin ítem")
-
-
-def superponer(ejec: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFrame, per: pd.DataFrame, empresa: str, mapa: dict):
-    """Reemplaza, para cada periodo con SISPO, el genérico de SAP «Salida de inventario» de la cuenta OTROS por las líneas de Consumibles,
-    Herramientas y Otros. Solo si el total de la cuenta OTROS del SISPO coincide al centavo con el genérico de SAP (todos los rubros).
-    `ejec` = ejecución del rubro 3.1 ya con `hoja` y `gerencia`; `ejec_all` = ejecución de todos los rubros; `lin`/`per` = lo guardado del
-    SISPO de esta compañía. Devuelve (ejec nueva, avisos). Los genéricos OTROS de periodos sin SISPO (o que no cuadran) pasan a «Sin hoja
-    asignada» con la marca `pend_sispo`: ya no se pueden atribuir a Herramientas, porque contienen también consumibles y bolsas."""
-    ejec = ejec.reset_index(drop=True).copy()
-    avisos, nuevos = [], []
-    if ejec.empty:
-        return ejec.assign(sispo=pd.Series(dtype=bool), pend_sispo=pd.Series(dtype=bool)), avisos
-    ejec["empresa"] = empresa
-    ejec_all = ejec_all.assign(empresa=empresa)
-    for p in per.itertuples():
-        pn = int(p.periodo)
-        sap_all = L.sispo_sap_generico(ejec_all, empresa, pn, CUENTA_OTROS)
-        if sap_all.empty:
-            avisos.append(f"{empresa} {pn}: hay SISPO cargado pero no encuentro en SAP la «Salida de inventario» de la cuenta OTROS; no se reparte.")
-            continue
-        sap_c = int(sum(L.centavos(v) for v in pd.to_numeric(sap_all["valor"], errors="coerce").fillna(0.0)))
-        sis_c = L.centavos(p.total_otros)
-        if sap_c != sis_c:
-            avisos.append(f"{empresa} {pn}: la cuenta OTROS no cuadra. SAP {sap_c / 100:,.2f} contra SISPO {sis_c / 100:,.2f} "
-                          f"(diferencia {(sap_c - sis_c) / 100:,.2f}); no se reparte hasta resolverlo.")
-            continue
-        gen = L.sispo_sap_generico(ejec, empresa, pn, CUENTA_OTROS)
-        l = lin[(lin["periodo"] == pn) & lin["hoja"].isin(HOJAS_PESOS)].reset_index(drop=True)
-        if l.empty:
-            continue
-        dest = L.sispo_destinos(l, gen) if len(gen) else None
-        if dest is None:
-            continue
-        en_rubro = dest["codigo"].astype(str).str.strip().str.replace(",", ".", regex=False) == ID_RUBRO
-        l, dest = l[en_rubro.to_numpy()].reset_index(drop=True), dest[en_rubro.to_numpy()].reset_index(drop=True)
-        if l.empty:
-            continue
-        ejec = ejec.drop(index=gen.index)
-        item, vista = _vista_lin(l, mapa)
-        nuevos.append(pd.DataFrame({
-            "empresa": empresa, "anio": pn // 100, "mes": pn % 100, "fecha": pd.to_datetime(l["fecha"], errors="coerce"),
-            "documento": "Kardex " + l["id_kardex"].astype(str), "tercero": l["bodega"], "texto": l["articulo"],
-            "cuenta_nombre": "SISPO · " + l["cuenta"], "cc": l["cc_codigo"], "cc_nombre": l["cc_nombre"],
-            "codigo": dest["codigo"], "sub_rubro": dest["sub_rubro"], "sub_rubro_sap": dest["sub_rubro_sap"],
-            "valor": l["valor"], "cantidad": l["cantidad"], "hoja": l["hoja"], "gerencia": dest["gerencia"], "sispo": True,
-            "codigo_articulo": l["codigo"], "item": item, "item_vista": vista, "grupo": l["grupo"]}))
-    if nuevos:
-        ejec = pd.concat([ejec, *nuevos], ignore_index=True)
-    for c in ("valor", "mes", "anio"):                  # de la base pueden llegar como texto/object: se vuelven numéricos
-        ejec[c] = pd.to_numeric(ejec[c], errors="coerce")
-    ejec["valor"] = ejec["valor"].fillna(0.0)
-    if "sispo" not in ejec:
-        ejec["sispo"] = False
-    ejec["sispo"] = ejec["sispo"].fillna(False).astype(bool)
-    for c in ("item", "item_vista", "codigo_articulo", "grupo", "cantidad"):        # existen siempre, aunque ningún mes se haya repartido
-        if c not in ejec:
-            ejec[c] = None
-    pend = _es_generico_otros(ejec) & ~ejec["sispo"]
-    ejec["pend_sispo"] = pend
-    ejec.loc[pend, "hoja"] = SIN_HOJA
-    return ejec, avisos
 
 
 def papeleria(lin: pd.DataFrame, cfg: dict, empresa: str, mapa: dict) -> pd.DataFrame:

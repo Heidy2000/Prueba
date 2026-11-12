@@ -9,7 +9,7 @@ Una pantalla con cinco pestañas:
 
 Qué compara y a qué nivel
 - Presupuesto: el del libro (mes a mes y por ítem: cantidad × costo unitario = total). Se carga por compañía (ALDC / ALSM).
-- Ejecución: SOLO el SISPO del mes (ver sispo_oper.py; se carga una sola vez en Mantenimiento y se guarda también aquí), sin valores de SAP.
+- Ejecución: SOLO el SISPO del mes (ver sispo_oper.py; se carga una sola vez en Administración, se aplica en Mantenimiento y se guarda también aquí), sin valores de SAP.
   Se reparte así: Consumibles (grupo 5, cuenta OTROS, sin las 2 bolsas), Herramientas (grupo 7, cuenta OTROS) y Otros (las 2 bolsas), en pesos.
   Papelería sale del SISPO (centros Staf Operaciones, Aguas de Bogotá y Planeación) y se compara en CANTIDADES (costo cero).
   Con el SISPO, el detalle por ítem también tiene ejecución: la referencia se liga a su ítem con la tabla de equivalencias
@@ -41,7 +41,6 @@ from types import SimpleNamespace
 
 import openpyxl
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 import pandas as pd
@@ -290,20 +289,21 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
             "documento": "Kardex " + l["id_kardex"].astype(str), "tercero": l["bodega"], "texto": l["articulo"],
             "cuenta_nombre": "SISPO · " + l["cuenta"], "cc": l["cc_codigo"], "cc_nombre": l["cc_nombre"], "codigo": RUBRO_COD,
             "sub_rubro": l["hoja"], "sub_rubro_sap": "", "valor": l["valor"], "cantidad": l["cantidad"], "hoja": l["hoja"], "gerencia": ger,
-            "sispo": True, "codigo_articulo": l["codigo"], "item": item, "item_vista": vista, "grupo": l["grupo"], "pend_sispo": False}))
+            "sispo": True, "codigo_articulo": l["codigo"], "item": item, "item_vista": vista, "grupo": l["grupo"], "pend_sispo": False,
+            "observacion": OS.observacion(l)}))
     con_sispo = {int(x) for x in per["periodo"]}
     for m in range(m0, m1 + 1):                                  # meses con genérico en SAP y sin SISPO: Operaciones queda en cero ahí
         pn = cfg["anio"] * 100 + m
         if pn not in con_sispo and not _generico_otros_sap(ejec_all, empresa, pn).empty:
             if (empresa, pn) in mtto_per:
                 avisos.append(f"{empresa} {pn}: Mantenimiento ya aplicó este SISPO, pero Operaciones no lo tiene (Mantenimiento no guarda el grupo del "
-                              "artículo ni Papelería, que Operaciones necesita). Sube ese mismo archivo en Mantenimiento («Cargar SISPO del mes») y "
+                              "artículo ni Papelería, que Operaciones necesita). Elige ese mismo SISPO (cargado en Administración) en Mantenimiento («Cargar SISPO del mes») y "
                               "pulsa «Aplicar»: solo guarda la parte de Operaciones, no cambia ni duplica nada en Mantenimiento.")
             else:
                 avisos.append(f"{empresa} {pn}: SAP registra «Salida de inventario» de la cuenta OTROS, pero no hay SISPO aplicado; Operaciones no muestra "
-                              "Consumibles, Herramientas ni Otros de ese mes. Aplícalo en Mantenimiento («Cargar SISPO del mes»).")
+                              "Consumibles, Herramientas ni Otros de ese mes. Cárgalo en Administración y aplícalo en Mantenimiento («Cargar SISPO del mes»).")
     cols = ["empresa", "anio", "mes", "fecha", "documento", "tercero", "texto", "cuenta_nombre", "cc", "cc_nombre", "codigo", "sub_rubro",
-            "sub_rubro_sap", "valor", "cantidad", "hoja", "gerencia", "sispo", "codigo_articulo", "item", "item_vista", "grupo", "pend_sispo"]
+            "sub_rubro_sap", "valor", "cantidad", "hoja", "gerencia", "sispo", "codigo_articulo", "item", "item_vista", "grupo", "pend_sispo", "observacion"]
     ejec = pd.concat(nuevos, ignore_index=True) if nuevos else pd.DataFrame(columns=cols)
     for c in ("valor", "mes", "anio"):
         ejec[c] = pd.to_numeric(ejec[c], errors="coerce")
@@ -840,6 +840,9 @@ def _admin_presupuesto(ctx, empresa: str):
         st.rerun()
 
 
+admin_presupuesto = _admin_presupuesto           # lo usa Administración
+
+
 def _admin_mapeo(S):
     _exigir_admin(S.ctx)
     partes = []
@@ -887,7 +890,7 @@ def _guardar_sispo(ctx, empresa: str, periodo: int, d: pd.DataFrame, archivo: st
 
 
 def sispo_analizar(ctx, up) -> dict:
-    """Lo que Operaciones toma de un SISPO (la carga es única y se hace en Mantenimiento: ese módulo llama a esta función y a
+    """Lo que Operaciones toma de un SISPO (la carga es única y se hace en Administración; Mantenimiento la aplica y llama a esta función y a
     `sispo_guardar`). No guarda nada. Devuelve `d` (archivo clasificado), `bloqueos` (solo de Operaciones), `embudo`, `resumen`,
     `huerfanos` (valores de «Concepto» que no son ítems del presupuesto) y `total_otros_c` (centavos de la cuenta OTROS)."""
     _asegurar_tablas(ctx)
@@ -944,7 +947,7 @@ def _admin_sispo(S):
             "empresa": "Compañía", "periodo": st.column_config.NumberColumn("Periodo", format="%d"), "archivo": "Archivo", "usuario": "Usuario",
             "fecha": "Cargado", "n_lineas": st.column_config.NumberColumn("Líneas", format="%d"),
             "total_otros": st.column_config.NumberColumn("Total cuenta OTROS (SISPO)", format="accounting")})
-    st.info("El SISPO se carga UNA sola vez, en Mantenimiento («Cargar SISPO del mes y reemplazar las salidas de inventario»). Al aplicarlo, "
+    st.info("El SISPO se carga UNA sola vez, en Administración (pestaña «Mantenimiento y Operaciones»), y se aplica en Mantenimiento. Al aplicarlo, "
             "ese mismo archivo también se guarda aquí: Operaciones toma sus 5 centros de costo, grupos 5 y 7 y cuentas ÚTILES, PAPELERÍA Y OTROS u "
             "OTROS, sin Staf Mantenimiento. Volver a aplicar el mismo periodo lo reemplaza, no lo duplica.", icon=":material/sync_alt:")
     if not cargado.empty:
@@ -996,19 +999,14 @@ def _admin_items(S):
 
 def _admin(S):
     _exigir_admin(S.ctx)
-    with st.expander("Datos base · presupuesto, SISPO, equivalencias y asignación de sub-rubros (administrador)", icon=":material/settings:"):
-        st.markdown("**1. Presupuesto del libro «3.1 operaciones».** Se carga por compañía.")
-        for tab, e in zip(st.tabs([f"{e} · {EMPRESAS[e]}" for e in EMPRESAS]), EMPRESAS):
-            with tab:
-                _admin_presupuesto(S.ctx, e)
-        st.divider()
-        st.markdown("**2. SISPO del mes (carga única en Mantenimiento).** Reparte Consumibles, Herramientas y Otros (en pesos) y trae Papelería (en cantidades).")
+    with st.expander("Datos base · SISPO aplicado, equivalencias y asignación de sub-rubros (administrador)", icon=":material/settings:"):
+        st.markdown("**1. SISPO aplicado.** Reparte Consumibles, Herramientas y Otros (en pesos) y trae Papelería (en cantidades).")
         _admin_sispo(S)
         st.divider()
-        st.markdown("**3. Equivalencias referencia → ítem del presupuesto.**")
+        st.markdown("**2. Equivalencias referencia → ítem del presupuesto.**")
         _admin_items(S)
         st.divider()
-        st.markdown("**4. Asignación de sub-rubros a hojas.**")
+        st.markdown("**3. Asignación de sub-rubros a hojas.**")
         _admin_mapeo(S)
 
 
@@ -1213,7 +1211,7 @@ def _X_hoja_detalle(wb, meta, s):
     fv = _X_F_CANT if cant else _X_F_PESOS
     u = "unidades" if cant else "pesos"
     ancho = 12
-    _X_anchos(ws, [46, 16, 18, 18, 18, 16, 22, 34, 24, 24, 18, 18])
+    _X_anchos(ws, [46, 16, 18, 18, 18, 16, 22, 34, 24, 24, 18, 18, 44])
     _X_encabezado(ws, s["titulo"], meta["subtitulo"] + f" · valores en {u}", ancho)
     fila = 4
     c = s["cifras"]
@@ -1268,8 +1266,8 @@ def _X_hoja_detalle(wb, meta, s):
     mv = s["movs"]
     fila = _X_seccion(ws, fila, f"Movimientos que componen la ejecución ({len(mv):,})".replace(",", "."), ancho)
     cab = ["Mes", "Fecha", "Documento", "Proveedor / tercero", "Texto", "Referencia (SISPO)", "Ítem del presupuesto", "Cuenta", "Sub-rubro (SAP)",
-           "Centro de coste", "Cantidad"] + ([] if cant else ["Valor"])
-    fmm = [None, "dd/mm/yyyy", None, None, None, None, None, None, None, None, "#,##0"] + ([] if cant else [fv])
+           "Centro de coste", "Cantidad"] + ([] if cant else ["Valor"]) + ["Observación"]
+    fmm = [None, "dd/mm/yyyy", None, None, None, None, None, None, None, None, "#,##0"] + ([] if cant else [fv]) + [None]
     sufijo = lambda q, v: [_X_num(q)] + ([] if cant else [v])
     fila = _X_cabecera_tabla(ws, fila, cab)
     if mv.empty:
@@ -1279,9 +1277,9 @@ def _X_hoja_detalle(wb, meta, s):
         for row in g.itertuples(index=False):
             f = row.fecha.to_pydatetime() if pd.notna(row.fecha) else None
             fila = _X_escribir(ws, fila, [row.mes_txt, f, row.documento, row.tercero, row.texto, row.codigo_articulo, row.item, row.cuenta_nombre,
-                                        row.sub_rubro_sap, row.cc_nombre] + sufijo(row.cantidad, _X_num(row.valor)), fmm)
-        fila = _X_escribir(ws, fila, [f"Subtotal {g['mes_txt'].iloc[0]}"] + [None] * 9 + sufijo(g["cantidad"].sum(), float(g["valor"].sum())), fmm, "sub")
-    fila = _X_escribir(ws, fila, ["TOTAL EJECUTADO"] + [None] * 9 + sufijo(mv["cantidad"].sum(), float(mv["valor"].sum())), fmm, "tot")
+                                        row.sub_rubro_sap, row.cc_nombre] + sufijo(row.cantidad, _X_num(row.valor)) + [row.observacion], fmm)
+        fila = _X_escribir(ws, fila, [f"Subtotal {g['mes_txt'].iloc[0]}"] + [None] * 9 + sufijo(g["cantidad"].sum(), float(g["valor"].sum())) + [None], fmm, "sub")
+    fila = _X_escribir(ws, fila, ["TOTAL EJECUTADO"] + [None] * 9 + sufijo(mv["cantidad"].sum(), float(mv["valor"].sum())) + [None], fmm, "tot")
     ws.freeze_panes = "A4"
 
 
@@ -1311,7 +1309,7 @@ _SECCIONES = [(OS.HOJA_PAPELERIA, "2 Papelería", "2. PAPELERÍA · MOVIMIENTOS 
 def _movimientos_informe(Q, hoja: str) -> pd.DataFrame:
     e = _ejec_hoja(Q, hoja)
     e = e[e["mes"] <= Q.hasta_mes].copy()
-    for c in ("fecha", "documento", "tercero", "texto", "codigo_articulo", "item_vista", "cuenta_nombre", "sub_rubro_sap", "cc_nombre", "cantidad"):
+    for c in ("fecha", "documento", "tercero", "texto", "codigo_articulo", "item_vista", "cuenta_nombre", "sub_rubro_sap", "cc_nombre", "cantidad", "observacion"):
         if c not in e:
             e[c] = None
     e["fecha"] = pd.to_datetime(e["fecha"], errors="coerce")
@@ -1320,10 +1318,10 @@ def _movimientos_informe(Q, hoja: str) -> pd.DataFrame:
     e["item"] = e["item_vista"].where(e["item_vista"].notna(), "Sin ítem (SAP, sin detalle de SISPO)")
     e["mes"] = pd.to_numeric(e["mes"], errors="coerce").astype(int)
     e["mes_txt"] = e["mes"].map(lambda m: f"{MESES_L[m - 1].capitalize()} {Q.cfg['anio']}")
-    for c in ("documento", "tercero", "texto", "codigo_articulo", "cuenta_nombre", "sub_rubro_sap", "cc_nombre"):
+    for c in ("documento", "tercero", "texto", "codigo_articulo", "cuenta_nombre", "sub_rubro_sap", "cc_nombre", "observacion"):
         e[c] = e[c].where(e[c].notna(), None)
     return e.sort_values(["mes", "fecha"])[["mes", "mes_txt", "fecha", "documento", "tercero", "texto", "codigo_articulo", "item",
-                                             "cuenta_nombre", "sub_rubro_sap", "cc_nombre", "cantidad", "valor"]].reset_index(drop=True)
+                                             "cuenta_nombre", "sub_rubro_sap", "cc_nombre", "cantidad", "valor", "observacion"]].reset_index(drop=True)
 
 
 def _validaciones_informe(S2, secciones: list, resumen: dict, n_staf_sap: int) -> list:
@@ -1345,7 +1343,7 @@ def _validaciones_informe(S2, secciones: list, resumen: dict, n_staf_sap: int) -
         malos = int((~m[clave]).sum()) if len(sis) else 0
         v.append((nombre, "CUMPLE" if malos == 0 else "NO CUMPLE", ok_txt if malos == 0 else f"{malos} movimientos del SISPO no cumplen."))
     regla("Solo los 5 centros de costo autorizados (DB010500, 504, 515, 501, 509)", "centro", f"{len(sis)} movimientos del SISPO revisados.")
-    regla("Solo grupos 5 (Insumos) y 7 (Herramientas), salvo ítems del presupuesto", "grupo", "Sin otros grupos que no crucen con el presupuesto.")
+    regla("Solo grupos 5 (Insumos) y 7 (Herramientas), salvo ítems del presupuesto y la cuenta OTROS", "grupo", "Sin otros grupos que no crucen con el presupuesto ni sean cuenta OTROS.")
     regla("Solo cuentas ÚTILES, PAPELERÍA Y OTROS y OTROS", "cuenta", "Sin otras cuentas.")
     regla("Sin Staf Mantenimiento en el SISPO", "staf_mtto", f"Además se excluyeron {n_staf_sap} movimientos de SAP de ese centro de coste.")
     no_sal = int((pd.to_numeric(sis["cantidad"], errors="coerce").fillna(0) <= 0).sum()) if len(sis) and "cantidad" in sis else 0
