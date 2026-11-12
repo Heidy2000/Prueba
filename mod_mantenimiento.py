@@ -2188,7 +2188,7 @@ def _rubro(S, empresa: str, detalle_flota: bool = False):
     ck = (empresa, bool(detalle_flota))
     if ck in S.rubro_cache:
         return S.rubro_cache[ck]
-    d, cfg = S.datos_e[empresa], S.cfg
+    d = S.datos_e[empresa]
     flota = cargas.norm(L.SUBRUBRO_FLOTA)
     staf = d.ejec["_staf_otros"].fillna(False).astype(bool) if "_staf_otros" in d.ejec else pd.Series(False, index=d.ejec.index)
     # los códigos del rubro salen del presupuesto y de los movimientos propios de flota; los OTROS/Staf Mantenimiento no definen

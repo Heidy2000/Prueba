@@ -138,16 +138,7 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-dv span b {{ font-size:.82rem; }}
 .nf-dv span small {{ font-size:.68rem; font-weight:600; opacity:.85; }}
 
-/* ---------- lista marcada (pagos más grandes) y avisos ---------- */
-.nf-mk {{ display:flex; align-items:center; gap:.6rem; border:1px solid {BORDE}; border-radius:10px;
-    padding:.45rem .7rem; margin-bottom:.45rem; font-size:.82rem; }}
-.nf-mk em {{ font-style:normal; font-size:.7rem; font-weight:700; border-radius:6px; padding:.12rem .45rem;
-    background:{AZUL_SUAVE}; color:{AZUL}; flex-shrink:0; min-width:2.6rem; text-align:center; }}
-.nf-mk em.bad {{ background:{ROJO_SUAVE}; color:{ROJO}; }}
-.nf-mk em.warn {{ background:{AMBAR_SUAVE}; color:{AMBAR}; }}
-.nf-mk em.ok {{ background:{VERDE_SUAVE}; color:{VERDE}; }}
-.nf-mk span {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.nf-mk b {{ font-variant-numeric:tabular-nums; }}
+/* ---------- avisos ---------- */
 .nf-avisos {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(125px,1fr)); gap:.6rem; }}
 .nf-aviso {{ border:1px solid #f0c89a; background:{AMBAR_SUAVE}; border-radius:12px; padding:.6rem .75rem;
     font-size:.76rem; color:#7a4a12; line-height:1.3; }}
@@ -169,15 +160,6 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-inf li {{ margin:.15rem 0; }}
 .nf-inf .up {{ color:{ROJO}; font-weight:700; }}
 .nf-inf .dn {{ color:{VERDE}; font-weight:700; }}
-/* ---------- tira mensual bajo un gráfico ---------- */
-.nf-tira {{ display:grid; font-size:.76rem; color:{TEXTO}; border-top:1px solid {BORDE}; margin-top:.2rem; }}
-.nf-tira > div {{ padding:.32rem .2rem; text-align:center; font-variant-numeric:tabular-nums; white-space:nowrap;
-    border-bottom:1px solid #f1f4f8; overflow:hidden; text-overflow:ellipsis; }}
-.nf-tira > div.l {{ text-align:left; color:{TEXTO_2}; font-weight:600; }}
-.nf-tira > div.h {{ color:{TEXTO_2}; font-weight:700; }}
-.nf-tira > div.n {{ font-weight:700; }}
-.nf-tira > div.x {{ font-size:.68rem; color:{TEXTO_2}; white-space:normal; line-height:1.2; }}
-.nf-tira > div.alerta {{ background:{ROJO_SUAVE}; }}
 /* ---------- mini barra de variación dentro de las tablas ---------- */
 .nf-mb {{ display:flex !important; align-items:center; justify-content:flex-end; gap:.45rem; }}
 .nf-mb > i {{ position:relative; width:56px; height:12px; flex-shrink:0; display:block; }}
@@ -398,7 +380,6 @@ def encabezado(titulo: str, subtitulo: str, chips: list[tuple[str, str]]) -> str
             f'<div class="nf-chips">{cs}</div></div>')
 
 
-TONO_COLOR = {"ok": VERDE, "bad": ROJO, "warn": "#e8892c", "na": "#9aa7b8"}
 
 
 def delta(texto: str, tono: str = "na", flecha: str | None = None) -> str:
@@ -507,30 +488,6 @@ def barras_divergentes(filas: list[dict], columnas: list[str], nombre_col: str =
                    f"{celdas}</div>")
     return (f'<div class="nf-scroll notranslate" translate="no" style="border:none">'
             f'<div class="nf-dvt" style="min-width:{150 + 160 * n}px">{cab}{cuerpo}</div></div>')
-
-
-def lista_marcada(items: list[tuple]) -> str:
-    """Filas con una marca a la izquierda: (marca, nombre, valor_txt, tono) — p. ej. pagos más grandes."""
-    out = ""
-    for marca, nombre, valor, tono in items:
-        out += (f'<div class="nf-mk"><em class="{tono}">{escape(str(marca))}</em>'
-                f'<span title="{escape(str(nombre))}">{escape(str(nombre))}</span><b>{valor}</b></div>')
-    return f'<div class="notranslate" translate="no">{out}</div>'
-
-
-def tira(columnas: list[str], filas: list[tuple], alertas: set | None = None) -> str:
-    """Tabla compacta de pocas filas bajo un gráfico mensual: filas = (nombre, [celdas html], clase '', 'n' o 'x').
-    alertas: índices de columna a resaltar."""
-    alertas = alertas or set()
-    n = len(columnas)
-    html = '<div class="l"></div>' + "".join(
-        f'<div class="h{" alerta" if i in alertas else ""}">{escape(c)}</div>' for i, c in enumerate(columnas))
-    for nombre, celdas, clase in filas:
-        html += f'<div class="l">{escape(nombre)}</div>' + "".join(
-            f'<div class="{clase}{" alerta" if i in alertas else ""}">{c}</div>' for i, c in enumerate(celdas))
-    return (f'<div class="nf-scroll notranslate" translate="no" style="border:none"><div class="nf-tira" '
-            f'style="grid-template-columns:90px repeat({n}, minmax(58px,1fr));min-width:{90 + 60 * n}px">{html}'
-            f'</div></div>')
 
 
 def informe(titulo: str, sub: str, secciones: list[tuple[str, list[str]]]) -> str:

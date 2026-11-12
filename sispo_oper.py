@@ -37,7 +37,6 @@ GRUPOS_AUTORIZADOS = ("5INSUMOS", "7HERRAMIENTAS")                   # «[5] - I
 PATRON_EXCLUIDO = r"STAFF?MANT"                                       # «Staf Mantenimiento» (también recortado o con una f de más)
 CODIGOS_OTROS = ("5064610001", "5064610002")        # BOLSA CESTA 66x76 y BOLSA DESARENE 40x49
 GRUPO_INSUMOS, GRUPO_HERRAMIENTAS = GRUPOS_AUTORIZADOS
-ID_RUBRO = "3.1"
 SIN_HOJA = "Sin hoja asignada"
 
 # Equivalencias de partida referencia SISPO -> ítem del presupuesto (validadas con el usuario). Editables en pantalla (admin).

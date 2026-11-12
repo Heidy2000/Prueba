@@ -1281,7 +1281,6 @@ def hoja_resumen_mantenimiento(ws, titulo: str, subtitulo: str, meses: list[int]
         a, b = col_l(c - 2), col_l(c - 1)
         x = ws.cell(row=r, column=c, value=f'=IF({a}{r}=0,"",{b}{r}/{a}{r})')
         x.number_format, x.font, x.fill = "0%", Font(bold=True), claro
-    fin_tabla = r
     r += 2
     ws.cell(row=r, column=1, value="2. Flota y Equipo de transporte: de dónde sale la ejecución de cada mes").font = Font(bold=True, size=12)
     r += 1

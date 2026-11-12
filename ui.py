@@ -20,14 +20,6 @@ def empresa_de_nombre(nombre: str) -> str:
     return "ALSM" if "ALSM" in n or "MEDIO AMBIENT" in n or "MEDIOAMBIENT" in n else EMPRESA_DEFECTO
 
 
-def selector_empresa(contenedor, disponibles, key: str, label: str = "Compañía"):
-    """Selector de compañía; si solo hay una con datos, no se muestra nada y se devuelve esa."""
-    disponibles = [e for e in EMPRESAS if e in set(disponibles)] or [EMPRESA_DEFECTO]
-    if len(disponibles) == 1:
-        return disponibles[0]
-    return contenedor.selectbox(label, disponibles, key=key, format_func=lambda e: f"{e} · {EMPRESAS[e]}")
-
-
 def ahora():
     """Fecha y hora de Colombia (en la nube el servidor está en otra zona horaria)."""
     from datetime import datetime, timedelta, timezone
@@ -150,22 +142,3 @@ def cascada(pasos: list[dict], alto: int = 300):
     fig.update_layout(margin=dict(t=24, b=10, l=10, r=10))
     fig.update_xaxes(tickangle=0, tickfont=dict(size=11))
     return fig, piso
-
-
-def dona_doble(p1: float, p2: float | None, t1: str, t2: str, alto: int = 210):
-    """Dona de cumplimiento: anillo exterior p1 (p. ej. vs presupuesto) e interior p2 (vs otra base)."""
-    import plotly.graph_objects as go
-
-    def anillo(p, color, dom, hueco):
-        p = 0.0 if p is None or pd.isna(p) else float(p)
-        lleno = max(0.0, min(p, 1.0))
-        return go.Pie(values=[lleno, 1 - lleno], hole=hueco, sort=False, direction="clockwise", rotation=0,
-                      marker_colors=[color, "#e9eef5"], textinfo="none", hoverinfo="skip", domain=dom)
-    fig = go.Figure(anillo(p1, E.AZUL, dict(x=[0, 1], y=[0, 1]), .82))
-    if p2 is not None and not pd.isna(p2):
-        fig.add_trace(anillo(p2, "#7fa8e6", dict(x=[.13, .87], y=[.13, .87]), .78))
-    centro = "—" if p1 is None or pd.isna(p1) else f"{p1 * 100:.0f}%"
-    fig.add_annotation(text=f"<b style='font-size:28px'>{centro}</b><br><span style='font-size:11px'>{t1}</span>",
-                       showarrow=False, font=dict(family=E.FUENTE, color=E.TEXTO))
-    fig.update_layout(showlegend=False)
-    return estilo_grafico(fig, alto)
