@@ -18,6 +18,7 @@ import lineas
 import logica_m as L
 import mod_mantenimiento
 import operaciones
+import mod_corte_poda
 import sispo_fuente
 import sispo_oper
 from ui import ADMIN, EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, ahora, empresa_de_nombre, titulo_tarjeta
@@ -2079,8 +2080,8 @@ def mostrar(ctx):
     con, leer, usuario, registrar_carga = ctx.con, ctx.leer, ctx.usuario, ctx.registrar_carga
     anio = (leer("SELECT MAX(anio) a FROM presupuesto")["a"][0] or datetime.now().year)
     st.html(E.encabezado("Administración", "Carga de archivos, asignación por gerencia, historial y respaldo", []))
-    t1, t2, t6, t8, t3, t9, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
-                                              "Combustible", "Mantenimiento y Operaciones", "Nómina",
+    t1, t2, t6, t8, t3, t9, t10, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
+                                              "Combustible", "Mantenimiento y Operaciones", "Corte y poda", "Nómina",
                                               "Historial y respaldo"], on_change="rerun", key="adm_tabs")
     with t6:
         if t6.open:   # solo se calcula la pestaña abierta
@@ -2136,6 +2137,10 @@ def mostrar(ctx):
     with t9:
         if t9.open:   # solo se calcula la pestaña abierta
             _cargar_mantenimiento_operaciones(ctx)
+
+    with t10:
+        if t10.open:   # solo se calcula la pestaña abierta
+            mod_corte_poda.admin_cargas(ctx)
 
     with t4:
         if t4.open:   # solo se calcula la pestaña abierta

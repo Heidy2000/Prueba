@@ -2282,6 +2282,38 @@ def _control_staf(S):
                 st.dataframe(o_.head(60), hide_index=True, width="stretch", height=380)
 
 
+def _genericos_sin_reemplazar(S, empresa: str, mes: int) -> pd.DataFrame:
+    """Movimientos genéricos «Salida de inventario…» de SAP que SIGUEN en el soporte de `empresa` hasta `mes` (SISPO no los reemplazó), por
+    mes, cuenta y centro de coste, con el motivo. No sustituye nada: solo identifica las inconsistencias antes de descargar. Vacío = todo
+    lo que SAP tenía como salida de inventario ya está reemplazado por el detalle de SISPO."""
+    import sispo_fuente
+    cols = ["Mes", "Cuenta", "Centro de coste", "Movimientos SAP", "Valor SAP", "Motivo"]
+    ejec = _rubro(S, empresa, detalle_flota=True)[1]
+    if ejec.empty:
+        return pd.DataFrame(columns=cols)
+    es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+    gen = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)
+               & (pd.to_numeric(ejec["mes"], errors="coerce") <= mes)].copy()
+    if gen.empty:
+        return pd.DataFrame(columns=cols)
+    gen["_cta"] = L.cuenta_sap(gen).fillna("(sin cuenta de SISPO)")
+    gen["_cc"] = gen["cc"].fillna("").astype(str).str.strip().str.upper() if "cc" in gen else ""
+    guardados = {(r.empresa, int(r.periodo)) for r in sispo_fuente.listar(S.ctx.leer).itertuples()}
+    aplicadas = {(int(r.periodo), L.cuenta_de(r.cuenta) or L.SISPO_CUENTA)
+                 for r in S.ctx.leer("SELECT periodo, cuenta FROM mtto_sispo_periodo WHERE empresa=?", (empresa,)).itertuples()}
+    filas = []
+    for (m_, cta, cc), g in gen.groupby([pd.to_numeric(gen["mes"]).astype(int), "_cta", "_cc"]):
+        per = int(S.cfg["anio"]) * 100 + int(m_)
+        if (empresa, per) not in guardados and not any(p == per for p, _ in aplicadas):
+            motivo = "No hay SISPO de este mes"
+        elif (per, cta) not in aplicadas:
+            motivo = "SISPO de la cuenta sin aplicar (no cuadra con SAP o falta aplicarlo)"
+        else:
+            motivo = "El centro de coste no cuadra al centavo entre SAP y SISPO"
+        filas.append((f"{MESES_L[int(m_) - 1].capitalize()} {S.cfg['anio']}", cta, cc, len(g), float(pd.to_numeric(g["valor"], errors="coerce").sum()), motivo))
+    return pd.DataFrame(filas, columns=cols)
+
+
 def _descarga_soporte(S):
     """Soporte de ejecución (Excel) para cualquier usuario: presupuesto de todos los meses y ejecución acumulada en la primera
     hoja; en las demás, los movimientos."""
@@ -2297,6 +2329,13 @@ def _descarga_soporte(S):
                          key=f"mt_detalle_soporte_{S.escenario}",
                          help="«Todos los meses…» agrega a cada hoja de sub-rubro los movimientos de los meses anteriores (p. ej. septiembre y "
                               "octubre) con una columna «Mes».") == "Todos los meses hasta el elegido"
+        for e in S.sel:                                   # inconsistencias SAP vs SISPO: se avisan antes de descargar, no se corrigen solas
+            pend = _genericos_sin_reemplazar(S, e, mes_sop)
+            if len(pend):
+                st.warning(f"{e}: {len(pend)} grupos de «Salida de inventario» de SAP siguen sin reemplazar por SISPO "
+                           f"({_pesos2(pend['Valor SAP'].sum())}). El soporte los trae tal como están en SAP.", icon=":material/rule:")
+                st.dataframe(pend, hide_index=True, width="stretch", column_config={
+                    "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
         cols_dl = st.columns(len(S.sel))
         for cdl, e in zip(cols_dl, S.sel):
             cdl.download_button(f"Descargar soporte de ejecución · {e}", lambda e=e: _soporte(S, e, mes_sop, todos),
@@ -2626,7 +2665,7 @@ def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
         ejec = ejec.assign(raw="")
         num_cuenta = {}
     return L.exportar_soporte(ppto, ejec, dict(cfg, escenario=S.escenario), mes, "UPA" if S.escenario.startswith("UPA") else "PRESUPUESTO",
-                              detalle_meses=detalle_meses, num_cuenta=num_cuenta)
+                              detalle_meses=detalle_meses, num_cuenta=num_cuenta, sin_hoja=L.SUBRUBROS_SIN_HOJA_SOPORTE)
 
 
 def _excel_control(S, ts_mes: pd.DataFrame) -> bytes:

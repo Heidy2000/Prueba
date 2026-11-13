@@ -1515,14 +1515,19 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: 
     return t[["mes", "presupuesto", "ejecutado", "saldo", "pct"]]
 
 
+# Sub-rubros que el soporte de ejecución resume en la hoja «Presupuesto» pero para los que no abre hoja de movimientos.
+SUBRUBROS_SIN_HOJA_SOPORTE = ("Inventarios",)
+
+
 def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
-                     detalle_meses: bool = False, num_cuenta: dict | None = None) -> bytes:
+                     detalle_meses: bool = False, num_cuenta: dict | None = None, sin_hoja: tuple = ()) -> bytes:
     """Excel de soporte: `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) del MISMO rubro,
     compañía y año. Hoja «Presupuesto»: el presupuesto muestra TODOS los meses del escenario y la ejecución es la ACUMULADA
     desde el primer mes del escenario hasta `mes` (los meses posteriores quedan en cero). Hojas de cada sub-rubro: solo los
     movimientos de SAP del mes `mes`. Los totales son fórmulas, como en el archivo original.
     `num_cuenta` (opcional): número de cuenta de SAP por cuenta de SISPO, para las filas de detalle de SISPO cuyo genérico ya no está en `ejec`.
-    Con `detalle_meses=True` las hojas de cada sub-rubro traen los movimientos de todos los meses hasta `mes` (con la columna «Mes»), en vez de solo los de `mes`."""
+    Con `detalle_meses=True` las hojas de cada sub-rubro traen los movimientos de todos los meses hasta `mes` (con la columna «Mes»), en vez de solo los de `mes`.
+    `sin_hoja`: sub-rubros que no llevan hoja de movimientos (siguen sumando en «Presupuesto», así los totales no cambian)."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter as col
@@ -1575,7 +1580,10 @@ def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int
     ws.freeze_panes = "B6"
 
     usados = {"presupuesto"}
+    omitir = {norm_texto(x) for x in sin_hoja}
     for k in orden:                                          # una hoja por sub-rubro CON movimientos
+        if k in omitir:
+            continue
         mv = ejec[ejec["sub_rubro"].fillna("").astype(str).map(norm_texto) == k]
         if mv.empty:
             continue

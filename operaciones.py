@@ -1183,9 +1183,6 @@ def _X_hoja_resumen(wb, meta, r):
     if r.get("papeleria"):
         c = r["papeleria"]
         fila = _X_seccion(ws, fila, "Papelería · cantidades (costo cero: no hay pesos que comparar)", 9)
-        if r.get("mensual_pap"):
-            mp = r["mensual_pap"]
-            fila = _X_matriz(ws, fila, mp["meses"], mp["filas"], _X_F_CANT, "Papelería (unidades)", mp["n_corte"])
         fila = _X_cabecera_tabla(ws, fila, ["Concepto", "Cantidad presupuestada (escenario)", "Cantidad presupuestada al corte", "Cantidad ejecutada",
                                           "Diferencia", "% ejecución", "Saldo del escenario", "Estado", "Salidas"])
         fila = _X_escribir(ws, fila, ["Papelería (unidades)", c["presupuesto_esc"], c["presupuesto"], c["ejecutado"], c["variacion"], _X_num(c["pct"]),
@@ -1251,17 +1248,6 @@ def _X_hoja_detalle(wb, meta, s):
     fila = _X_seccion(ws, fila, f"Presupuesto mensual, ejecución mensual y % de cumplimiento por ítem · {u}", ancho)
     fila = _X_matriz(ws, fila, im["meses"], im["filas"], fv, "Ítem", im["n_corte"])
 
-    # --- mensual
-    fila = _X_seccion(ws, fila, "Evolución mensual", ancho)
-    fila = _X_cabecera_tabla(ws, fila, ["Mes", "Presupuesto", "Ejecutado", "Variación", "% ejecución", "Presupuesto acumulado", "Ejecutado acumulado",
-                                      "% acumulado"])
-    fm = [None, fv, fv, fv, _X_F_PCT, fv, fv, _X_F_PCT]
-    for row in s["mensual"].itertuples(index=False):
-        es_tot = row.Mes == "Total al corte"
-        fila = _X_escribir(ws, fila, [row.Mes, row.presupuesto, _X_num(row.ejecutado), _X_num(row.variacion), _X_num(row.pct), _X_num(row.ppto_acum),
-                                    _X_num(row.ejec_acum), _X_num(row.pct_acum)], fm, "tot" if es_tot else None)
-    fila += 1
-
     # --- movimientos con subtotal por mes y total
     mv = s["movs"]
     fila = _X_seccion(ws, fila, f"Movimientos que componen la ejecución ({len(mv):,})".replace(",", "."), ancho)
@@ -1303,7 +1289,7 @@ def _sin_staf_mtto(df: pd.DataFrame) -> pd.Series:
 _SECCIONES = [(OS.HOJA_PAPELERIA, "2 Papelería", "2. PAPELERÍA · MOVIMIENTOS DE PAPELERÍA"),
               (OS.HOJA_CONSUMIBLES, "3 Consumibles", "3. CONSUMIBLES"),
               (OS.HOJA_HERRAMIENTAS, "4 Herramientas", "4. HERRAMIENTAS"),
-              (OS.HOJA_OTROS, "5 Bolsas", "5. BOLSAS")]
+              (OS.HOJA_OTROS, "5 Otros", "5. OTROS")]
 
 
 def _movimientos_informe(Q, hoja: str) -> pd.DataFrame:
@@ -1440,20 +1426,17 @@ def _informe(S) -> bytes:
             resumen["papeleria"] = _cifras(q, OS.HOJA_PAPELERIA)
     hay_sin = bool(len(S2.ejec[(S2.ejec["hoja"] == SIN_HOJA) & (S2.ejec["mes"] <= S2.hasta_mes)]))
     resumen["mensual_hojas"] = _mensual_hojas(S2, [h for h in S.hojas if h != OS.HOJA_PAPELERIA], hay_sin)
-    if resumen.get("papeleria"):
-        qp = _vista_cantidades(S2)
-        resumen["mensual_pap"] = _mensual_hojas(qp, [OS.HOJA_PAPELERIA], False)
     secciones = []
     for hoja, hoja_xl, titulo in _SECCIONES:
         if hoja not in S.hojas:
             continue
         Q = _vista_cantidades(S2) if hoja == OS.HOJA_PAPELERIA else S2
         secciones.append(dict(hoja_excel=hoja_xl, titulo=titulo, unidad="unidades" if hoja == OS.HOJA_PAPELERIA else "pesos",
-                              cifras=_cifras(Q, hoja), mensual=_mensual(Q, hoja), items=_items(Q, hoja), items_mes=_items_mes(Q, hoja),
+                              cifras=_cifras(Q, hoja), items=_items(Q, hoja), items_mes=_items_mes(Q, hoja),
                               movs=_movimientos_informe(Q, hoja)))
     if len(S2.ejec[(S2.ejec["hoja"] == SIN_HOJA) & (S2.ejec["mes"] <= S2.hasta_mes)]):      # para que el total del resumen cuadre con las hojas
         secciones.append(dict(hoja_excel="6 Sin hoja asignada", titulo="6. EJECUCIÓN SIN HOJA ASIGNADA", unidad="pesos", cifras=_cifras(S2, SIN_HOJA),
-                              mensual=_mensual(S2, SIN_HOJA), items=_items(S2, SIN_HOJA), items_mes=_items_mes(S2, SIN_HOJA),
+                              items=_items(S2, SIN_HOJA), items_mes=_items_mes(S2, SIN_HOJA),
                               movs=_movimientos_informe(S2, SIN_HOJA)))
         notas.append("La hoja «6 Sin hoja asignada» reúne ejecución del rubro 3.1 que aún no se reparte (SISPO sin cargar o sin cuadrar, o sub-rubro "
                      "sin asignar). Se incluye para que el total del resumen coincida con la suma de las hojas.")
@@ -1473,10 +1456,36 @@ def _informe(S) -> bytes:
     return _construir_informe(meta, resumen, secciones)
 
 
+# Compañía del informe descargable -> clave interna. «SM» es ALSM (Área Limpia Servicios Medioambientales).
+INFORME_EMPRESAS = {"SM": "ALSM", "ALDC": "ALDC"}
+
+
+def _vista_empresa(S, empresa: str):
+    """Copia de `S` con los datos de UNA sola compañía: presupuesto, ejecución, Papelería, SISPO y avisos salen de ella y de ninguna otra,
+    sin importar la compañía elegida en pantalla. Mantiene el filtro por gerencia de quien consulta."""
+    d = S.datos_e[empresa]
+    c = S.cfg
+    ppto = S.ppto_todo[(S.ppto_todo["empresa"] == empresa) & (S.ppto_todo["anio"] == c["anio"]) & S.ppto_todo["mes"].between(S.m0, S.m1)]
+    ejec = d.ejec
+    lin_pap = d.lin_pap if S.ver_todo else OS.papeleria(pd.DataFrame(), c, "", {})
+    if not S.ver_todo:                                       # quien no ve todo, solo lo de su gerencia
+        ejec = ejec[ejec["gerencia"] == S.ctx.usuario]
+        ppto = ppto[ppto["hoja"].isin(S.hojas)]
+    return SimpleNamespace(**{**vars(S), "sel": [empresa], "multi": False, "ppto": ppto, "ppto_todo": S.ppto_todo[S.ppto_todo["empresa"] == empresa],
+                              "ejec": ejec, "datos_e": {empresa: d}, "lin_pap": lin_pap, "avisos": list(d.avisos),
+                              "lin_sispo": S.lin_sispo[S.lin_sispo["empresa"] == empresa], "per_sispo": S.per_sispo[S.per_sispo["empresa"] == empresa]})
+
+
 def _descarga_ejecucion(S):
-    st.download_button("Descargar informe (Excel)", lambda: _informe(S), f"informe_operaciones_{S.escenario.replace(' ', '_')}_{S.hasta_mes:02d}.xlsx",
-                       icon=":material/download:", key="op_dl_informe",
-                       help="Resumen general + Papelería, Consumibles, Herramientas y Bolsas. Sin los movimientos de Staf Mantenimiento.")
+    """Descarga del informe de una compañía a la vez (SM o ALDC): nunca mezcla ni completa una con los datos de la otra."""
+    c1, c2 = st.columns([1, 2], vertical_alignment="bottom")
+    etiqueta = c1.selectbox("Compañía del informe", list(INFORME_EMPRESAS), key="op_empresa_informe",
+                            help="El archivo se genera solo con los datos, movimientos, cuentas y clasificación de la compañía elegida.")
+    e = INFORME_EMPRESAS[etiqueta]
+    c2.download_button(f"Descargar informe {etiqueta} (Excel)", lambda: _informe(_vista_empresa(S, e)),
+                       f"informe_operaciones_{etiqueta}_{S.escenario.replace(' ', '_')}_{S.hasta_mes:02d}.xlsx",
+                       icon=":material/download:", key=f"op_dl_informe_{etiqueta}",
+                       help="Resumen general + Papelería, Consumibles, Herramientas y Otros. Sin los movimientos de Staf Mantenimiento.")
 
 
 def _mostrar(ctx):

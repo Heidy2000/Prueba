@@ -22,6 +22,7 @@ import db as base_datos
 import estilo as E
 import mod_admin
 import mod_combustible
+import mod_corte_poda
 import mod_cartera
 import mod_eeff
 import mod_flujo
@@ -102,6 +103,7 @@ def conectar():
     """)
     con.crear_tablas(cartera.ddl(con.motor))
     con.crear_tablas(sispo_fuente.ddl(con.motor))
+    con.crear_tablas(mod_corte_poda.TABLAS)
 
     # columnas agregadas en versiones posteriores (bases creadas antes las reciben vacías)
     nuevas = {
@@ -160,6 +162,7 @@ MODULOS = [  # (nombre, ícono, sección del menú, función)
     ("Combustible", ":material/local_gas_station:", "Operación", mod_combustible.mostrar),
     ("Mantenimiento", ":material/build:", "Operación", mod_mantenimiento.mostrar),
     ("Operaciones", ":material/engineering:", "Operación", Operaciones.mostrar),
+    ("Corte y poda", ":material/park:", "Operación", mod_corte_poda.mostrar),
     ("Nómina", ":material/badge:", "Talento humano", mod_nomina.mostrar),
     ("Administración", ":material/settings:", "Control", mod_admin.mostrar),
 ]
@@ -169,7 +172,8 @@ ACCESO_DEFECTO = {"Nómina": ["Recursos Humanos"],
                   "Estados financieros": ["Dirección", "Administrativa y Financiera"],
                   "Cartera": ["Dirección", "Administrativa y Financiera"]}
 # acceso fijo: manda sobre secrets (Financiera, el administrador, siempre ve todo)
-ACCESO_FIJO = {"Combustible": ["Operaciones", "Administrativa y Financiera"]}
+ACCESO_FIJO = {"Combustible": ["Operaciones", "Administrativa y Financiera"],
+               "Corte y poda": ["Operaciones", "Administrativa y Financiera"]}
 
 
 def puede_ver(usuario: str, modulo: str) -> bool:
