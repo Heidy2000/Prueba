@@ -493,42 +493,18 @@ def _columnas_mes(S=None):
 
 
 def _graficos_mes(S, t: pd.DataFrame, hoja: str):
+    """Un solo gráfico por hoja: presupuesto vs ejecutado mes a mes (el acumulado ya está en la tabla)."""
     m = t[t["mes"] > 0]
     x = [f"{MESES[mm - 1]} {str(S.cfg['anio'])[2:]}" for mm in m["mes"]]
-    div, suf, que = (1.0, " und", "unidades") if S.cant else (1e6, " M", "millones de pesos")
-    c1, c2 = st.columns(2)
-    with c1:
-        with st.container(key=f"op_card_graf_mes_{hoja}"):
-            titulo_tarjeta("Mes a mes", f"Presupuesto vs ejecutado ({que})")
-            fig = go.Figure()
-            fig.add_bar(x=x, y=m["presupuesto"] / div, name="Presupuesto", marker_color="#c9d4e4", marker_line_width=0,
-                        hovertemplate="%{y:,.1f}" + suf)
-            fig.add_bar(x=x, y=m["ejecutado"] / div, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0,
-                        hovertemplate="%{y:,.1f}" + suf)
-            fig.update_layout(barmode="group", bargap=.25, yaxis=dict(tickformat=",.0f", ticksuffix=suf, rangemode="tozero"))
-            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
-    with c2:
-        with st.container(key=f"op_card_graf_acum_{hoja}"):
-            titulo_tarjeta("Acumulado", f"Presupuesto acumulado vs ejecución acumulada ({que})")
-            fig = go.Figure()
-            fig.add_scatter(x=x, y=(m["presupuesto"].cumsum()) / div, name="Presupuesto acumulado", mode="lines+markers",
-                            line=dict(color="#9fb0c9", width=2, dash="dot"), hovertemplate="%{y:,.1f}" + suf)
-            fig.add_scatter(x=x, y=m["ejec_acum"] / div, name="Ejecutado acumulado", mode="lines+markers",
-                            line=dict(color=E.AZUL, width=3), hovertemplate="%{y:,.1f}" + suf)
-            fig.update_layout(yaxis=dict(tickformat=",.0f", ticksuffix=suf, rangemode="tozero"))
-            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
-
-
-def _graf_items(it: pd.DataFrame, S):
-    top = it[it["presupuesto_esc"] > 0].head(12).iloc[::-1]
-    if top.empty:
-        return
-    div, suf = (1.0, " und") if S.cant else (1e6, " M")
-    fig = go.Figure()
-    fig.add_bar(y=[s[:48] for s in top["item"]], x=top["presupuesto_esc"] / div, orientation="h", marker_color=E.AZUL,
-                marker_line_width=0, hovertemplate="%{y}: %{x:,.2f}" + suf + "<extra>Presupuesto</extra>", name="Presupuesto del escenario")
-    fig.update_layout(xaxis=dict(tickformat=",.1f", ticksuffix=suf), yaxis=dict(type="category"), showlegend=False)
-    st.plotly_chart(estilo_grafico(fig, 420), width="stretch", config={"displayModeBar": False})
+    div, suf, que = (1.0, "", "unidades") if S.cant else (1e6, " M", "millones de pesos")
+    with st.container(key=f"op_card_graf_mes_{hoja}"):
+        titulo_tarjeta("Mes a mes", f"Presupuesto vs ejecutado ({que})")
+        fig = go.Figure()
+        for nombre, col, color in (("Presupuesto", "presupuesto", "#c9d4e4"), ("Ejecutado", "ejecutado", E.AZUL)):
+            fig.add_bar(x=x, y=m[col] / div, name=nombre, marker_color=color, marker_line_width=0, hovertemplate="%{y:,.1f}" + suf,
+                        text=(m[col] / div).map(lambda v: f"{v:,.0f}") if len(m) <= 8 else None, textposition="outside", cliponaxis=False)
+        fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
+        st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
 
 
 def _excel(hojas: dict) -> bytes:
@@ -565,22 +541,18 @@ def _tab_hoja(S, hoja: str):
         titulo_tarjeta("Presupuesto y ejecución por ítem", f"{S.escenario} · "
                        + ("cantidad presupuestada del libro contra salidas del SISPO" if S.cant else
                           "presupuesto del libro (cantidad × costo unitario) contra salidas del SISPO"))
-        c_t, c_g = st.columns([1.35, 1])
-        with c_t:
-            nc = st.column_config.NumberColumn
-            fm = "localized" if S.cant else "accounting"
-            vis = it.drop(columns=["cantidad", "costo_unit"]) if S.cant else it
-            conf = {"item": "Ítem", "cantidad": nc("Cantidad presupuestada", format="localized"),
-                    "costo_unit": nc("Costo unit. promedio", format="accounting"),
-                    "presupuesto_esc": nc("Presupuesto escenario", format=fm), "presupuesto": nc("Presupuesto al corte", format=fm),
-                    "ejecutado": nc("Ejecutado", format=fm), "variacion": nc("Variación", format=fm),
-                    "pct": nc("% ejecución", format="percent"), "peso": nc("% del total", format="percent")}
-            st.dataframe(_estilo(vis, "variacion"), hide_index=True, width="stretch", height=min(40 + 35 * len(vis), 460),
-                         column_config={k: v for k, v in conf.items() if k in vis.columns})
-            st.caption("Lo ejecutado que no tiene ítem presupuestado en esta hoja aparece con presupuesto 0 (marcado «sin ítem» si la referencia "
-                       "no tiene equivalencia). Las equivalencias referencia → ítem se editan en «Datos base».")
-        with c_g:
-            _graf_items(it, S)
+        nc = st.column_config.NumberColumn
+        fm = "localized" if S.cant else "accounting"
+        vis = it.drop(columns=["cantidad", "costo_unit"]) if S.cant else it
+        conf = {"item": "Ítem", "cantidad": nc("Cantidad presupuestada", format="localized"),
+                "costo_unit": nc("Costo unit. promedio", format="accounting"),
+                "presupuesto_esc": nc("Presupuesto escenario", format=fm), "presupuesto": nc("Presupuesto al corte", format=fm),
+                "ejecutado": nc("Ejecutado", format=fm), "variacion": nc("Variación", format=fm),
+                "pct": nc("% ejecución", format="percent"), "peso": nc("% del total", format="percent")}
+        st.dataframe(_estilo(vis, "variacion"), hide_index=True, width="stretch", height=min(40 + 35 * len(vis), 460),
+                     column_config={k: v for k, v in conf.items() if k in vis.columns})
+        st.caption("Lo ejecutado que no tiene ítem presupuestado en esta hoja aparece con presupuesto 0 (marcado «sin ítem» si la referencia "
+                   "no tiene equivalencia). Las equivalencias referencia → ítem se editan en «Datos base».")
     e = _ejec_hoja(S, hoja)
     e = e[e["mes"] <= S.hasta_mes]
     cols_mov = ["empresa", "fecha", "mes", "documento", "tercero", "texto", "codigo_articulo", "cuenta_nombre", "sub_rubro_sap", "cc_nombre"]
@@ -720,7 +692,10 @@ def _tab_resumen(S):
                         hovertemplate="%{y:,.1f} M")
             fig.add_bar(x=graf["hoja"], y=graf["ejecutado"] / 1e6, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0,
                         hovertemplate="%{y:,.1f} M")
-            fig.update_layout(barmode="group", bargap=.3, yaxis=dict(tickformat=",.0f", ticksuffix=" M", rangemode="tozero"))
+            fig.update_traces(text=None)
+            fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
+            fig.data[0].update(text=(graf["presupuesto"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
+            fig.data[1].update(text=(graf["ejecutado"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
             st.plotly_chart(estilo_grafico(fig, 320), width="stretch", config={"displayModeBar": False})
     if OS.HOJA_PAPELERIA in S.hojas:                    # Papelería: en cantidades, aparte de los pesos
         q = _vista_cantidades(S)

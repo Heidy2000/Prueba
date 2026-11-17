@@ -1812,16 +1812,26 @@ def sispo_placas(lineas: pd.DataFrame, registro: pd.DataFrame) -> pd.DataFrame:
 
 
 def sispo_maestro_leer(archivo) -> tuple[pd.DataFrame, dict]:
-    """Base maestra: Codigo Articulo, Articulo y CONCEPTO ASIGNADO. Una referencia con dos conceptos distintos es un error (no se
-    adivina); las filas sin código o sin concepto se informan y no se cargan."""
+    """Base maestra de referencias. Formato vigente: Bodega, Articulo (código), Texto (descripción), Clasificación (categoría) y
+    ELEMENTO (detalle); el concepto de la referencia es el ELEMENTO y la categoría queda aparte (la columna PTO no se usa).
+    También se lee el formato anterior (Codigo Articulo, Articulo, CONCEPTO ASIGNADO). Una referencia con dos conceptos distintos
+    es un error (no se adivina); las filas sin código o sin concepto se informan y no se cargan."""
     d = pd.read_excel(archivo, dtype=object)
     claves = {_canon(c): c for c in d.columns}
-    faltan = [k for k in ("CODIGOARTICULO", "CONCEPTOASIGNADO") if k not in claves]
-    if faltan:
-        raise ValueError("A la base maestra le faltan columnas: «Codigo Articulo» y/o «CONCEPTO ASIGNADO».")
-    m = pd.DataFrame({"codigo": d[claves["CODIGOARTICULO"]].map(_cod_articulo),
-                      "articulo": d[claves["ARTICULO"]].map(lambda x: " ".join(_como_texto(x).split())) if "ARTICULO" in claves else "",
-                      "concepto": d[claves["CONCEPTOASIGNADO"]].map(lambda x: " ".join(_como_texto(x).split()))})
+    cat = next((claves[k] for k in ("CLASIFICACION", "CLASIFIACION") if k in claves), None)   # el libro trae «Clasifiación»
+    if "ELEMENTO" in claves and "CODIGOARTICULO" not in claves:
+        c_cod, c_art, c_con = claves.get("ARTICULO"), claves.get("TEXTO"), claves["ELEMENTO"]
+    else:
+        c_cod, c_art, c_con = claves.get("CODIGOARTICULO"), claves.get("ARTICULO"), claves.get("CONCEPTOASIGNADO")
+    if c_cod is None or c_con is None:
+        raise ValueError("A la base maestra le faltan columnas: «Articulo» (código) y «ELEMENTO» "
+                         "(o, en el formato anterior, «Codigo Articulo» y «CONCEPTO ASIGNADO»).")
+    limpio = lambda x: " ".join(_como_texto(x).split())
+    m = pd.DataFrame({"codigo": d[c_cod].map(_cod_articulo),
+                      "articulo": d[c_art].map(limpio) if c_art else "",
+                      "concepto": d[c_con].map(limpio),
+                      "categoria": d[cat].map(limpio) if cat else "",
+                      "bodega": d[claves["BODEGA"]].map(limpio) if "BODEGA" in claves else ""})
     sin = m[(m["codigo"] == "") | (m["concepto"] == "")]
     m = m.drop(sin.index)
     distintos = m.groupby("codigo")["concepto"].nunique()

@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS mtto_sispo_reemplazados(empresa TEXT, periodo INT, ll
     sub_rubro TEXT DEFAULT '', sub_rubro_sap TEXT DEFAULT '');
 """
 # columnas agregadas a tablas que ya existían en versiones anteriores del módulo
-MIGRACIONES = {"mtto_ppto": {"texto_original": "TEXT DEFAULT ''"}, "mtto_clasif_manual": {"placa": "TEXT DEFAULT ''"},
+MIGRACIONES = {"mtto_sispo_ref": {"categoria": "TEXT DEFAULT ''", "bodega": "TEXT DEFAULT ''"},   # base maestra: Clasificación y Bodega
+               "mtto_ppto": {"texto_original": "TEXT DEFAULT ''"}, "mtto_clasif_manual": {"placa": "TEXT DEFAULT ''"},
                "mtto_clasif_log": {"motivo": "TEXT DEFAULT ''"},
                # la reclasificación SISPO pasó de una cuenta (flota) a siete: lo ya aplicado queda como de la flota
                "mtto_sispo_periodo": {"cuenta": "TEXT DEFAULT 'FLOTA Y EQUIPO DE TR'"},
@@ -1594,8 +1595,8 @@ def _sispo_cargar_maestro(ctx, m: pd.DataFrame, reemplazar: bool, archivo: str):
         for i in range(0, len(m), 200):
             parte = list(m["codigo"].iloc[i:i + 200])
             ctx.con.execute("DELETE FROM mtto_sispo_ref WHERE codigo IN (" + ",".join("?" * len(parte)) + ")", tuple(parte))
-    _insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha)",
-                        [(r.codigo, r.articulo, r.concepto, ctx.usuario, ahora_txt) for r in m.itertuples()])
+    _insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha, categoria, bodega)",
+                        [(r.codigo, r.articulo, r.concepto, ctx.usuario, ahora_txt, r.categoria, r.bodega) for r in m.itertuples()])
     ctx.con.commit()
     ctx.registrar_carga(ctx.usuario, "Base maestra SISPO", archivo, f"{len(m)} referencias" + (" (reemplazo total)" if reemplazar else ""))
 
@@ -1787,13 +1788,19 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
 def admin_base_maestra(ctx):
     """Carga de la base maestra de referencias y conceptos (se usa desde Administración)."""
     _exigir_admin(ctx)
-    maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
+    maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha, categoria FROM mtto_sispo_ref")
     if maestro.empty:
-        st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Codigo Articulo», «Articulo» y «CONCEPTO ASIGNADO».",
+        st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Bodega», «Articulo», «Texto», «Clasificación» y «ELEMENTO».",
                    icon=":material/warning:")
     else:
-        st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} conceptos · última actualización "
+        st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} elementos · última actualización "
                 f"{maestro['fecha'].max()}.".replace(",", "."), icon=":material/database:")
+        if "categoria" in maestro and maestro["categoria"].fillna("").ne("").any():
+            res = (maestro.assign(categoria=maestro["categoria"].replace("", "(sin clasificación)"))
+                   .groupby("categoria").agg(Elementos=("concepto", "nunique"), Referencias=("codigo", "count")).reset_index()
+                   .rename(columns={"categoria": "Clasificación"}).sort_values("Referencias", ascending=False))
+            with st.expander("Referencias por clasificación"):
+                st.dataframe(res, hide_index=True, width="stretch")
     up_m = st.file_uploader("Base maestra (.xlsx): adjúntala la primera vez o cuando quieras actualizarla", type=["xlsx"],
                             key="mt_sispo_up_maestro")
     if up_m:

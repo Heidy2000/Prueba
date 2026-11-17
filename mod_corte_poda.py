@@ -283,10 +283,12 @@ def mostrar(ctx):
     for col, titulo, p, e in ((g1, "Área (m²) por mes", "m2", "m2_ej"), (g2, "Árboles por mes", "arboles", "arboles_ej")):
         with col:
             titulo_tarjeta(titulo)
-            fig = go.Figure([go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO),
-                             go.Bar(x=mes_txt, y=t[e], name="Ejecutado", marker_color=COLOR_EJEC)])
-            fig.update_layout(barmode="group")
-            st.plotly_chart(estilo_grafico(fig, 280), width="stretch")
+            fig = go.Figure([go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO, marker_line_width=0,
+                                    text=t[p].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", ".")), textposition="outside", cliponaxis=False),
+                             go.Bar(x=mes_txt, y=t[e], name="Ejecutado", marker_color=COLOR_EJEC, marker_line_width=0,
+                                    text=t[e].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", ".")), textposition="outside", cliponaxis=False)])
+            fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(estilo_grafico(fig, 280), width="stretch", config={"displayModeBar": False})
 
     corte = pd.DataFrame({"Mes": mes_txt, "m² presup.": t["m2"], "m² ejec.": t["m2_ej"],
                           "% m²": [_pct(a, b) for a, b in zip(t["m2_ej"], t["m2"])],
