@@ -10,12 +10,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import estilo as E
-from ui import MESES_L, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
+from ui import MESES_L, ahora, estilo_grafico, selector_periodo, titulo_tarjeta
 
 TABLAS = """
 CREATE TABLE IF NOT EXISTS cp_ppto(anio INT, mes INT, m2 REAL, tarifa_corte_mta REAL, tarifa_corte_nmt REAL,
     valor_corte_mta REAL, valor_corte_nmt REAL, arboles REAL, valor_poda_mta REAL, valor_poda_nmt REAL, archivo TEXT);
-CREATE TABLE IF NOT EXISTS cp_ejec(anio INT, mes INT, m2 REAL, arboles REAL, archivo TEXT)
+CREATE TABLE IF NOT EXISTS cp_ejec(anio INT, mes INT, m2 REAL, tarifa REAL, valor_corte REAL, arboles REAL, valor_poda REAL, actualizado TEXT)
 """
 COLOR_PPTO, COLOR_EJEC = "#9aa7b8", E.AZUL
 
@@ -87,51 +87,20 @@ def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]
     return d, avisos
 
 
-def leer_ejecucion(archivo, anio_defecto: int) -> tuple[pd.DataFrame, list[str]]:
-    """Ejecución: columnas reconocidas por nombre (Año, Mes o Fecha, m², Árboles). Varias filas del mismo mes se suman."""
-    d = pd.read_excel(archivo, dtype=object)
-    claves = {_norm(c): c for c in d.columns}
-    def col(*prefijos):
-        return next((c for k, c in claves.items() if any(k.startswith(p) for p in prefijos)), None)
-    c_f, c_m, c_a = col("FECHA"), col("MES"), col("ANO", "ANIO")
-    c_m2 = col("M2", "AREA", "METROS")
-    c_ar = col("ARBOL", "PODA")
-    if (c_f is None and c_m is None) or (c_m2 is None and c_ar is None):
-        raise ValueError("El archivo necesita una columna de mes (o fecha) y al menos una de m² / árboles.")
-    avisos = []
-    if c_f is not None:
-        f = pd.to_datetime(d[c_f], errors="coerce")
-        anio, mes = f.dt.year, f.dt.month
-    else:
-        mes = d[c_m].map(_mes)
-        anio = pd.to_numeric(d[c_a], errors="coerce") if c_a else pd.Series(anio_defecto, index=d.index)
-    out = pd.DataFrame({"anio": anio, "mes": mes,
-                        "m2": pd.to_numeric(d[c_m2], errors="coerce") if c_m2 else float("nan"),
-                        "arboles": pd.to_numeric(d[c_ar], errors="coerce") if c_ar else float("nan")})
-    malas = out["anio"].isna() | out["mes"].isna()
-    if malas.any():
-        avisos.append(f"{int(malas.sum())} fila(s) sin mes/año válido no se cargan.")
-    out = out[~malas].astype({"anio": int, "mes": int})
-    out = out.groupby(["anio", "mes"], as_index=False).agg(m2=("m2", lambda s: s.sum(min_count=1)),
-                                                           arboles=("arboles", lambda s: s.sum(min_count=1)))
-    return out, avisos
-
-
-def plantilla_ejecucion() -> bytes:
-    return a_excel(pd.DataFrame({"Año": [2026, 2026], "Mes": ["SEPTIEMBRE", "OCTUBRE"],
-                                 "m² ejecutados": [None, None], "Árboles podados": [None, None]}))
-
-
 # ------------------------------------------------------------------ cálculo
 def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame) -> pd.DataFrame:
     """Una fila por mes: presupuesto, ejecución (vacía si no hay dato: no es cero) y ejecución valorizada con cada tarifa."""
     ppto = ppto.apply(pd.to_numeric, errors="coerce")
-    t = ppto.merge(ejec.rename(columns={"m2": "m2_ej", "arboles": "arboles_ej"})[["anio", "mes", "m2_ej", "arboles_ej"]],
-                   on=["anio", "mes"], how="left")
+    ejec = ejec.apply(pd.to_numeric, errors="coerce")
+    t = ppto.merge(ejec.rename(columns={"m2": "m2_ej", "arboles": "arboles_ej", "valor_corte": "fact_corte", "valor_poda": "fact_poda"})
+                   [["anio", "mes", "m2_ej", "arboles_ej", "fact_corte", "fact_poda"]], on=["anio", "mes"], how="left")
     for esc in ("mta", "nmt"):
         t[f"corte_ej_{esc}"] = t["m2_ej"] * t[f"tarifa_corte_{esc}"]
         por_arbol = t[f"valor_poda_{esc}"] / t["arboles"].where(t["arboles"] > 0)
         t[f"poda_ej_{esc}"] = t["arboles_ej"] * por_arbol
+    # Lo facturado es la ejecución real en pesos: manda sobre la valorización con tarifa en la columna MTA (vigente hoy).
+    t["corte_ej_mta"] = t["fact_corte"].where(t["fact_corte"].notna(), t["corte_ej_mta"])
+    t["poda_ej_mta"] = t["fact_poda"].where(t["fact_poda"].notna(), t["poda_ej_mta"])
     return t.sort_values(["anio", "mes"]).reset_index(drop=True)
 
 
@@ -165,10 +134,10 @@ def resumen(t: pd.DataFrame) -> dict:
 def admin_cargas(ctx):
     con, leer = ctx.con, ctx.leer
     with st.container(key="card_adm_cp"):
-        titulo_tarjeta("Corte y poda", "Presupuesto (libro de servicios proyectados) y ejecución mensual de m² y árboles.")
+        titulo_tarjeta("Corte y poda", "Presupuesto (libro de servicios proyectados) y ejecución mensual digitada: m², árboles y lo facturado.")
         anio0 = st.number_input("Año del primer mes del libro", 2024, 2035, 2026, key="cp_anio0",
                                 help="El año sube solo al pasar de diciembre a enero.")
-        a, b = st.tabs(["Presupuesto", "Ejecución"])
+        a, b = st.tabs(["Presupuesto", "Ejecución (histórico manual)"])
         with a:
             f = st.file_uploader("Libro de presupuesto", type=["xlsx", "xlsm"], key="cp_f_ppto", label_visibility="collapsed")
             if f is not None:
@@ -188,24 +157,89 @@ def admin_cargas(ctx):
                         ctx.registrar_carga(ctx.usuario, "Corte y poda · presupuesto", f.name, f"{len(d)} meses")
                         st.success("Presupuesto guardado.")
         with b:
-            st.download_button("Descargar plantilla", plantilla_ejecucion(), "plantilla_ejecucion_corte_poda.xlsx",
-                               icon=":material/download:", key="cp_plantilla")
-            f = st.file_uploader("Archivo de ejecución", type=["xlsx", "xlsm"], key="cp_f_ejec", label_visibility="collapsed")
-            if f is not None:
-                try:
-                    d, avisos = leer_ejecucion(f, int(anio0))
-                except Exception as err:
-                    st.error(f"No pude leer el archivo: {err}")
-                else:
-                    for x in avisos:
-                        st.warning(x)
-                    st.dataframe(d, hide_index=True, width="stretch")
-                    if st.button("Guardar ejecución", type="primary", key="cp_g_ejec"):
-                        for r in d.itertuples(index=False):
-                            con.execute("DELETE FROM cp_ejec WHERE anio=? AND mes=?", (int(r.anio), int(r.mes)))
-                        con.anexar(d.assign(archivo=f.name), "cp_ejec"); con.commit()
-                        ctx.registrar_carga(ctx.usuario, "Corte y poda · ejecución", f.name, f"{len(d)} meses")
-                        st.success("Ejecución guardada.")
+            _digitar_mes(ctx)
+            with st.expander("Histórico completo (corregir o borrar meses)"):
+                _editor_historico(ctx)
+
+
+def _digitar_mes(ctx):
+    """Digitación de un mes: solo corte o solo poda. Guarda únicamente lo que se digita y conserva lo demás del mes."""
+    con, leer = ctx.con, ctx.leer
+    c = st.columns([1.2, 0.8, 1.2], vertical_alignment="bottom")
+    tipo = c[0].segmented_control("Ejecución de", ["Corte", "Poda"], default="Corte", key="cp_tipo") or "Corte"
+    hoy = ahora()
+    anio = int(c[1].number_input("Año", 2024, 2040, hoy.year, key="cp_f_anio"))
+    mes = c[2].selectbox("Mes", list(range(1, 13)), index=hoy.month - 1, key="cp_f_mes", format_func=lambda m: MESES_L[m - 1].capitalize())
+    ya = leer("SELECT * FROM cp_ejec WHERE anio=? AND mes=?", (anio, mes))
+    ya = ya.iloc[0] if len(ya) else None
+    prev = lambda k: None if ya is None or pd.isna(ya[k]) else float(ya[k])
+    if ya is not None:
+        st.caption(f"{MESES_L[mes - 1].capitalize()} {anio} ya tiene datos: lo que guardes los actualiza.")
+    k = f"{anio}_{mes}_{tipo}"                       # al cambiar de mes o tipo, los campos toman el valor guardado
+    if tipo == "Corte":
+        f = st.columns(3)
+        m2 = f[0].number_input("m² ejecutados", 0.0, value=prev("m2"), step=1000.0, format="%.0f", key=f"cp_m2_{k}")
+        tar = f[1].number_input("$/m²", 0.0, value=prev("tarifa"), step=0.1, format="%.2f", key=f"cp_tar_{k}")
+        t0 = prev("valor_corte")             # si el total guardado es m² × $/m², se deja en blanco para que se recalcule al cambiar m²
+        if t0 is not None and prev("m2") is not None and prev("tarifa") is not None and abs(t0 - prev("m2") * prev("tarifa")) < 1:
+            t0 = None
+        tot = f[2].number_input("Total corte ($)", 0.0, value=t0, step=1000.0, format="%.0f", key=f"cp_tot_{k}",
+                                help="En blanco = m² × $/m²")
+        nuevo = dict(m2=m2, tarifa=tar, valor_corte=tot if tot is not None else (round(m2 * tar) if m2 is not None and tar is not None else None))
+        vacio = m2 is None and tot is None
+    else:
+        f = st.columns(2)
+        arb = f[0].number_input("Árboles podados", 0.0, value=prev("arboles"), step=1.0, format="%.0f", key=f"cp_arb_{k}")
+        tot = f[1].number_input("Total poda ($)", 0.0, value=prev("valor_poda"), step=1000.0, format="%.0f", key=f"cp_totp_{k}")
+        nuevo = dict(arboles=arb, valor_poda=tot)
+        vacio = arb is None and tot is None
+    if st.button(f"Guardar {tipo.lower()} de {MESES_L[mes - 1]} {anio}", type="primary", key="cp_g_mes", disabled=vacio):
+        fila = {c_: (None if ya is None or pd.isna(ya[c_]) else ya[c_]) for c_ in ("m2", "tarifa", "valor_corte", "arboles", "valor_poda")}
+        fila.update(nuevo)
+        con.execute("DELETE FROM cp_ejec WHERE anio=? AND mes=?", (anio, mes))
+        con.anexar(pd.DataFrame([dict(anio=anio, mes=mes, **fila, actualizado=hoy.strftime("%Y-%m-%d %H:%M"))]), "cp_ejec"); con.commit()
+        ctx.registrar_carga(ctx.usuario, f"Corte y poda · ejecución {tipo.lower()}", "manual", f"{MESES_L[mes - 1]} {anio}")
+        st.success(f"Guardado: {tipo.lower()} de {MESES_L[mes - 1]} {anio}.")
+        st.rerun()
+
+
+def _editor_historico(ctx):
+    """Histórico manual de ejecución: se agregan, corrigen o borran meses y se guarda todo junto. Valores en blanco: el total de
+    corte se calcula como m² × $/m² y la poda queda sin valor."""
+    con, leer = ctx.con, ctx.leer
+    h = leer("SELECT anio, mes, m2, tarifa, valor_corte, arboles, valor_poda FROM cp_ejec ORDER BY anio, mes")
+    primera = h.empty
+    if primera:                                      # primera vez: lo ya facturado, para revisar y guardar
+        h = pd.DataFrame({"anio": [2026, 2026], "mes": [9, 10], "m2": [9382754.0, 9342238.0], "tarifa": [151.2, 151.2],
+                          "valor_corte": [1418672405.0, 1412546386.0], "arboles": [None, None], "valor_poda": [None, None]})
+        st.caption("Precargado con lo facturado de corte de septiembre y octubre; revísalo y guarda.")
+    h = h.assign(mes=h["mes"].map(lambda m: MESES_L[int(m) - 1].capitalize()))
+    h = h.rename(columns={"anio": "Año", "mes": "Mes", "m2": "m² ejecutados", "tarifa": "$/m²", "valor_corte": "Total corte ($)",
+                          "arboles": "Árboles podados", "valor_poda": "Total poda ($)"})
+    ed = st.data_editor(h, num_rows="dynamic", hide_index=True, width="stretch", key="cp_editor", column_config={
+        "Año": st.column_config.NumberColumn(format="%d", min_value=2024, max_value=2040, step=1, required=True),
+        "Mes": st.column_config.SelectboxColumn(options=[m.capitalize() for m in MESES_L], required=True),
+        "m² ejecutados": st.column_config.NumberColumn(format="%.0f", min_value=0),
+        "$/m²": st.column_config.NumberColumn(format="%.2f", min_value=0),
+        "Total corte ($)": st.column_config.NumberColumn(format="%.0f", help="En blanco = m² × $/m²", min_value=0),
+        "Árboles podados": st.column_config.NumberColumn(format="%.0f", min_value=0),
+        "Total poda ($)": st.column_config.NumberColumn(format="%.0f", min_value=0)})
+    if st.button("Guardar histórico", type="primary", key="cp_g_ejec"):
+        d = ed.dropna(subset=["Año", "Mes"]).copy()
+        d["mes"] = d["Mes"].map(lambda m: [x.capitalize() for x in MESES_L].index(m) + 1)
+        d["anio"] = d["Año"].astype(int)
+        if d.duplicated(["anio", "mes"]).any():
+            dup = d[d.duplicated(["anio", "mes"], keep=False)]
+            st.error("Hay meses repetidos: " + ", ".join(sorted({f"{MESES_L[m - 1]} {a}" for a, m in zip(dup["anio"], dup["mes"])})))
+            return
+        d["valor_corte"] = d["Total corte ($)"].where(d["Total corte ($)"].notna(), (d["m² ejecutados"] * d["$/m²"]).round(0))
+        out = d.assign(m2=d["m² ejecutados"], tarifa=d["$/m²"], arboles=d["Árboles podados"], valor_poda=d["Total poda ($)"],
+                       actualizado=ahora().strftime("%Y-%m-%d %H:%M"))[
+            ["anio", "mes", "m2", "tarifa", "valor_corte", "arboles", "valor_poda", "actualizado"]]
+        con.execute("DELETE FROM cp_ejec")
+        con.anexar(out, "cp_ejec"); con.commit()
+        ctx.registrar_carga(ctx.usuario, "Corte y poda · ejecución", "manual", f"{len(out)} meses")
+        st.success(f"Histórico guardado: {len(out)} meses.")
 
 
 # ------------------------------------------------------------------ pestaña

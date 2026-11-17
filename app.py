@@ -119,6 +119,7 @@ def conectar():
                                                        "ref3", "referencia", "compensacion", "anulado", "origen",
                                                        "regla", "confianza"]}},
         "combustible": {c: "TEXT DEFAULT ''" for c in ["clave", "documento", "estacion", "hora", "km"]},
+        "cp_ejec": {"tarifa": "REAL", "valor_corte": "REAL", "valor_poda": "REAL", "actualizado": "TEXT DEFAULT ''"},
         "nomina_homol": {"cc": "TEXT DEFAULT ''"},
         "nomina_ppto": {c: "DOUBLE PRECISION" for c in nomina.COLS_CONCEPTO},
         "ejecucion": {**{c: "TEXT DEFAULT ''" for c in ["clave", "origen", "regla", "confianza", "cc_sap",
