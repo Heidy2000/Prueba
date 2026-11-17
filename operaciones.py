@@ -1338,7 +1338,7 @@ def _validaciones_informe(S2, secciones: list, resumen: dict, n_staf_sap: int) -
     def regla(nombre, clave, ok_txt):
         malos = int((~m[clave]).sum()) if len(sis) else 0
         v.append((nombre, "CUMPLE" if malos == 0 else "NO CUMPLE", ok_txt if malos == 0 else f"{malos} movimientos del SISPO no cumplen."))
-    regla("Solo los 5 centros de costo autorizados (DB010500, 504, 515, 501, 509)", "centro", f"{len(sis)} movimientos del SISPO revisados.")
+    regla("Centro de costo autorizado (DB010500, 504, 515, 501, 509) o cuenta OTROS de cualquier centro", "centro", f"{len(sis)} movimientos del SISPO revisados.")
     regla("Solo grupos 5 (Insumos) y 7 (Herramientas), salvo ítems del presupuesto y la cuenta OTROS", "grupo", "Sin otros grupos que no crucen con el presupuesto ni sean cuenta OTROS.")
     regla("Solo cuentas ÚTILES, PAPELERÍA Y OTROS y OTROS", "cuenta", "Sin otras cuentas.")
     regla("Sin Staf Mantenimiento en el SISPO", "staf_mtto", f"Además se excluyeron {n_staf_sap} movimientos de SAP de ese centro de coste.")
