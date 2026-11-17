@@ -42,7 +42,7 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, grafico_distribucion, titulo_tarjeta
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -243,7 +243,7 @@ def _movimientos_maestro(datos_e: dict, cfg: dict, hasta_mes: int, oficial: pd.D
     el usuario) quedan fuera por su llave, también en cargas posteriores.
     `sispo` = (líneas aplicadas, movimientos de SAP reemplazados): los movimientos genéricos de SAP salen y entran, en su lugar,
     las líneas de SISPO con su placa y su concepto de la base maestra (los cambios manuales siguen mandando)."""
-    m0 = cfg["meses"][0]
+    m0 = cfg.get("desde", cfg["meses"][0])
     todo = pool_sap if pool_sap is not None else _pool_sap(datos_e)
     if sispo is not None and len(sispo[0]):
         todo = todo[~todo["llave"].isin(set(sispo[1]["llave"]))]
@@ -326,6 +326,12 @@ def _tabla(df: pd.DataFrame, alto=380):
     st.dataframe(df, hide_index=True, width="stretch", height=alto, column_config=_config())
 
 
+def _tecnico() -> bool:
+    """True solo cuando la vista se pinta desde Administración (`admin_revision_tecnica`): ahí viven las descargas, validaciones y
+    herramientas técnicas. En la página del módulo no se muestran."""
+    return bool(st.session_state.get("_mt_tecnico"))
+
+
 def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bool = False):
     """Detalle de movimientos con búsqueda y descarga. Valores originales de SAP (signo SAP)."""
     cols = [c for c in ["empresa", "fecha", "mes", "tercero", "texto", "documento", "codigo_articulo", "cantidad", "cuenta_nombre",
@@ -355,8 +361,9 @@ def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bo
         "sub_rubro_sap": "Sub-rubro (SAP)", "valor": st.column_config.NumberColumn("Valor", format="accounting"),
         "codigo_articulo": "Referencia (SISPO)", "cantidad": st.column_config.NumberColumn("Cantidad", format="%g"),
         "llave": "ID del movimiento"})
-    st.download_button("Descargar movimientos", lambda d=vista: a_excel(d), f"{archivo}.xlsx",
-                       icon=":material/download:", key=f"mt_dl_{clave}")
+    if _tecnico():
+        st.download_button("Descargar movimientos", lambda d=vista: a_excel(d), f"{archivo}.xlsx",
+                           icon=":material/download:", key=f"mt_dl_{clave}")
 
 
 def _auditoria(S, m: pd.DataFrame, clave: str, archivo: str):
@@ -1367,7 +1374,7 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     detalle = pd.DataFrame(filas_d, columns=["Placa", "Tipo", "Origen", "Concepto", "Fecha", "Documento", "Referencia", "Artículo / texto",
                                              "Proveedor / bodega", "Cantidad", "Valor", "% de la ejecución de la placa"])
     # ---- hoja «Resumen»: por sub-rubro y mes, y origen de la ejecución de Flota
-    meses = [mes] if mes else list(range(S.m0, S.hasta_mes + 1))
+    meses = [mes] if mes else list(range(L.desde_mes(S.cfg), S.hasta_mes + 1))
     mv = S.vistas["movimientos"]
     mv = mv[mv["ambito"].isin([L.AMB_PLACAS, L.AMB_GEN])]
     mv_s = mv["sispo"].fillna(False).astype(bool) if "sispo" in mv else pd.Series(False, index=mv.index)
@@ -1387,8 +1394,8 @@ def _tab_flota(S):
     """Flota y Equipo de transporte. TODOS los perfiles ven la tabla por concepto de gasto (concepto -> movimientos), los indicadores,
     los conceptos generales y el gráfico, con los datos que su perfil puede ver (cada gerencia, solo lo suyo). Solo el administrador
     tiene además la carga mensual de SISPO, el filtro/vista por placa, la auditoría y la reclasificación."""
-    if S.es_admin:
-        _sispo_panel(S)                                 # carga mensual del SISPO: arriba y abierto, es lo primero que se usa
+    if S.es_admin and _tecnico():
+        _sispo_panel(S)                                 # estado del SISPO aplicado: es técnico, vive en Administración
     v = S.vistas
     ppc = v["por_placa_concepto"]
     opciones = sorted(set(ppc["concepto"]))
@@ -1459,7 +1466,8 @@ def _tab_flota(S):
             if len(g_gen):
                 md = pd.concat([md, mg[mg["concepto"].isin(set(g_gen["concepto"]))]], ignore_index=True)
             nombre_xl = "movimientos_por_concepto_de_gasto_" + str(S.hasta).replace(" ", "_") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
-            st.download_button(f"Descargar movimientos ({len(md):,})".replace(",", "."), lambda: _excel_movs_concepto(
+            if _tecnico():
+              st.download_button(f"Descargar movimientos ({len(md):,})".replace(",", "."), lambda: _excel_movs_concepto(
                                    pd.concat([t.assign(ambito=L.AMB_PLACAS), g_gen.assign(ambito=L.AMB_GEN)], ignore_index=True), md), nombre_xl,
                                icon=":material/download:", key="mt_dl_mov_concepto", disabled=md.empty,
                                help="Un renglón por movimiento, con su concepto de gasto, placa, documento, proveedor y texto: una hoja con todos, "
@@ -1468,24 +1476,25 @@ def _tab_flota(S):
             st.caption("Cada concepto de gasto se abre en los movimientos clasificados en él (la placa de cada uno va como etiqueta"
                        + ("; para ver el detalle por placa usa la vista «Por placa»" if S.es_admin else "") + "). «Pendiente» = movimientos "
                        "sin concepto asignado.")
-    nombre_inf = "ejecucion_vs_presupuesto_por_mes_" + str(S.hasta).replace(" ", "_").replace("–", "-") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
-    st.download_button("Descargar informe ejecución vs presupuesto por mes", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
-                       nombre_inf, icon=":material/download:", key="mt_dl_informe_meses", disabled=t.empty and g_gen.empty,
-                       help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
-                            ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
-                            "No trae el acumulado. Respeta los filtros de concepto, estado y placa.")
-    if S.es_admin:                                      # trae detalle de SISPO de todas las gerencias: solo administrador
-        opc_mes = [0, *range(S.m0, S.hasta_mes + 1)]
-        mes_inf = st.selectbox("Mes del informe reclasificado", opc_mes, index=len(opc_mes) - 1, key="mt_mes_informe_recl",
-                               format_func=lambda x: "Todos los meses (columna por mes)" if x == 0 else MESES_L[x - 1].capitalize(),
-                               help="Un mes: solo la ejecución de ese mes y su presupuesto (el de placa y concepto se prorratea; el Resumen usa el "
-                                    "presupuesto mensual real). «Todos los meses»: el informe completo con una columna por mes.")
-        st.download_button("Descargar informe reclasificado (OTROS como concepto)", lambda: _excel_informe_reclasificado(S, mes_inf),
-                           "ejecucion_reclasificada_" + (f"{MESES_L[mes_inf - 1]}_{S.cfg['anio']}" if mes_inf else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx", icon=":material/download:",
-                           key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
-                           help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» "
-                                "(sin presupuesto), saldo y % de avance con fórmulas, barras de avance y negativos en rojo, más las hojas "
-                                "«Resumen», «Reclasificación» y «Pendientes por referencia». Solo cambia el Excel: la pantalla no se modifica.")
+    if _tecnico():
+        nombre_inf = "ejecucion_vs_presupuesto_por_mes_" + str(S.hasta).replace(" ", "_").replace("–", "-") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
+        st.download_button("Descargar informe ejecución vs presupuesto por mes", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
+                           nombre_inf, icon=":material/download:", key="mt_dl_informe_meses", disabled=t.empty and g_gen.empty,
+                           help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
+                                ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
+                                "No trae el acumulado. Respeta los filtros de concepto, estado y placa.")
+        if S.es_admin:                                      # trae detalle de SISPO de todas las gerencias: solo administrador
+            opc_mes = [0, *range(L.desde_mes(S.cfg), S.hasta_mes + 1)]
+            mes_inf = st.selectbox("Mes del informe reclasificado", opc_mes, index=len(opc_mes) - 1, key="mt_mes_informe_recl",
+                                   format_func=lambda x: "Todos los meses (columna por mes)" if x == 0 else MESES_L[x - 1].capitalize(),
+                                   help="Un mes: solo la ejecución de ese mes y su presupuesto (el de placa y concepto se prorratea; el Resumen usa el "
+                                        "presupuesto mensual real). «Todos los meses»: el informe completo con una columna por mes.")
+            st.download_button("Descargar informe reclasificado (OTROS como concepto)", lambda: _excel_informe_reclasificado(S, mes_inf),
+                               "ejecucion_reclasificada_" + (f"{MESES_L[mes_inf - 1]}_{S.cfg['anio']}" if mes_inf else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx", icon=":material/download:",
+                               key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
+                               help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» "
+                                    "(sin presupuesto), saldo y % de avance con fórmulas, barras de avance y negativos en rojo, más las hojas "
+                                    "«Resumen», «Reclasificación» y «Pendientes por referencia». Solo cambia el Excel: la pantalla no se modifica.")
     if len(g_gen):                                      # los conceptos generales no tienen placa: se ven aparte, así nada queda fuera de la pestaña
         with st.expander(f"Conceptos generales, sin placa ({len(g_gen)})", icon=":material/category:"):
             _aviso_arbol(mg)
@@ -2322,35 +2331,24 @@ def _genericos_sin_reemplazar(S, empresa: str, mes: int) -> pd.DataFrame:
 
 
 def _descarga_soporte(S):
-    """Soporte de ejecución (Excel) para cualquier usuario: presupuesto de todos los meses y ejecución acumulada en la primera
-    hoja; en las demás, los movimientos."""
+    """«Archivo de ejecución» (Excel por compañía): usa EXACTAMENTE el período elegido en la página. Un mes = solo ese mes; acumulado =
+    desde el inicio del escenario hasta el último mes con ejecución. Es la única descarga de la página."""
+    unico = L.desde_mes(S.cfg) > S.cfg["meses"][0]           # se eligió un solo mes
     with st.container(key="mt_card_soporte"):
-        titulo_tarjeta("Soporte de ejecución de mantenimiento", "Excel por compañía · «Presupuesto»: presupuesto de todos los meses y "
-                       "ejecución acumulada · demás hojas: movimientos")
-        c1, c2 = st.columns([1, 1.4], vertical_alignment="bottom")
-        mes_sop = c1.selectbox("Mes del soporte de ejecución", list(range(S.m0, S.m1 + 1)), index=S.ult - S.m0,
-                               key=f"mt_mes_soporte_{S.escenario}", format_func=lambda m: MESES_L[m - 1].capitalize(),
-                               help="La hoja «Presupuesto» acumula la ejecución desde el inicio del escenario hasta este "
-                                    "mes. Es independiente de «Ejecución hasta».")
-        todos = c2.radio("Movimientos de cada sub-rubro", ["Solo el mes elegido", "Todos los meses hasta el elegido"], horizontal=True,
-                         key=f"mt_detalle_soporte_{S.escenario}",
-                         help="«Todos los meses…» agrega a cada hoja de sub-rubro los movimientos de los meses anteriores (p. ej. septiembre y "
-                              "octubre) con una columna «Mes».") == "Todos los meses hasta el elegido"
-        for e in S.sel:                                   # inconsistencias SAP vs SISPO: se avisan antes de descargar, no se corrigen solas
-            pend = _genericos_sin_reemplazar(S, e, mes_sop)
+        titulo_tarjeta("Archivo de ejecución", f"Excel por compañía · ejecución {S.hasta} · mismas cifras que esta página")
+        for e in S.sel:                                   # inconsistencias SAP vs SISPO: se avisan, no se corrigen solas
+            pend = _genericos_sin_reemplazar(S, e, S.hasta_mes)
             if len(pend):
                 st.warning(f"{e}: {len(pend)} grupos de «Salida de inventario» de SAP siguen sin reemplazar por SISPO "
-                           f"({_pesos2(pend['Valor SAP'].sum())}). El soporte los trae tal como están en SAP.", icon=":material/rule:")
-                st.dataframe(pend, hide_index=True, width="stretch", column_config={
-                    "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
+                           f"({_pesos2(pend['Valor SAP'].sum())}); el archivo los trae tal como están en SAP. Detalle en Administración.",
+                           icon=":material/rule:")
         cols_dl = st.columns(len(S.sel))
         for cdl, e in zip(cols_dl, S.sel):
-            cdl.download_button(f"Descargar soporte de ejecución · {e}", lambda e=e: _soporte(S, e, mes_sop, todos),
-                                f"{mes_sop:02d}_{e}_Soporte_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
+            cdl.download_button(f"Descargar archivo de ejecución · {e}", lambda e=e: _soporte(S, e, S.hasta_mes, not unico),
+                                f"{S.hasta_mes:02d}_{e}_Archivo_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
                                 key=f"mt_soporte_{e}",
-                                help="Hoja «Presupuesto»: presupuesto de todos los meses y ejecución acumulada hasta el mes elegido, "
-                                     "por sub-rubro. "
-                                     "Una hoja por sub-rubro con los movimientos de SAP.")
+                                help="Hoja «Presupuesto»: presupuesto de todos los meses y ejecución del período elegido, por sub-rubro. "
+                                     "Una hoja por sub-rubro con sus movimientos.")
 
 
 def _tab_mantenimiento(S):
@@ -2370,6 +2368,10 @@ def _tab_mantenimiento(S):
     with st.container(key="mt_card_rubro_graf"):
         titulo_tarjeta("Dónde se concentra el presupuesto", "Presupuesto vs ejecutado por sub-rubro (millones de pesos)")
         _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.")
+    with st.container(key="mt_card_rubro_dist"):
+        titulo_tarjeta("Distribución del costo ejecutado", f"Por sub-rubro · {S.hasta} · % del total en pesos")
+        if not grafico_distribucion(t["sub_rubro"], t["ejecutado"]):
+            st.caption("Aún no hay costo ejecutado para repartir.")
     if S.multi:
         filas = []
         for e in S.sel:
@@ -2384,12 +2386,7 @@ def _tab_mantenimiento(S):
     with st.container(key="mt_card_rubro_mes"):
         titulo_tarjeta("Mes a mes", "Presupuesto vs ejecutado del rubro (millones de pesos)")
         _grafico_ts_mensual(S, ppto, ejec)
-    _control_staf(S)
     _descarga_soporte(S)
-    with st.expander("Flota y Equipo de transporte por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
-        _tabla(S.vistas["resumen"], 190)
-        st.caption("Placas = presupuesto por vehículo. Generales = conceptos sin placa. Tecnomecánica y SOAT = presupuesto mensual por "
-                   "placa. El saldo es presupuesto − ejecutado.")
 
 
 def _tab_contenedores(S):
@@ -2403,7 +2400,7 @@ def _tab_contenedores(S):
         return
     t = L.tabla_mensual(pc, ec, S.cfg, S.hasta_mes, "Contenedores")
     tot = t[t["mes"] == 0].iloc[0]
-    n_mov = int(((ec["mes"] >= S.m0) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
+    n_mov = int(((ec["mes"] >= L.desde_mes(S.cfg)) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
     _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, f"Escenario {S.escenario}")
     vista = t.assign(Mes=t["mes"].map(lambda m: "Total" if m == 0 else f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}"))
     with st.container(key="mt_card_cont_tabla"):
@@ -2665,6 +2662,8 @@ def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
     ppto, ejec = _rubro(S, empresa, detalle_flota=True)
     ejec = ejec.copy()
     if len(ejec):
+        ejec = ejec[pd.to_numeric(ejec["mes"], errors="coerce") >= L.desde_mes(cfg)]      # un solo mes: nada de meses anteriores
+    if len(ejec):
         crudo = ctx.leer("SELECT id, raw FROM ejecucion WHERE anio=? AND empresa=?", (int(cfg["anio"]), empresa))
         ejec = ejec.merge(crudo, on="id", how="left") if "id" in ejec else ejec.assign(raw="")
         num_cuenta = L.numeros_cuenta(crudo)                 # el detalle de SISPO usa el número de cuenta de SAP que reemplaza
@@ -2694,8 +2693,9 @@ def _estado_cargas(S) -> pd.DataFrame:
 
 
 # ================================================================== pantalla principal
-def _mostrar(ctx):
+def _mostrar(ctx, tecnico: bool = False):
     leer, usuario, es_admin = ctx.leer, ctx.usuario, ctx.es_admin
+    st.session_state["_mt_tecnico"] = bool(tecnico and es_admin)
     ver_todo = getattr(ctx, "ver_todo", es_admin)
     _asegurar_tablas(ctx)
     zona_encabezado = st.container()
@@ -2733,9 +2733,15 @@ def _mostrar(ctx):
     pool_todo = pd.concat([d.pool for d in datos_e.values()], ignore_index=True)
     en_ventana = pool_todo[(pool_todo["mes"] >= m0) & (pool_todo["mes"] <= m1)]
     ult = int(en_ventana["mes"].max()) if not en_ventana.empty else m1
-    hasta_mes = c_hasta.selectbox("Ejecución hasta", list(range(m0, m1 + 1)), index=ult - m0, key=f"mt_hasta_{escenario}",
-                                  format_func=lambda m: MESES_L[m - 1].capitalize())
-    if m0 == hasta_mes:
+    sel_mes = c_hasta.selectbox("Período", [0, *range(m0, m1 + 1)], key=f"mt_mes_{escenario}",
+                                format_func=lambda m: f"Acumulado a {MESES_L[ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
+                                help="Un mes muestra y descarga SOLO ese mes (sin acumular). «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución.")
+    hasta_mes = sel_mes or ult
+    if sel_mes:                                         # un solo mes: todo el cálculo (movimientos, tablas, gráficos, Excel) usa ese mes
+        cfg = dict(cfg, desde=sel_mes)                   # el presupuesto sigue siendo el del escenario; solo la ejecución se recorta al mes
+    if sel_mes:
+        hasta = f"{MESES_L[sel_mes - 1]} {cfg['anio']}"
+    elif m0 == hasta_mes:
         hasta = f"{MESES_L[hasta_mes - 1]} {cfg['anio']}"
     else:
         hasta = f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {cfg['anio']}"
@@ -2868,8 +2874,8 @@ def _mostrar(ctx):
                                  "cargado en Presupuesto; Flota lee el detalle por placa cargado en Administración."]
 
     # ------------------------------------------------------------------ descargas y validaciones (solo administrador)
-    if es_admin:
-        with st.expander("Descargas y validaciones (administrador)", icon=":material/download:"):
+    if es_admin and _tecnico():
+        with st.expander("Descargas y validaciones (administrador)", icon=":material/download:", expanded=True):
             nombre = f"mantenimiento_{escenario.replace(' ', '_')}_{'consolidado' if multi else sel[0]}" + (f"_{placa}" if placa else "") + ".xlsx"
             st.download_button("Descargar Excel de control", lambda: _excel_control(S, ts_mes_sel), nombre,
                                icon=":material/download:", key="mt_excel",
@@ -2888,18 +2894,32 @@ def _mostrar(ctx):
 
     # ------------------------------------------------------------------ pestañas
     nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT", "Contenedores"]
-    t_m, t_f, t_t, t_c = st.tabs(nombres_tabs)
-    with t_m:
-        _tab_mantenimiento(S)
-    with t_f:
-        _tab_flota(S)
-    with t_t:
-        _tab_ts(S)
-    with t_c:
-        _tab_contenedores(S)
+    if not _tecnico():
+        t_m, t_f, t_t, t_c = st.tabs(nombres_tabs)
+        with t_m:
+            _tab_mantenimiento(S)
+        with t_f:
+            _tab_flota(S)
+        with t_t:
+            _tab_ts(S)
+        with t_c:
+            _tab_contenedores(S)
+    else:
+        with st.expander("Control de Staf Mantenimiento y genéricos de SAP sin reemplazar", icon=":material/rule:"):
+            _control_staf(S)
+            for e_ in S.sel:
+                pend_ = _genericos_sin_reemplazar(S, e_, S.hasta_mes)
+                if len(pend_):
+                    st.warning(f"{e_}: {len(pend_)} grupos de «Salida de inventario» de SAP sin reemplazar por SISPO.", icon=":material/rule:")
+                    st.dataframe(pend_, hide_index=True, width="stretch", column_config={
+                        "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
+        with st.expander("Flota por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
+            _tabla(S.vistas["resumen"], 190)
+        with st.expander("Detalle de Flota (descargas por concepto y por mes)", icon=":material/directions_car:"):
+            _tab_flota(S)
 
-    # lo que sigue es solo del administrador (la lógica de cada función lo vuelve a exigir)
-    if es_admin:
+    # lo que sigue es técnico y solo del administrador: vive en Administración (la lógica de cada función lo vuelve a exigir)
+    if es_admin and _tecnico():
         _reclasificacion(S)
         _avanzado(S, reglas, bool(reglas_db.empty))
         with st.expander("¿Qué sub-rubros hay en la base?", icon=":material/search:"):
@@ -2943,6 +2963,20 @@ def _verificar_logica() -> bool:
     st.code(f"Módulo que había en memoria: {previo}\nTamaño del archivo junto a este módulo: "
             f"{os.path.getsize(ruta) if os.path.exists(ruta) else 'no existe'} bytes (el actual pesa 133.025)\n{detalle}")
     return False
+
+
+def admin_revision_tecnica(ctx):
+    """Administración: lo técnico de Mantenimiento (validaciones, estado de cargas, SISPO aplicado, reclasificación, reglas y descargas
+    de control). Usa los mismos cálculos que la página del módulo."""
+    if not ctx.es_admin:
+        return
+    try:
+        _mostrar(ctx, tecnico=True)
+    except Exception:
+        st.error("La revisión técnica de Mantenimiento tuvo un error. Copia este detalle y compártelo para corregirlo.")
+        st.code(traceback.format_exc())
+    finally:
+        st.session_state["_mt_tecnico"] = False
 
 
 def mostrar(ctx):

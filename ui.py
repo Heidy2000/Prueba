@@ -41,6 +41,23 @@ def estilo_grafico(fig, alto=320):
     return fig
 
 
+def grafico_distribucion(etiquetas, valores, alto=300, max_partes=7):
+    """Dona con la distribución del costo ejecutado (millones de pesos). Agrupa lo menor en «Otros»; ignora valores <= 0.
+    Devuelve False (sin dibujar) si no hay nada que repartir."""
+    import plotly.graph_objects as go
+    d = pd.DataFrame({"e": [str(x) for x in etiquetas], "v": pd.to_numeric(pd.Series(list(valores)), errors="coerce").fillna(0.0)})
+    d = d[d["v"] > 0].groupby("e", as_index=False)["v"].sum().sort_values("v", ascending=False)
+    if d.empty:
+        return False
+    if len(d) > max_partes:
+        d = pd.concat([d.head(max_partes - 1), pd.DataFrame({"e": ["Otros"], "v": [d["v"].iloc[max_partes - 1:].sum()]})], ignore_index=True)
+    fig = go.Figure(go.Pie(labels=[x[:40] for x in d["e"]], values=d["v"] / 1e6, hole=.55, sort=False, textinfo="percent",
+                           hovertemplate="%{label}: %{value:,.1f} M (%{percent})<extra></extra>"))
+    fig.update_layout(legend=dict(orientation="v", y=.5, x=1.02), showlegend=True)
+    st.plotly_chart(estilo_grafico(fig, alto), width="stretch", config={"displayModeBar": False})
+    return True
+
+
 def titulo_tarjeta(t, s=""):
     st.html(f'<p class="nf-card-t">{t}</p>' + (f'<p class="nf-card-s">{s}</p>' if s else ""))
 

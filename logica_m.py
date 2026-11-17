@@ -1486,14 +1486,19 @@ def serie_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict):
     return nombres, orden, p, e
 
 
+def desde_mes(cfg: dict) -> int:
+    """Primer mes de la ejecución que se consulta: el mes elegido si se pidió un solo mes (`cfg["desde"]`) o el inicio del escenario."""
+    return int(cfg.get("desde", cfg["meses"][0]))
+
+
 def tabla_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: int) -> pd.DataFrame:
     """Resumen por sub-rubro: presupuesto del escenario completo, ejecutado hasta el corte, saldo, % y estado."""
     nombres, orden, p, e = serie_subrubros(ppto, ejec, cfg)
-    m0, _ = cfg["meses"]
+    m0 = desde_mes(cfg)
     ej = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= hasta_mes)]
     n = ej.assign(_k=ej["sub_rubro"].fillna("").astype(str).map(norm_texto)).groupby("_k").size()
     filas = [dict(sub_rubro=nombres[k], presupuesto=float(p[k].sum()) if k in p.index.get_level_values(0) else 0.0,
-                  ejecutado=float(e[k][e[k].index <= hasta_mes].sum()) if k in e.index.get_level_values(0) else 0.0,
+                  ejecutado=float(e[k][(e[k].index >= m0) & (e[k].index <= hasta_mes)].sum()) if k in e.index.get_level_values(0) else 0.0,
                   movimientos=int(n.get(k, 0))) for k in orden]
     t = pd.DataFrame(filas, columns=["sub_rubro", "presupuesto", "ejecutado", "movimientos"])
     return con_metricas(t.assign(concepto=t["sub_rubro"]))[["sub_rubro", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]]
@@ -1504,10 +1509,12 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: 
     _, _, p, e = serie_subrubros(ppto, ejec, cfg)
     k = norm_texto(sub_rubro)
     m0, m1 = cfg["meses"]
+    d0 = desde_mes(cfg)
     filas = []
     for m in range(m0, m1 + 1):
-        filas.append(dict(mes=m, presupuesto=float(p.get((k, m), 0.0)), ejecutado=float(e.get((k, m), 0.0)) if m <= hasta_mes else 0.0,
-                          movimientos=1 if m <= hasta_mes else 0))
+        en = d0 <= m <= hasta_mes
+        filas.append(dict(mes=m, presupuesto=float(p.get((k, m), 0.0)), ejecutado=float(e.get((k, m), 0.0)) if en else 0.0,
+                          movimientos=1 if en else 0))
     t = pd.DataFrame(filas)
     t.loc[len(t)] = dict(mes=0, presupuesto=t["presupuesto"].sum(), ejecutado=t["ejecutado"].sum(), movimientos=int(t["movimientos"].sum()))
     t["saldo"] = t["presupuesto"] - t["ejecutado"]
@@ -1890,6 +1897,12 @@ CLASE_STAF_OTROS = "OTROS"
 OBJETO_STAF_OTROS = "Staf Mantenimiento"
 
 
+def es_objeto_staf_mtto(objeto: pd.Series) -> pd.Series:
+    """True donde la «Denominación del objeto» es exactamente «Staf Mantenimiento» (sin importar mayúsculas, tildes, espacios ni signos).
+    Es la ÚNICA definición de esa exclusión: la usan Mantenimiento (que las suma a Flota) y Operaciones (que las deja fuera)."""
+    return objeto.fillna("").map(_canon).eq(_canon(OBJETO_STAF_OTROS))
+
+
 def es_staf_otros(df: pd.DataFrame) -> pd.Series:
     """Movimientos de SAP cuya «Denom.clase de coste» es OTROS (`cuenta_nombre`, o `sub_rubro_sap` si ahí no viene) y cuya
     «Denominación del objeto» (`cc_nombre`) es «Staf Mantenimiento». El presupuesto de flota no los trae en su sub-rubro, pero son
@@ -1901,9 +1914,9 @@ def es_staf_otros(df: pd.DataFrame) -> pd.Series:
     clase = df["cuenta_nombre"] if "cuenta_nombre" in df else vacio
     clase_sap = df["sub_rubro_sap"] if "sub_rubro_sap" in df else vacio
     obj = df["cc_nombre"] if "cc_nombre" in df else vacio
-    k_otros, k_obj = _canon(CLASE_STAF_OTROS), _canon(OBJETO_STAF_OTROS)
+    k_otros = _canon(CLASE_STAF_OTROS)
     es_clase = clase.map(_canon).eq(k_otros) | (clase.map(_canon).eq("") & clase_sap.map(_canon).eq(k_otros))
-    return (es_clase & obj.map(_canon).eq(k_obj)).astype(bool)
+    return (es_clase & es_objeto_staf_mtto(obj)).astype(bool)
 
 
 def ids_staf_otros_raw(crudo: pd.DataFrame) -> set:
