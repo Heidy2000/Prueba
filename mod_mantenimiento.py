@@ -1629,7 +1629,7 @@ def _sispo_guardar_lineas(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.
 def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFrame, sap: pd.DataFrame, conc: dict, archivo: str,
                    huella: str, huella_m: str, generico: str):
     """Aplica (o reprocesa) la reclasificación de UNA cuenta de UN periodo. Idempotente: reemplaza lo aplicado antes para esa
-    compañía, periodo y cuenta, sin tocar las otras cuentas. Solo se ejecuta si la conciliación cuadra al centavo y si todo lo
+    compañía, periodo y cuenta, sin tocar las otras cuentas. Solo se ejecuta si la conciliación cuadra (tolerancia de redondeo de $1) y si todo lo
     que se va a guardar es de esa cuenta; las validaciones se repiten aquí, no solo en la pantalla."""
     _exigir_admin(ctx)
     if not conc["cuadra"]:
@@ -1852,7 +1852,7 @@ def _sispo_panel(S):
                    "y placa, con el concepto de la base maestra. Se hace CUENTA POR CUENTA (" + "; ".join(L.SISPO_CUENTAS) + "): cada "
                    "salida de SISPO solo se asigna a la cuenta de su propio «Nombre Cta» y reemplaza únicamente los genéricos de SAP "
                    "de esa misma clase de coste. Cada mes se usa el SISPO de ESE mes, cargado en Administración. Una cuenta solo "
-                   "se aplica si su valor total de SISPO coincide al centavo con lo que SAP tiene como genérico (se compara solo por valor, "
+                   "se aplica si su valor total de SISPO coincide con lo que SAP tiene como genérico (tolerancia de redondeo: hasta $1) (se compara solo por valor, "
                    "no por centro de coste); las que no cuadran quedan sin tocar y se informan.")
         maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
         st.markdown("**1. Base maestra de referencias y conceptos**")
@@ -1971,7 +1971,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     for v in por.values():                      # si el genérico está en varios sub-rubros, cada uno debe quedar igual que en SAP
         if v["estado"] == "Cuadra":
             t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
-            if (t["diferencia_c"] != 0).any():
+            if not t["cuadra"].all():
                 v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
     problemas = L.sispo_validar_cuentas(lin, a["original"], por)
     n_pend_cta = {c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()}
@@ -1993,7 +1993,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
         "Valor SISPO": st.column_config.NumberColumn(format="accounting"), "Valor SAP": st.column_config.NumberColumn(format="accounting"),
         "Diferencia (SAP + SISPO)": st.column_config.NumberColumn(format="accounting")})
     st.caption("SAP carga estas salidas con signo positivo (costo) y SISPO las trae negativas (salida de inventario): cada cuenta concilia "
-               "SAP contra −SISPO, en centavos exactos. Los valores quedan con el signo de SAP. El TOTAL suma todas las cuentas, "
+               "SAP contra −SISPO, con tolerancia de redondeo de hasta $1. Los valores quedan con el signo de SAP. El TOTAL suma todas las cuentas, "
                "incluso las que no se pueden aplicar.")
     st.dataframe(pd.DataFrame([
         ("Total de registros SISPO", f"{info['total']:,}".replace(",", ".")),
@@ -2355,7 +2355,7 @@ def _genericos_sin_reemplazar(S, empresa: str, mes: int) -> pd.DataFrame:
         elif (per, cta) not in aplicadas:
             motivo = "SISPO de la cuenta sin aplicar (no cuadra con SAP o falta aplicarlo)"
         else:
-            motivo = "El centro de coste no cuadra al centavo entre SAP y SISPO"
+            motivo = "El centro de coste no cuadra entre SAP y SISPO (más de $1 de diferencia)"
         filas.append((f"{MESES_L[int(m_) - 1].capitalize()} {S.cfg['anio']}", cta, cc, len(g), float(pd.to_numeric(g["valor"], errors="coerce").sum()), motivo))
     return pd.DataFrame(filas, columns=cols)
 

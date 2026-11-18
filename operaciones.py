@@ -279,7 +279,7 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
             avisos.append(f"{empresa} {pn}: se toma el SISPO; SAP todavía no trae la «Salida de inventario» de la cuenta OTROS para compararlo.")
         else:
             sap_c = int(sum(L.centavos(v) for v in pd.to_numeric(sap_all["valor"], errors="coerce").fillna(0.0)))
-            if sap_c != sis_c:
+            if not L.cuadra_c(sap_c - sis_c):
                 avisos.append(f"{empresa} {pn}: se toma el SISPO, pero la cuenta OTROS difiere de SAP: SAP {sap_c / 100:,.2f}, SISPO {sis_c / 100:,.2f} "
                               f"(diferencia {(sap_c - sis_c) / 100:,.2f}).")
         l = lin[(lin["periodo"] == pn) & lin["hoja"].isin(OS.HOJAS_PESOS)].reset_index(drop=True)
@@ -639,7 +639,7 @@ def _control_meses(S):
                 dx = "Falta el SISPO: aplícalo en Mantenimiento («Cargar SISPO del mes»); se guarda también en Operaciones."
             elif gen.empty:
                 dx = "SISPO tomado. SAP no trae la «Salida de inventario» de OTROS: no hay con qué compararlo."
-            elif L.centavos(val(gen)) != L.centavos(sis_otros):
+            elif not L.cuadra_c(L.centavos(val(gen)) - L.centavos(sis_otros)):
                 dx = "SISPO tomado, pero la cuenta OTROS difiere de SAP: revisa el SISPO o el SAP de este mes."
             else:
                 dx = "Completo: SISPO tomado y cuadra con SAP."

@@ -1759,6 +1759,14 @@ def _cod_articulo(x) -> str:
     return t[:-2] if re.fullmatch(r"\d+\.0", t) else t
 
 
+TOLERANCIA_CENTAVOS = 100        # SAP redondea al peso y SISPO trae decimales: una diferencia de hasta $1 (100 centavos) es redondeo, no un error
+
+
+def cuadra_c(diferencia_c) -> bool:
+    """True si la diferencia entre SAP y SISPO, en centavos, cabe en la tolerancia de redondeo (hasta $1). Única regla para todos los cruces."""
+    return abs(int(diferencia_c)) <= TOLERANCIA_CENTAVOS
+
+
 def centavos(x) -> int:
     """Pesos -> centavos enteros: las sumas y comparaciones se hacen en enteros, sin errores de coma flotante."""
     return int(round(float(x) * 100))
@@ -2057,12 +2065,13 @@ def sispo_sap_generico(pool: pd.DataFrame, empresa: str, periodo: int, cuenta: s
 
 
 def sispo_conciliar(lineas: pd.DataFrame, sap: pd.DataFrame) -> dict:
-    """Conciliación EXACTA en centavos, solo por VALOR. SAP carga el costo en positivo y SISPO lo trae negativo (salida): el total de
-    SAP debe ser igual a −SISPO y lo distribuido por concepto debe sumar lo mismo. No se compara por centro de coste."""
+    """Conciliación por VALOR, con tolerancia de redondeo de hasta $1 (`cuadra_c`). SAP carga el costo en positivo y SISPO lo trae negativo
+    (salida): el total de SAP debe ser igual a −SISPO y lo distribuido por concepto debe sumar exactamente lo mismo que SISPO. No se compara
+    por centro de coste."""
     sap_c = [centavos(v) for v in pd.to_numeric(sap["valor"], errors="coerce").fillna(0.0)] if len(sap) else []
     t_sispo, t_sap = int(lineas["centavos"].sum()) if len(lineas) else 0, int(sum(sap_c))
     dist = lineas.groupby("concepto")["centavos"].sum() if len(lineas) else pd.Series(dtype="int64")
-    cuadra_total = len(sap) > 0 and t_sap + t_sispo == 0 and (int(dist.sum()) if len(dist) else 0) == t_sispo
+    cuadra_total = len(sap) > 0 and cuadra_c(t_sap + t_sispo) and (int(dist.sum()) if len(dist) else 0) == t_sispo
     return dict(sap_c=t_sap, sispo_c=t_sispo, distribuido_c=int(dist.sum()) if len(dist) else 0, diferencia_c=t_sap + t_sispo,
                 n_sap=len(sap), n_sispo=len(lineas),
                 cuadra=cuadra_total)
@@ -2167,6 +2176,7 @@ def sispo_cuadre_destinos(lin: pd.DataFrame, rep: pd.DataFrame) -> pd.DataFrame:
     sis = pd.Series(-lin["centavos"].to_numpy(), index=pd.MultiIndex.from_frame(d[["codigo", "sub_rubro"]])).groupby(level=[0, 1]).sum()
     t = pd.concat([sap.rename("sap_c"), sis.rename("sispo_c")], axis=1).fillna(0).astype("int64")
     t["diferencia_c"] = t["sap_c"] - t["sispo_c"]
+    t["cuadra"] = t["diferencia_c"].map(cuadra_c)
     return t.reset_index()
 
 
@@ -2232,7 +2242,7 @@ def _sispo_cc_conciliados(lin: pd.DataFrame, rep: pd.DataFrame, presentes: set) 
     kr = pd.Series(list(zip(cr, rep["cc"].fillna("").astype(str).str.strip().str.upper())), index=rep.index)
     sis = pd.Series([centavos(v) for v in pd.to_numeric(lin["valor_sap"], errors="coerce").fillna(0.0)], index=lin.index).groupby(kl).sum()
     sap = pd.Series([centavos(v) for v in pd.to_numeric(rep["valor"], errors="coerce").fillna(0.0)], index=rep.index).groupby(kr).sum()
-    buenas = {k for k in sap.index if k in sis.index and int(sap[k]) == int(sis[k])}
+    buenas = {k for k in sap.index if k in sis.index and cuadra_c(int(sap[k]) - int(sis[k]))}
     return lin[kl.isin(buenas)], rep[kr.isin(buenas)]
 
 
