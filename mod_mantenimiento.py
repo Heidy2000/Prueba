@@ -1934,7 +1934,7 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
             "Cantidad": st.column_config.NumberColumn(format="localized"), "Valor": st.column_config.NumberColumn(format="accounting")})
         st.dataframe(pd.DataFrame(a_ops["embudo"], columns=["Filtro de Operaciones (acumulado)", "Filas que quedan"]), hide_index=True, width="stretch",
                      column_config={"Filas que quedan": st.column_config.NumberColumn(format="%d")})
-        st.caption("Operaciones usa toda la cuenta OTROS (cualquier centro de costo, salvo «Staf Mantenimiento») y la Papelería de sus 5 centros, grupos 5 y 7 (o ítems del presupuesto), cuentas ÚTILES, PAPELERÍA Y OTROS u "
+        st.caption("Operaciones usa toda la cuenta OTROS (cualquier centro de costo, salvo «Staf Mantenimiento») y la Papelería de sus centros autorizados (ALDC: 5; ALSM: 4), grupos 5 y 7 (o ítems del presupuesto), cuentas ÚTILES, PAPELERÍA Y OTROS u "
                    "OTROS, sin Staf Mantenimiento. Papelería va en cantidades. El reparto solo se aplica en Operaciones cuando la cuenta OTROS cuadra al "
                    "centavo con SAP (se ve en la tabla de validación de arriba).")
         if a_ops["huerfanos"]:

@@ -957,7 +957,7 @@ def _admin_sispo(S):
             "fecha": "Cargado", "n_lineas": st.column_config.NumberColumn("Líneas", format="%d"),
             "total_otros": st.column_config.NumberColumn("Total cuenta OTROS (SISPO)", format="accounting")})
     st.info("El SISPO se carga UNA sola vez, en Administración (pestaña «Mantenimiento y Operaciones»), y se aplica en Mantenimiento. Al aplicarlo, "
-            "ese mismo archivo también se guarda aquí: Operaciones toma toda la cuenta OTROS (de cualquier centro de costo) y la Papelería de sus 5 centros, "
+            "ese mismo archivo también se guarda aquí: Operaciones toma toda la cuenta OTROS (de cualquier centro de costo) y la Papelería de sus centros autorizados (ALDC: 5; ALSM: 4), "
             "sin las líneas cuya denominación del objeto es «Staf Mantenimiento», que van a Mantenimiento. Volver a aplicar el mismo periodo lo reemplaza, no lo duplica.", icon=":material/sync_alt:")
     if not cargado.empty:
         opciones = [f"{r.empresa} · {r.periodo}" for r in cargado.itertuples()]
@@ -1337,7 +1337,7 @@ def _validaciones_informe(S2, secciones: list, resumen: dict, n_staf_sap: int) -
     def regla(nombre, clave, ok_txt):
         malos = int((~m[clave]).sum()) if len(sis) else 0
         v.append((nombre, "CUMPLE" if malos == 0 else "NO CUMPLE", ok_txt if malos == 0 else f"{malos} movimientos del SISPO no cumplen."))
-    regla("Centro de costo autorizado (DB010500, 504, 515, 501, 509) o cuenta OTROS de cualquier centro", "centro", f"{len(sis)} movimientos del SISPO revisados.")
+    regla("Centro de costo autorizado (ALDC: DB010500, 504, 515, 501, 509 · ALSM: DB020511, 508, DB021011, DB021111) o cuenta OTROS de cualquier centro", "centro", f"{len(sis)} movimientos del SISPO revisados.")
     regla("Solo grupos 5 (Insumos) y 7 (Herramientas), salvo ítems del presupuesto y la cuenta OTROS", "grupo", "Sin otros grupos que no crucen con el presupuesto ni sean cuenta OTROS.")
     regla("Solo cuentas ÚTILES, PAPELERÍA Y OTROS y OTROS", "cuenta", "Sin otras cuentas.")
     regla("Sin Staf Mantenimiento en el SISPO", "staf_mtto", f"Además se excluyeron {n_staf_sap} movimientos de SAP de ese centro de coste.")

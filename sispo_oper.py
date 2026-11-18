@@ -3,8 +3,9 @@ SISPO para el módulo Operaciones (lógica pura, sin Streamlit ni base de datos,
 =========================================================================================================
 Filtros previos (se aplican a los datos ORIGINALES del SISPO, antes de clasificar, agrupar o consolidar; el archivo nunca se modifica):
   1. Cuenta OTROS: entra de cualquier centro de costo (regla general: OTROS del SISPO -> Operaciones). Papelería, en cambio, solo de
-     DB010500 Staf Operaciones, DB010504 Barrido Manual, DB010515 Proyecto Aguas de Bogotá, DB010501 Recolección Domiciliaria,
-     DB010509 Planeación.
+     (ALDC) DB010500 Staf Operaciones, DB010504 Barrido Manual, DB010515 Proyecto Aguas de Bogotá, DB010501 Recolección
+     Domiciliaria, DB010509 Planeación; (ALSM) DB020511 Poda, DB020508 Corte de césped, DB021011 Operaciones Circasia,
+     DB021111 Operaciones Quimbaya. Cada compañía solo con sus centros (`CENTROS_POR_EMPRESA`).
   2. Grupo [5] - INSUMOS o [7] - HERRAMIENTAS, salvo las referencias que CRUZAN con un ítem del presupuesto (por la columna «Concepto» del
      SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos). Toda la cuenta
      OTROS de esos centros también entra, de cualquier grupo: SAP la carga completa en 3.1. Lo que no es grupo 5/7 ni cruza va a Herramientas
@@ -33,8 +34,11 @@ HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", 
 HOJAS_PESOS = (HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS)       # se comparan en pesos; Papelería, en cantidades
 CUENTA_PAPELERIA = "ÚTILES, PAPELERÍA Y OTROS"                       # «Nombre Cta» completo; el archivo lo trae recortado a 20 caracteres
 CUENTA_OTROS = "OTROS"
-CENTROS_AUTORIZADOS = {"DB010500": "STAF OPERACIONES", "DB010504": "BARRIDO MANUAL", "DB010515": "PROYECTO AGUAS DE BOGOTÁ",
-                       "DB010501": "RECOLECCIÓN DOMICILIARIA", "DB010509": "PLANEACIÓN"}
+CENTROS_POR_EMPRESA = {
+    "ALDC": {"DB010500": "STAF OPERACIONES", "DB010504": "BARRIDO MANUAL", "DB010515": "PROYECTO AGUAS DE BOGOTÁ",
+             "DB010501": "RECOLECCIÓN DOMICILIARIA", "DB010509": "PLANEACIÓN"},
+    "ALSM": {"DB020511": "PODA", "DB020508": "CORTE DE CÉSPED", "DB021011": "OPERACIONES CIRCASIA", "DB021111": "OPERACIONES QUIMBAYA"}}
+CENTROS_AUTORIZADOS = {c: n for d in CENTROS_POR_EMPRESA.values() for c, n in d.items()}   # unión: solo cuando se desconoce la compañía (archivo sin cargar)
 GRUPOS_AUTORIZADOS = ("5INSUMOS", "7HERRAMIENTAS")                   # «[5] - INSUMOS» / «[7] - HERRAMIENTAS» en forma canónica
 CODIGOS_OTROS = ("5064610001", "5064610002")        # BOLSA CESTA 66x76 y BOLSA DESARENE 40x49
 GRUPO_INSUMOS, GRUPO_HERRAMIENTAS = GRUPOS_AUTORIZADOS
@@ -95,7 +99,12 @@ def _mascaras(d: pd.DataFrame) -> dict:
     else:
         salida = pd.Series(True, index=d.index)
     es_otros = d["cuenta"].map(L.clase20) == L.clase20(CUENTA_OTROS)       # SAP carga TODA la cuenta OTROS del centro en 3.1: sin filtro de grupo
-    return {"salida": salida, "centro": _codigo_cc(d["cc_codigo"]).isin(CENTROS_AUTORIZADOS) | es_otros,
+    cod = _codigo_cc(d["cc_codigo"])
+    if "empresa" in d:                                  # líneas guardadas: cada compañía con sus centros (los DB01… son de ALDC; los DB02…, de ALSM)
+        centro_ok = pd.Series([c in CENTROS_POR_EMPRESA.get(str(e), CENTROS_AUTORIZADOS) for c, e in zip(cod, d["empresa"])], index=d.index)
+    else:
+        centro_ok = cod.isin(CENTROS_AUTORIZADOS)
+    return {"salida": salida, "centro": centro_ok | es_otros,
             "grupo": d["grupo"].map(L._canon).isin(GRUPOS_AUTORIZADOS) | cruza | es_otros,
             "cuenta": d["cuenta"].map(L.clase20).isin(cuentas),
             "staf_mtto": ~L.es_objeto_staf_mtto(d["cc_nombre"])}
@@ -127,7 +136,7 @@ def depurar(d: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     """Filtros previos sobre el SISPO original, en este orden. Devuelve (líneas que pasan todos, embudo [(paso, filas que quedan)])."""
     m = _mascaras(d)
     embudo, ok = [("Filas del archivo", len(d))], pd.Series(True, index=d.index)
-    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (5 códigos) o cuenta OTROS"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto o cuenta OTROS)"),
+    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (ALDC 5 códigos, ALSM 4) o cuenta OTROS"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto o cuenta OTROS)"),
                             ("cuenta", "Cuenta ÚTILES, PAPELERÍA Y OTROS u OTROS"), ("staf_mtto", "Sin Staf Mantenimiento")):
         ok &= m[clave]
         embudo.append((etiqueta, int(ok.sum())))
