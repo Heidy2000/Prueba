@@ -3,21 +3,21 @@ Módulo Operaciones (rubro 3.1): presupuesto vs ejecución por hoja del libro «
 ==============================================================================================
 Una pantalla con cinco pestañas:
 - Resumen       <- las cuatro hojas lado a lado (más la ejecución del rubro 3.1 que no cae en ninguna hoja).
-- Papelería · Consumibles · Herramientas · Otros
+- Papelería · Consumibles · Herramientas · Bolsas
                 <- una pestaña por hoja del libro: presupuesto mes a mes (y por ítem) contra la ejecución, con variación,
-                   % de ejecución, acumulados, movimientos y Excel. La hoja «Bolsas» del libro pasó a llamarse «Otros».
+                   % de ejecución, acumulados, movimientos y Excel. La hoja del libro se llama «Bolsas» (también se acepta «Otros»).
 
 Qué compara y a qué nivel
 - Presupuesto: el del libro (mes a mes y por ítem: cantidad × costo unitario = total). Se carga por compañía (ALDC / ALSM).
 - Ejecución: SOLO el SISPO del mes (ver sispo_oper.py; se carga una sola vez en Administración, se aplica en Mantenimiento y se guarda también aquí), sin valores de SAP.
-  Se reparte así: Consumibles (grupo 5, cuenta OTROS, sin las 2 bolsas), Herramientas (grupo 7, cuenta OTROS) y Otros (las 2 bolsas), en pesos.
+  Se reparte así: Consumibles (grupo 5, cuenta OTROS, sin las 2 bolsas), Herramientas (grupo 7, cuenta OTROS) y Bolsas (las 2 bolsas), en pesos.
   Papelería sale del SISPO (centros Staf Operaciones, Aguas de Bogotá y Planeación) y se compara en CANTIDADES (costo cero).
   Con el SISPO, el detalle por ítem también tiene ejecución: la referencia se liga a su ítem con la tabla de equivalencias
   (editable); lo ejecutado sin ítem presupuestado aparece en la tabla con presupuesto 0.
 - ¿Qué línea va a qué hoja? La que le da el SISPO (reglas de sispo_oper.py y equivalencias). El sub-rubro de SAP solo asigna hoja al PRESUPUESTO del
   módulo Presupuesto (si el nombre contiene PAPELERIA, CONSUMIBLE, HERRAMIENTA o BOLSA se asigna solo; si no, el administrador lo asigna en
   «Asignación de sub-rubros»).
-- Ejecución = SOLO SISPO: Consumibles, Herramientas y Otros (en pesos) y Papelería (en cantidades) salen del detalle del SISPO de cada mes, cuadre
+- Ejecución = SOLO SISPO: Consumibles, Herramientas y Bolsas (en pesos) y Papelería (en cantidades) salen del detalle del SISPO de cada mes, cuadre
   o no con SAP; SAP no aporta ningún valor. Solo presta la gerencia (cada línea hereda la de SAP en el mismo centro de costo). La comparación de
   la cuenta OTROS contra el genérico de SAP es informativa (avisos y «Control» del Resumen). Un mes sin SISPO aplicado queda en cero, y se avisa si
   SAP trae «Salida de inventario» ese mes. El SAP con clase OTROS y objeto Staf Mantenimiento no interviene (el SISPO ya excluye Staf Mantenimiento;
@@ -58,8 +58,8 @@ from ui import EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, grafico_distribu
 VERSION = "v3 · 9-nov-2026"          # se muestra en el encabezado: sirve para confirmar qué versión está corriendo
 RUBRO_COD = "3.1"
 HOJAS = [OS.HOJA_PAPELERIA, OS.HOJA_CONSUMIBLES, OS.HOJA_HERRAMIENTAS, OS.HOJA_OTROS]
-RAIZ_HOJA = {"PAPELERIA": "Papelería", "CONSUMIBLE": "Consumibles", "HERRAMIENTA": "Herramientas", "BOLSA": "Otros"}   # sub-rubros de SAP
-RAIZ_LIBRO = {**RAIZ_HOJA, "OTROS": "Otros"}                    # nombres de hoja del libro (acepta «Bolsas» u «Otros»)
+RAIZ_HOJA = {"PAPELERIA": "Papelería", "CONSUMIBLE": "Consumibles", "HERRAMIENTA": "Herramientas", "BOLSA": "Bolsas"}   # sub-rubros de SAP
+RAIZ_LIBRO = {**RAIZ_HOJA, "OTROS": "Bolsas"}                    # nombres de hoja del libro (acepta «Bolsas» u «Otros»)
 SIN_HOJA = OS.SIN_HOJA
 TODAS = "Consolidado"
 
@@ -261,7 +261,7 @@ def _hojas_de(df: pd.DataFrame, mapeo: dict) -> list:
 
 def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFrame, per: pd.DataFrame, empresa: str, items: dict, cfg: dict,
                 mtto_per: set = frozenset()):
-    """La ejecución de Operaciones sale SOLO del SISPO (Consumibles, Herramientas y Otros en pesos): no se usa ningún valor de SAP.
+    """La ejecución de Operaciones sale SOLO del SISPO (Consumibles, Herramientas y Bolsas en pesos): no se usa ningún valor de SAP.
     Se toma todo periodo con SISPO guardado, cuadre o no con SAP. SAP solo presta la GERENCIA: cada línea hereda la de los movimientos
     de SAP del mismo centro de costo (o la predominante). La comparación con la cuenta OTROS de SAP es informativa y va en `avisos`.
     Devuelve (ejecución, avisos); la ejecución trae las columnas que usa el resto del módulo."""
@@ -301,7 +301,7 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
                               "pulsa «Aplicar»: solo guarda la parte de Operaciones, no cambia ni duplica nada en Mantenimiento.")
             else:
                 avisos.append(f"{empresa} {pn}: SAP registra «Salida de inventario» de la cuenta OTROS, pero no hay SISPO aplicado; Operaciones no muestra "
-                              "Consumibles, Herramientas ni Otros de ese mes. Cárgalo en Administración y aplícalo en Mantenimiento («Cargar SISPO del mes»).")
+                              "Consumibles, Herramientas ni Bolsas de ese mes. Cárgalo en Administración y aplícalo en Mantenimiento («Cargar SISPO del mes»).")
     cols = ["empresa", "anio", "mes", "fecha", "documento", "tercero", "texto", "cuenta_nombre", "cc", "cc_nombre", "codigo", "sub_rubro",
             "sub_rubro_sap", "valor", "cantidad", "hoja", "gerencia", "sispo", "codigo_articulo", "item", "item_vista", "grupo", "pend_sispo", "observacion"]
     ejec = pd.concat(nuevos, ignore_index=True) if nuevos else pd.DataFrame(columns=cols)
@@ -332,7 +332,7 @@ def _datos_empresa(ctx, empresa: str, cfg: dict, asig, mapeo: dict, sispo=None) 
     if len(ppto_base):
         ppto_base["hoja"] = _hojas_de(ppto_base, mapeo)
         ppto_base["gerencia"] = asignacion.columna(ppto_base, asig)
-    # Ejecución = SOLO SISPO (Consumibles, Herramientas y Otros en pesos); Papelería en cantidades. SAP no aporta valores.
+    # Ejecución = SOLO SISPO (Consumibles, Herramientas y Bolsas en pesos); Papelería en cantidades. SAP no aporta valores.
     per = sispo.per[(sispo.per["empresa"] == empresa) & (sispo.per["periodo"] >= cfg["anio"] * 100 + m0)
                     & (sispo.per["periodo"] <= cfg["anio"] * 100 + m1)] if sispo is not None else pd.DataFrame(columns=["empresa", "periodo", "total_otros"])
     lin = sispo.lin[sispo.lin["empresa"] == empresa] if sispo is not None else pd.DataFrame()
@@ -533,8 +533,6 @@ def _tab_hoja(S, hoja: str):
                        + (" · EN CANTIDADES (unidades): estas referencias tienen costo cero" if S.cant else ""))
         vista = t[["Mes", "presupuesto", "ejecutado", "variacion", "pct", "ppto_acum", "ejec_acum", "pct_acum"]]
         st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config=_columnas_mes(S))
-        st.caption("«% ejecución» compara cada mes con su presupuesto. El total y los KPI se calculan contra el presupuesto al corte; "
-                   "el saldo, contra el del escenario completo.")
     _graficos_mes(S, t, hoja)
     it = _items(S, hoja)
     with st.container(key=f"op_card_items_{hoja}"):
@@ -551,8 +549,6 @@ def _tab_hoja(S, hoja: str):
                 "pct": nc("% ejecución", format="percent"), "peso": nc("% del total", format="percent")}
         st.dataframe(_estilo(vis, "variacion"), hide_index=True, width="stretch", height=min(40 + 35 * len(vis), 460),
                      column_config={k: v for k, v in conf.items() if k in vis.columns})
-        st.caption("Lo ejecutado que no tiene ítem presupuestado en esta hoja aparece con presupuesto 0 (marcado «sin ítem» si la referencia "
-                   "no tiene equivalencia). Las equivalencias referencia → ítem se editan en «Datos base».")
     e = _ejec_hoja(S, hoja)
     e = e[e["mes"] <= S.hasta_mes]
     cols_mov = ["empresa", "fecha", "mes", "documento", "tercero", "texto", "codigo_articulo", "cuenta_nombre", "sub_rubro_sap", "cc_nombre"]
@@ -561,21 +557,22 @@ def _tab_hoja(S, hoja: str):
     mov = e.assign(fecha=pd.to_datetime(e["fecha"], errors="coerce"))[
         [c for c in [*cols_mov, "valor"] if c in e.columns]].sort_values("fecha", ascending=False)
     mov_todos = mov                                       # lo que se descarga es todo, aunque se filtre la vista con la búsqueda
-    with st.expander(f"Movimientos que componen la ejecución ({len(mov):,})".replace(",", "."), icon=":material/receipt_long:"):
-        if mov.empty:
-            st.info("No hay movimientos asignados a esta hoja hasta el corte.")
-        else:
-            buscar = st.text_input("Buscar", placeholder="Proveedor, texto, documento…", label_visibility="collapsed", key=f"op_buscar_{hoja}")
-            if buscar:
-                mov = mov[mov.astype(str).apply(lambda col: col.str.contains(buscar, case=False, regex=False)).any(axis=1)]
-            total_txt = f"{mov['valor'].sum():,.0f} unidades".replace(",", ".") if S.cant else E.pesos(mov["valor"].sum())
-            st.html(f'<p class="nf-card-s">{len(mov):,} movimientos · total <b style="color:{E.TEXTO}">{total_txt}</b></p>'.replace(",", "."))
-            st.dataframe(mov, hide_index=True, width="stretch", height=380, column_config={
-                "empresa": "Compañía", "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"), "mes": "Mes",
-                "documento": "Documento", "tercero": "Proveedor / tercero", "texto": st.column_config.TextColumn("Texto", width="large"),
-                "codigo_articulo": "Referencia (SISPO)", "cantidad": st.column_config.NumberColumn("Cantidad", format="localized"),
-                "cuenta_nombre": "Cuenta", "sub_rubro_sap": "Sub-rubro (SAP)", "cc_nombre": "Centro de coste",
-                "valor": st.column_config.NumberColumn("Cantidad" if S.cant else "Valor", format="localized" if S.cant else "accounting")})
+    if _tecnico():
+        with st.expander(f"Movimientos que componen la ejecución ({len(mov):,})".replace(",", "."), icon=":material/receipt_long:"):
+            if mov.empty:
+                st.info("No hay movimientos asignados a esta hoja hasta el corte.")
+            else:
+                buscar = st.text_input("Buscar", placeholder="Proveedor, texto, documento…", label_visibility="collapsed", key=f"op_buscar_{hoja}")
+                if buscar:
+                    mov = mov[mov.astype(str).apply(lambda col: col.str.contains(buscar, case=False, regex=False)).any(axis=1)]
+                total_txt = f"{mov['valor'].sum():,.0f} unidades".replace(",", ".") if S.cant else E.pesos(mov["valor"].sum())
+                st.html(f'<p class="nf-card-s">{len(mov):,} movimientos · total <b style="color:{E.TEXTO}">{total_txt}</b></p>'.replace(",", "."))
+                st.dataframe(mov, hide_index=True, width="stretch", height=380, column_config={
+                    "empresa": "Compañía", "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"), "mes": "Mes",
+                    "documento": "Documento", "tercero": "Proveedor / tercero", "texto": st.column_config.TextColumn("Texto", width="large"),
+                    "codigo_articulo": "Referencia (SISPO)", "cantidad": st.column_config.NumberColumn("Cantidad", format="localized"),
+                    "cuenta_nombre": "Cuenta", "sub_rubro_sap": "Sub-rubro (SAP)", "cc_nombre": "Centro de coste",
+                    "valor": st.column_config.NumberColumn("Cantidad" if S.cant else "Valor", format="localized" if S.cant else "accounting")})
     if _tecnico():
       st.download_button(f"Descargar {hoja} (Excel)", lambda: _excel({
         "Mensual": t[["Mes", "presupuesto", "ejecutado", "variacion", "pct", "ppto_acum", "ejec_acum", "pct_acum"]].rename(columns={
@@ -653,7 +650,7 @@ def _control_meses(S):
         nc = st.column_config.NumberColumn
         st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch", column_config={
             c: nc(c, format="accounting") for c in ("SAP rubro 3.1 ($)", "OTROS en SAP ($)", "OTROS en SISPO ($)", "Diferencia ($)", "En Operaciones (SISPO) ($)")})
-        st.caption("«En Operaciones» es solo SISPO (Consumibles, Herramientas y Otros). El SAP del rubro 3.1 se muestra únicamente para comparar. "
+        st.caption("«En Operaciones» es solo SISPO (Consumibles, Herramientas y Bolsas). El SAP del rubro 3.1 se muestra únicamente para comparar. "
                    "El SISPO se aplica desde Mantenimiento (la carga es única).")
 
 
@@ -701,7 +698,6 @@ def _tab_resumen(S):
             "ejecutado": nc("Ejecutado", format="accounting"), "variacion": nc("Variación", format="accounting"),
             "pct": nc("% ejecución", format="percent"), "saldo": nc("Saldo del escenario", format="accounting"), "estado": "Estado",
             "movimientos": nc("Movimientos", format="%d")})
-        st.caption("La ejecución sale solo del SISPO (Consumibles, Herramientas y Otros); Papelería, en cantidades. SAP no aporta valores a Operaciones.")
         if "pend_sispo" in sin:
             pend, resto = sin[sin["pend_sispo"].fillna(False).astype(bool)], sin[~sin["pend_sispo"].fillna(False).astype(bool)]
         else:
@@ -709,7 +705,7 @@ def _tab_resumen(S):
         if len(pend):
             st.warning(f"{len(pend)} movimientos por {E.pesos(pend['valor'].sum())} son la «Salida de inventario» de la cuenta OTROS de meses sin SISPO "
                        "aplicado (o que no cuadra con SAP). Al aplicarlo en Mantenimiento («Cargar SISPO del mes»), se reparte entre Consumibles, "
-                       "Herramientas y Otros." + ("" if S.ctx.es_admin else " El administrador carga el SISPO."), icon=":material/inventory_2:")
+                       "Herramientas y Bolsas." + ("" if S.ctx.es_admin else " El administrador carga el SISPO."), icon=":material/inventory_2:")
         if len(resto):
             st.warning(f"{len(resto)} movimientos por {E.pesos(resto['valor'].sum())} son del rubro 3.1 pero su sub-rubro no está asignado a ninguna "
                        "hoja" + (": asígnalo en «Asignación de sub-rubros a hojas»." if S.ctx.es_admin else "; el administrador lo asigna."),
@@ -1010,7 +1006,7 @@ def _admin_items(S):
 def _admin(S):
     _exigir_admin(S.ctx)
     with st.expander("Datos base · SISPO aplicado, equivalencias y asignación de sub-rubros (administrador)", icon=":material/settings:"):
-        st.markdown("**1. SISPO aplicado.** Reparte Consumibles, Herramientas y Otros (en pesos) y trae Papelería (en cantidades).")
+        st.markdown("**1. SISPO aplicado.** Reparte Consumibles, Herramientas y Bolsas (en pesos) y trae Papelería (en cantidades).")
         _admin_sispo(S)
         st.divider()
         st.markdown("**2. Equivalencias referencia → ítem del presupuesto.**")
@@ -1299,7 +1295,7 @@ def _sin_staf_mtto(df: pd.DataFrame) -> pd.Series:
 _SECCIONES = [(OS.HOJA_PAPELERIA, "2 Papelería", "2. PAPELERÍA · MOVIMIENTOS DE PAPELERÍA"),
               (OS.HOJA_CONSUMIBLES, "3 Consumibles", "3. CONSUMIBLES"),
               (OS.HOJA_HERRAMIENTAS, "4 Herramientas", "4. HERRAMIENTAS"),
-              (OS.HOJA_OTROS, "5 Otros", "5. OTROS")]
+              (OS.HOJA_OTROS, "5 Bolsas", "5. BOLSAS")]
 
 
 def _movimientos_informe(Q, hoja: str) -> pd.DataFrame:
@@ -1495,7 +1491,7 @@ def _descarga_ejecucion(S):
     c2.download_button(f"Descargar informe {etiqueta} (Excel)", lambda: _informe(_vista_empresa(S, e)),
                        f"informe_operaciones_{etiqueta}_{S.escenario.replace(' ', '_')}_{S.hasta_mes:02d}.xlsx",
                        icon=":material/download:", key=f"op_dl_informe_{etiqueta}",
-                       help="Resumen general + Papelería, Consumibles, Herramientas y Otros. Sin los movimientos de Staf Mantenimiento.")
+                       help="Resumen general + Papelería, Consumibles, Herramientas y Bolsas. Sin los movimientos de Staf Mantenimiento.")
 
 
 def _mostrar(ctx, tecnico: bool = False):
@@ -1514,7 +1510,7 @@ def _mostrar(ctx, tecnico: bool = False):
     sel = list(EMPRESAS) if vista_emp == TODAS else [vista_emp]
     m0, m1 = cfg["meses"]
 
-    mapeo = {r.sub_norm: r.hoja for r in leer("SELECT sub_norm, hoja FROM oper_mapeo").itertuples()}
+    mapeo = {r.sub_norm: ("Bolsas" if r.hoja == "Otros" else r.hoja) for r in leer("SELECT sub_norm, hoja FROM oper_mapeo").itertuples()}
     asig = asignacion.mapa(leer)
     lin_sispo = leer("SELECT empresa, periodo, hoja, id_kardex, fecha, bodega, codigo, articulo, grupo, cuenta, cc_codigo, cc_nombre, cantidad, valor, concepto "
                      "FROM oper_sispo")
@@ -1528,7 +1524,7 @@ def _mostrar(ctx, tecnico: bool = False):
     ppto_op = leer("SELECT empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor FROM oper_ppto")
     for c in ("anio", "mes", "orden", "cantidad", "costo_unit", "valor"):
         ppto_op[c] = pd.to_numeric(ppto_op[c], errors="coerce")
-    ppto_op["hoja"] = ppto_op["hoja"].replace({"Bolsas": OS.HOJA_OTROS})              # la hoja «Bolsas» pasó a llamarse «Otros»
+    ppto_op["hoja"] = ppto_op["hoja"].replace({"Otros": OS.HOJA_OTROS})              # datos guardados con el nombre «Otros»
     lin_sispo = OS.filtrar_guardado(lin_sispo, items_eq, OS.items_presupuestados(ppto_op))   # mismos filtros del SISPO sobre lo ya guardado
     lin_sispo = OS.hoja_por_item(lin_sispo, items_eq, OS.hojas_de_items(ppto_op))      # la lista presupuestada manda sobre el Grupo
     datos_e = {e: _datos_empresa(ctx, e, cfg, asig, mapeo, SimpleNamespace(lin=lin_sispo, per=per_sispo, items=items_eq)) for e in EMPRESAS}

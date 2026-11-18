@@ -9,14 +9,14 @@ Filtros previos (se aplican a los datos ORIGINALES del SISPO, antes de clasifica
      SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos). Toda la cuenta
      OTROS de esos centros también entra, de cualquier grupo: SAP la carga completa en 3.1. Lo que no es grupo 5/7 ni cruza va a Herramientas
      (donde SAP carga el genérico) con la observación de `observacion()`.
-  3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Otros).
+  3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Bolsas).
   4. Se excluye únicamente la «Denominación del objeto» exactamente «Staf Mantenimiento» (`L.es_objeto_staf_mtto`); esas líneas las trata
      Mantenimiento, que las suma a Flota y Equipo de transporte.
 Reglas por hoja, sobre lo que pasó los filtros:
 - Papelería    <- cuenta ÚTILES, PAPELERÍA Y OTROS. Solo salidas (cantidad negativa). Se compara en CANTIDADES: costo cero.
 - Consumibles  <- Grupo [5] - INSUMOS y cuenta OTROS, salvo los dos códigos de bolsas. Solo salidas (costo negativo).
 - Herramientas <- Grupo [7] - HERRAMIENTAS y cuenta OTROS. Solo salidas (costo negativo).
-- Otros        <- exclusivamente los códigos 5064610001 y 5064610002. Solo salidas (costo negativo).
+- Bolsas       <- exclusivamente los códigos 5064610001 y 5064610002. Solo salidas (costo negativo).
 Una línea cae en UNA sola hoja. Lo que no cumple ninguna regla no se muestra en Operaciones.
 
 Relación con SAP: SAP carga todas las salidas de inventario de la cuenta OTROS como UN genérico («Salida de inventario <mes>») en
@@ -29,7 +29,7 @@ import pandas as pd
 
 import logica_m as L
 
-HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", "Consumibles", "Herramientas", "Otros"
+HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", "Consumibles", "Herramientas", "Bolsas"   # HOJA_OTROS = las dos bolsas
 HOJAS_PESOS = (HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS)       # se comparan en pesos; Papelería, en cantidades
 CUENTA_PAPELERIA = "ÚTILES, PAPELERÍA Y OTROS"                       # «Nombre Cta» completo; el archivo lo trae recortado a 20 caracteres
 CUENTA_OTROS = "OTROS"
@@ -54,7 +54,7 @@ MAPEO_INICIAL = {
     # presupuestados en Herramientas
     "5064710001": "Cepíllos", "52850010053": "Rastrillos", "5043910033": "Espatulas 4\"",
     "7015019003": "Pala No. 4", "7015019007": "Palin", "7015019013": "Canastillas", "7015019046": "Desmoñador",
-    # Otros (las dos bolsas)
+    # Bolsas (las dos bolsas)
     "5064610001": "Cesta", "5064610002": "Desarene",
     # tomadas de la columna «Concepto» del SISPO de septiembre y de la lista de ítems
     "1801012631": "Aro 20 aluminio", "1941011215": "Toalla de retazo (kilo)", "5064710002": "Cabos cepillo", "52748010135": "Cepíllos",
@@ -147,7 +147,7 @@ def filtrar_guardado(lin: pd.DataFrame, mapa: dict, presup: set | None) -> pd.Da
 def clasificar(d: pd.DataFrame, mapa: dict | None = None, presup: set | None = None) -> tuple[pd.DataFrame, int]:
     """Agrega `hoja` (vacía si la línea no es de Operaciones). Primero se depura el archivo original (`depurar`) y solo sobre lo que pasa se
     aplican las reglas de cada hoja. Devuelve (líneas, solapes): los solapes son líneas que cumplirían más de una regla; se asignan a una sola
-    (Otros > Consumibles > Herramientas > Papelería) y se informan."""
+    (Bolsas > Consumibles > Herramientas > Papelería) y se informan."""
     d = resolver_items(d, dict(MAPEO_INICIAL) if mapa is None else mapa, presup)
     dep, _ = depurar(d)
     cuenta, grupo = dep["cuenta"].map(L.clase20), dep["grupo"].map(L._canon)
@@ -232,7 +232,7 @@ def hojas_de_items(ppto: pd.DataFrame) -> dict:
 def hoja_por_item(lin: pd.DataFrame, mapa: dict, item_hoja: dict) -> pd.DataFrame:
     """La lista de ítems del presupuesto manda sobre el Grupo del SISPO: una referencia con equivalencia a un ítem que está presupuestado
     en Consumibles o en Herramientas va a esa hoja. Solo mueve líneas que ya están en Consumibles/Herramientas (cuenta OTROS: son las que
-    SAP carga como genérico); no toca Papelería ni Otros. Se aplica al mostrar, sin volver a cargar el SISPO."""
+    SAP carga como genérico); no toca Papelería ni Bolsas. Se aplica al mostrar, sin volver a cargar el SISPO."""
     if lin is None or lin.empty or not item_hoja:
         return lin
     item = lin["item_res"] if "item_res" in lin else lin["codigo"].map(lambda c: mapa.get(str(c), ""))

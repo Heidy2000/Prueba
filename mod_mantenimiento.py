@@ -1424,14 +1424,9 @@ def _tab_flota(S):
     if S.placa:
         st.info(f"Con la placa **{S.placa}** seleccionada no se muestran los conceptos generales: son gastos de la operación y no "
                 "se atribuyen a ninguna placa.", icon=":material/info:")
-    # una vista guardada en la sesión que ya no existe («Por concepto presupuestal») se descarta antes de crear el control
-    if st.session_state.get("mt_vista_placas") not in ("Por placa", "Por concepto de gasto", None):
-        del st.session_state["mt_vista_placas"]
-    if S.es_admin:
-        vista = st.segmented_control("Vista", ["Por concepto de gasto", "Por placa"], default="Por concepto de gasto",
-                                     key="mt_vista_placas") or "Por concepto de gasto"
-    else:                                               # el resto de perfiles ve la vista por concepto de gasto (sin nivel de placa)
-        vista = "Por concepto de gasto"
+    # El administrador ve solo «Por placa» en la página; el detalle por concepto de gasto (con sus descargas) queda en Administración y para
+    # los perfiles sin nivel de placa.
+    vista = "Por placa" if (S.es_admin and not _tecnico()) else "Por concepto de gasto"
     m = mp[mp["concepto"].isin(conc_f)] if conc_f else mp
     # conceptos de gasto con filtros aplicados, sin los que no tienen presupuesto, ejecución ni movimientos (todo en 0: no dicen nada).
     # Alimenta la tabla por concepto de gasto y el gráfico.
