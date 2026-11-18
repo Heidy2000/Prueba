@@ -134,7 +134,8 @@ def resumen(t: pd.DataFrame) -> dict:
 def admin_cargas(ctx):
     con, leer = ctx.con, ctx.leer
     with st.container(key="card_adm_cp"):
-        titulo_tarjeta("Corte y poda", "Presupuesto (libro de servicios proyectados) y ejecución mensual digitada: m², árboles y lo facturado.")
+        titulo_tarjeta("Corte y poda", "Presupuesto (libro de servicios proyectados) y ejecución mensual digitada: m², árboles y lo facturado."
+                   if MOSTRAR_PODA else "Presupuesto (libro de servicios proyectados) y ejecución mensual digitada: m² y lo facturado.")
         anio0 = st.number_input("Año del primer mes del libro", 2024, 2035, 2026, key="cp_anio0",
                                 help="El año sube solo al pasar de diciembre a enero.")
         a, b = st.tabs(["Presupuesto", "Ejecución (histórico manual)"])
@@ -242,13 +243,16 @@ def _editor_historico(ctx):
         st.success(f"Histórico guardado: {len(out)} meses.")
 
 
+MOSTRAR_PODA = False        # de momento la página solo muestra el corte; la poda se sigue cargando y guardando en Administración
+
+
 # ------------------------------------------------------------------ pestaña
 def mostrar(ctx):
     leer = ctx.leer
     ppto, ejec = leer("SELECT * FROM cp_ppto"), leer("SELECT * FROM cp_ejec")
     zona = st.container()
     if ppto.empty:
-        zona.html(E.encabezado("Corte y poda", "Ejecución de área y de árboles contra el presupuesto", []))
+        zona.html(E.encabezado("Corte y poda", "Ejecución de área y de árboles contra el presupuesto" if MOSTRAR_PODA else "Ejecución de área cortada contra el presupuesto", []))
         st.info("Aún no hay presupuesto de corte y poda. Se carga en Administración → Corte y poda.")
         return
     with st.container(key="card_filtros"):
@@ -263,12 +267,12 @@ def mostrar(ctx):
     chips = [(f"{'Mes' if per.solo else 'Corte'}: {MESES_L[per.mes - 1].capitalize()} {anio}", "")]
     chips.append((f"Ejecución cargada hasta {MESES_L[ult - 1].capitalize()}", "ok") if (ejec["anio"] == anio).any()
                  else ("Sin ejecución cargada", "warn"))
-    zona.html(E.encabezado("Corte y poda", f"Área cortada y árboles podados · {per.texto}", chips))
-    if t["m2_ej"].isna().all() and t["arboles_ej"].isna().all():
+    zona.html(E.encabezado("Corte y poda", (f"Área cortada y árboles podados · {per.texto}" if MOSTRAR_PODA else f"Área cortada · {per.texto}"), chips))
+    if t["m2_ej"].isna().all() and (not MOSTRAR_PODA or t["arboles_ej"].isna().all()):
         st.info("No hay ejecución cargada para este periodo.")
         return
     r = resumen(t)
-    st.html(E.kpis([
+    kpis = [
         dict(label="Área cortada (m²)", valor=_n(r["m2_e"]), sub=f"{_fmt_pct(_pct(r['m2_e'], r['m2_p']))} de {_n(r['m2_p'])} m²",
              icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="Árboles podados", valor=_n(r["ar_e"]), sub=(f"{_fmt_pct(_pct(r['ar_e'], r['ar_p']))} de {_n(r['ar_p'])}" if r["ar_p"] else "sin meta de árboles"),
@@ -276,11 +280,14 @@ def mostrar(ctx):
         dict(label="Corte valorizado MTA", valor=E.millones(r["corte_e_mta"]), sub=f"{_fmt_pct(_pct(r['corte_e_mta'], r['corte_p_mta']))} de {E.millones(r['corte_p_mta'])}",
              icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="Corte valorizado NMT", valor=E.millones(r["corte_e_nmt"]), sub=f"{_fmt_pct(_pct(r['corte_e_nmt'], r['corte_p_nmt']))} de {E.millones(r['corte_p_nmt'])}",
-             icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE)]))
+             icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE)]
+    if not MOSTRAR_PODA:
+        kpis = [k for k in kpis if k["label"] != "Árboles podados"]
+    st.html(E.kpis(kpis))
 
     mes_txt = [MESES_L[m - 1].capitalize() for m in t["mes"]]
-    g1, g2 = st.columns(2)
-    for col, titulo, p, e in ((g1, "Área (m²) por mes", "m2", "m2_ej"), (g2, "Árboles por mes", "arboles", "arboles_ej")):
+    graficos = [("Área (m²) por mes", "m2", "m2_ej")] + ([("Árboles por mes", "arboles", "arboles_ej")] if MOSTRAR_PODA else [])
+    for col, (titulo, p, e) in zip(st.columns(len(graficos)), graficos):
         with col:
             titulo_tarjeta(titulo)
             fig = go.Figure([go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO, marker_line_width=0,
@@ -303,13 +310,15 @@ def mostrar(ctx):
     with st.container(key="card_cp_corte"):
         titulo_tarjeta("Corte de césped (área)", "Ejecución valorizada = m² ejecutados × tarifa del mes. Mes sin ejecución cargada queda vacío.")
         st.dataframe(corte, hide_index=True, width="stretch", column_config=cfg_cols)
-    cfg_p = {c: st.column_config.NumberColumn(format="%.0f") for c in poda.columns[1:] if c != "% árboles"}
-    cfg_p["% árboles"] = st.column_config.NumberColumn(format="percent")
-    with st.container(key="card_cp_poda"):
-        titulo_tarjeta("Poda de árboles", "Valor por árbol = valor mensual de poda ÷ árboles del presupuesto; sin árboles presupuestados no se valoriza.")
-        st.dataframe(poda, hide_index=True, width="stretch", column_config=cfg_p)
+    if MOSTRAR_PODA:
+        cfg_p = {c: st.column_config.NumberColumn(format="%.0f") for c in poda.columns[1:] if c != "% árboles"}
+        cfg_p["% árboles"] = st.column_config.NumberColumn(format="percent")
+        with st.container(key="card_cp_poda"):
+            titulo_tarjeta("Poda de árboles", "Valor por árbol = valor mensual de poda ÷ árboles del presupuesto; sin árboles presupuestados no se valoriza.")
+            st.dataframe(poda, hide_index=True, width="stretch", column_config=cfg_p)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf) as w:
         corte.to_excel(w, sheet_name="Corte", index=False)
-        poda.to_excel(w, sheet_name="Poda", index=False)
+        if MOSTRAR_PODA:
+            poda.to_excel(w, sheet_name="Poda", index=False)
     st.download_button("Descargar Excel", buf.getvalue(), f"corte_poda_{anio}_{per.mes:02d}.xlsx", icon=":material/download:", key="cp_dl")
