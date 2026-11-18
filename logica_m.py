@@ -109,16 +109,121 @@ def buscador_placas(placas: list[str]):
     return buscar
 
 
-def asignar_placas(ej: pd.DataFrame, placas: list[str]) -> pd.DataFrame:
-    """Agrega las columnas placa y placa_estado a los movimientos, según la columna texto."""
+METODO_TEXTO = "PLACA EXTRAÍDA DEL TEXTO"
+METODO_INTERNO = "IDENTIFICADA POR NÚMERO INTERNO"
+METODO_PENDIENTE = "PENDIENTE DE IDENTIFICACIÓN"
+METODO_MANUAL = "ASIGNADA MANUALMENTE"
+ESTADO_POR_INTERNO = "Identificada por N° interno"
+
+# Un número del texto solo se considera N° interno si ADEMÁS está en el maestro. Con marcador (INTERNO, INT, N°, NRO, MOVIL, UNIDAD,
+# EQUIPO, VEHICULO) vale en cualquier parte del texto; suelto solo vale en los últimos VENTANA_INTERNO caracteres y si no parece
+# factura, cantidad, medida, porcentaje o fecha.
+VENTANA_INTERNO = 25
+_RE_MARCADOR = re.compile(r"(?<![A-Z0-9])(?:(?:N[°º]\s*INTERNO|NRO\.?\s*INTERNO|NUM(?:ERO)?\.?\s*INTERNO|INTERNO|INT|N[°º]|NRO|NUM|"
+                          r"MOVIL|UNIDAD|EQUIPO|VEHICULO|VEH)(?![A-Z])[\s:#.\-]*)+([A-Z0-9]{1,8})(?![A-Z0-9])")
+_RE_SUELTO = re.compile(r"(?<![A-Z0-9/.,\-])([A-Z0-9]{2,8})(?![A-Z0-9/.,%\-])")
+_ANTES_NO_INTERNO = re.compile(r"(?:FACT(?:URA)?|FV|FE|FC|OC|OP|OT|DOC(?:UMENTO)?|PEDIDO|REMISION|COT(?:IZACION)?|NIT|CC|PO|REF)\.?\s*[:#\-]?\s*$")
+_DESPUES_NO_INTERNO = re.compile(r"^\s*(?:UND|UNDS|UNID|UNIDADES|U|KG|KGS|GL|GLN|LT|LTS|MT|MTS|M|CM|MM|X|PZ|PZAS|HRS|H|DIAS)\b")
+
+
+def norm_interno(x) -> str:
+    """N° interno comparable: mayúsculas, sin espacios ni símbolos, y sin el «.0» ni los ceros a la izquierda de los numéricos
+    (' 0105 ', '105.0' y '105' son el mismo número). Vacío si no hay dato."""
+    t = _como_texto(x).strip()
+    t = re.sub(r"^(\d+)\.0+$", r"\1", t)
+    t = re.sub(r"[^A-Z0-9]", "", sin_tildes(t).upper())
+    return t.lstrip("0") if t.isdigit() else t
+
+
+def internos_maestro(registro: pd.DataFrame | None) -> dict[str, set[str]]:
+    """N° interno normalizado -> conjunto de placas que el maestro le asigna. Es la ÚNICA fuente de la relación interno-placa."""
+    out: dict[str, set[str]] = {}
+    if registro is None or registro.empty or "numero_interno" not in registro:
+        return out
+    for p, i in zip(registro["placa"].map(norm_placa), registro["numero_interno"].map(norm_interno)):
+        if p and i:
+            out.setdefault(i, set()).add(p)
+    return out
+
+
+def inconsistencias_maestro(registro: pd.DataFrame | None) -> pd.DataFrame:
+    """Filas del maestro que no permiten identificar con certeza: un N° interno con varias placas, o una placa con varios N° internos."""
+    cols = ["problema", "numero_interno", "placa", "detalle"]
+    if registro is None or registro.empty or "numero_interno" not in registro:
+        return pd.DataFrame(columns=cols)
+    r = pd.DataFrame({"placa": registro["placa"].map(norm_placa), "numero_interno": registro["numero_interno"].map(norm_interno)})
+    r = r[(r["placa"] != "") & (r["numero_interno"] != "")].drop_duplicates()
+    filas = []
+    for i, g in r.groupby("numero_interno"):
+        if g["placa"].nunique() > 1:
+            filas.append(("N° interno con varias placas", i, ", ".join(sorted(g["placa"])), "No se asigna placa por este N° interno."))
+    for p, g in r.groupby("placa"):
+        if g["numero_interno"].nunique() > 1:
+            filas.append(("Placa con varios N° internos", ", ".join(sorted(g["numero_interno"])), p, "Revisar el maestro."))
+    return pd.DataFrame(filas, columns=cols)
+
+
+def internos_en_texto(texto, internos: dict) -> list[tuple[str, bool]]:
+    """N° internos del maestro que aparecen en el texto: [(N° interno, con_marcador)]. Nunca se toma un número que no esté en el
+    maestro. Si aparecen varios distintos (con marcador o sueltos), el llamador los trata como ambiguos."""
+    t = norm_texto(texto)
+    if not t or not internos:
+        return []
+    con = {norm_interno(m.group(1)) for m in _RE_MARCADOR.finditer(t)} & set(internos)
+    sueltos = set()
+    for m in _RE_SUELTO.finditer(t, max(0, len(t) - VENTANA_INTERNO)):
+        v = norm_interno(m.group(1))
+        if v in internos and not _ANTES_NO_INTERNO.search(t[:m.start()]) and not _DESPUES_NO_INTERNO.match(t[m.end():]):
+            sueltos.add(v)
+    return [(i, True) for i in sorted(con)] + [(i, False) for i in sorted(sueltos - con)]
+
+
+def identificar_vehiculo(texto, buscar, internos: dict) -> dict:
+    """Identifica el vehículo de UN movimiento: 1) placa del texto (lógica de siempre); 2) N° interno del texto contra el maestro.
+    Devuelve placa, placa_estado, placa_metodo, numero_interno_texto y placa_validacion. Nunca inventa una placa."""
+    placa, estado = buscar(texto)
+    hallados = internos_en_texto(texto, internos)
+    ids = [i for i, _ in hallados]
+    nota = "" if not hallados else ("" if all(c for _, c in hallados) else " (número suelto al final del texto)")
+    r = dict(placa=placa, placa_estado=estado, placa_metodo=METODO_TEXTO, numero_interno_texto=", ".join(ids), placa_validacion="")
+    if placa != SIN_PLACA:                              # hay placa en el texto: se conserva y se valida contra el N° interno
+        if len(ids) == 1:
+            ps = internos[ids[0]]
+            if len(ps) > 1:
+                r["placa_validacion"] = f"N° interno {ids[0]} tiene varias placas en el maestro; no se pudo validar"
+            elif placa in ps:
+                r["placa_validacion"] = "Coincide con el N° interno" + nota
+            else:
+                r["placa_validacion"] = f"NO COINCIDE: el N° interno {ids[0]} es de {next(iter(ps))}; se conservó la placa del texto" + nota
+        elif len(ids) > 1:
+            r["placa_validacion"] = "Varios N° internos en el texto; no se pudo validar"
+        return r
+    r["placa_metodo"] = METODO_PENDIENTE
+    if len(ids) == 1:
+        ps = internos[ids[0]]
+        if len(ps) == 1:
+            r.update(placa=next(iter(ps)), placa_estado=ESTADO_POR_INTERNO, placa_metodo=METODO_INTERNO,
+                     placa_validacion="Placa tomada del maestro por el N° interno" + nota)
+        else:
+            r["placa_validacion"] = f"INCONSISTENCIA: el N° interno {ids[0]} tiene varias placas en el maestro ({', '.join(sorted(ps))}); no se asignó"
+    elif len(ids) > 1:
+        r["placa_validacion"] = "Varios N° internos distintos en el texto; no se asignó placa"
+    return r
+
+
+def asignar_placas(ej: pd.DataFrame, placas: list[str], registro: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Agrega placa, placa_estado, placa_metodo, numero_interno_texto y placa_validacion a los movimientos, según la columna texto.
+    Con `registro` (el maestro: placa y numero_interno) además identifica por N° interno cuando el texto no trae placa."""
     ej = ej.copy()
+    nuevas = ["placa", "placa_estado", "placa_metodo", "numero_interno_texto", "placa_validacion"]
     if ej.empty:
-        return ej.assign(placa=pd.Series(dtype=str), placa_estado=pd.Series(dtype=str))
+        return ej.assign(**{c: pd.Series(dtype=str) for c in nuevas})
     buscar = buscador_placas(placas)
+    internos = internos_maestro(registro)
     textos = ej["texto"].fillna("").astype(str)          # el texto vacío de SAP puede venir como NaN/None
-    cache = {t: buscar(t) for t in textos.unique()}
-    ej["placa"] = textos.map(lambda t: cache[t][0])
-    ej["placa_estado"] = textos.map(lambda t: cache[t][1])
+    cache = {t: identificar_vehiculo(t, buscar, internos) for t in textos.unique()}
+    for c in nuevas:
+        ej[c] = textos.map(lambda t: cache[t][c])
     return ej
 
 
@@ -427,6 +532,8 @@ def aplicar_placas_manuales(ej: pd.DataFrame, manual: pd.DataFrame | None) -> pd
     La firma de aprendizaje se calcula siempre con la placa detectada, nunca con la corregida."""
     ej = ej.copy()
     ej["placa_detectada"] = ej["placa"]
+    if "placa_metodo" in ej:                              # «detectada en el texto» es solo la del texto: la sacada del N° interno no cuenta
+        ej.loc[ej["placa_metodo"] == METODO_INTERNO, "placa_detectada"] = SIN_PLACA
     if ej.empty or manual is None or manual.empty or "placa" not in manual:
         return ej
     m = manual[manual["llave"].fillna("").ne("") & manual["placa"].fillna("").ne("")]
@@ -437,6 +544,8 @@ def aplicar_placas_manuales(ej: pd.DataFrame, manual: pd.DataFrame | None) -> pd
     hay = nueva.notna()
     ej.loc[hay, "placa"] = nueva[hay]
     ej.loc[hay, "placa_estado"] = "Asignada a mano"
+    if "placa_metodo" in ej:
+        ej.loc[hay, "placa_metodo"] = METODO_MANUAL
     return ej
 
 
@@ -881,7 +990,8 @@ MESES_ABR = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct
 _ID = ["Compañía", "Grupo", "Placa", "N° interno", "Tipo de vehículo", "Concepto", "Descripción original (presupuesto)"]
 _RES = ["Presupuesto", "Ejecutado", "Saldo", "% ejecución", "Estado"]
 _MOV = ["Fecha", "Documento", "Proveedor", "Texto original del movimiento", "Valor movimiento", "Cuenta", "Centro de coste",
-        "Sub-rubro SAP", "Clasificado por", "Placa detectada en el texto", "ID del movimiento"]
+        "Sub-rubro SAP", "Clasificado por", "Placa detectada en el texto", "N° interno identificado", "Método de identificación",
+        "Validación placa / N° interno", "ID del movimiento"]
 
 
 def _filas_resumen(df: pd.DataFrame, empresa: str, grupo: pd.Series | str) -> pd.DataFrame:
@@ -899,6 +1009,8 @@ def _filas_resumen(df: pd.DataFrame, empresa: str, grupo: pd.Series | str) -> pd
 
 
 def _filas_movimiento(mv: pd.DataFrame, grupo: pd.Series | str, placa: pd.Series) -> pd.DataFrame:
+    if isinstance(grupo, str) and grupo == "Generales":     # los generales no son de un vehículo: no tienen método de identificación
+        mv = mv.assign(numero_interno_texto="", placa_metodo="", placa_validacion="")
     return pd.DataFrame({
         "Compañía": mv["empresa"].to_numpy(), "Grupo": grupo if isinstance(grupo, str) else grupo.to_numpy(),
         "Placa": placa.to_numpy(), "Concepto": mv["concepto"].to_numpy(),
@@ -909,6 +1021,9 @@ def _filas_movimiento(mv: pd.DataFrame, grupo: pd.Series | str, placa: pd.Series
         "Centro de coste": mv["cc_nombre"].to_numpy() if "cc_nombre" in mv else "",
         "Sub-rubro SAP": mv["sub_rubro_sap"].to_numpy() if "sub_rubro_sap" in mv else "",
         "Clasificado por": mv["origen"].to_numpy(), "Placa detectada en el texto": mv["placa_detectada"].to_numpy(),
+        "N° interno identificado": mv["numero_interno_texto"].to_numpy() if "numero_interno_texto" in mv else "",
+        "Método de identificación": mv["placa_metodo"].to_numpy() if "placa_metodo" in mv else "",
+        "Validación placa / N° interno": mv["placa_validacion"].to_numpy() if "placa_validacion" in mv else "",
         "ID del movimiento": mv["llave"].to_numpy()})
 
 

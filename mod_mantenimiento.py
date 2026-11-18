@@ -253,11 +253,18 @@ def _movimientos_maestro(datos_e: dict, cfg: dict, hasta_mes: int, oficial: pd.D
                 nuevos["fecha"] = pd.to_datetime(nuevos["fecha"], errors="coerce")
             todo = pd.concat([todo, nuevos], ignore_index=True)
     mov = todo[(todo["mes"] >= m0) & (todo["mes"] <= hasta_mes)].reset_index(drop=True)
-    mov = L.asignar_placas(mov, oficial["placa"].tolist())
+    mov = L.asignar_placas(mov, oficial["placa"].tolist(), oficial[["placa", "numero_interno"]] if "numero_interno" in oficial else None)
     es_s = mov["sispo"].fillna(False).astype(bool) if "sispo" in mov else pd.Series(False, index=mov.index)
     if es_s.any():                                      # la placa de SISPO sale de su centro de costos, no del texto del artículo
         mov.loc[es_s, "placa"] = mov.loc[es_s, "placa_sispo"]
         mov.loc[es_s, "placa_estado"] = mov.loc[es_s, "placa_estado_sispo"]
+        por_int = mov.loc[es_s, "placa_estado"] == L.ESTADO_POR_INTERNO     # SISPO: la placa viene del centro de costos, no del texto
+        sin_p = mov.loc[es_s, "placa"] == L.SIN_PLACA
+        mov.loc[es_s, "placa_metodo"] = L.METODO_TEXTO
+        mov.loc[es_s & por_int.reindex(mov.index, fill_value=False), "placa_metodo"] = L.METODO_INTERNO
+        mov.loc[es_s & sin_p.reindex(mov.index, fill_value=False), "placa_metodo"] = L.METODO_PENDIENTE
+        mov.loc[es_s, "numero_interno_texto"] = ""
+        mov.loc[es_s, "placa_validacion"] = "Placa del centro de costos de SISPO"
     mov = L.aplicar_placas_manuales(mov, manual)
     mov = L.clasificar(mov, reglas, manual, catalogo)
     if es_s.any():                                      # el concepto sale SOLO de la base maestra (o queda pendiente); lo manual manda
@@ -337,7 +344,7 @@ def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bo
     cols = [c for c in ["empresa", "fecha", "mes", "tercero", "texto", "documento", "codigo_articulo", "cantidad", "cuenta_nombre",
                         "cc_nombre", "sub_rubro_sap", "valor", "llave"] if c in mov.columns]
     if vehiculo:
-        cols = [c for c in ["ambito", "placa", "placa_detectada", "placa_estado", "concepto", "origen", "confianza",
+        cols = [c for c in ["ambito", "placa", "placa_detectada", "numero_interno_texto", "placa_metodo", "placa_validacion", "placa_estado", "concepto", "origen", "confianza",
                             "concepto_sugerido"] if c in mov.columns] + cols
     buscar = st.text_input("Buscar", placeholder="Compañía, proveedor, texto, documento, placa, concepto…",
                            label_visibility="collapsed", key=f"mt_buscar_{clave}")
@@ -355,7 +362,8 @@ def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bo
         "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
         "ambito": "Ámbito", "placa": "Placa (final)", "placa_detectada": "Placa detectada en el texto",
         "placa_estado": "Identificación de placa", "concepto": "Concepto",
-        "origen": "Clasificado por", "confianza": "Confianza", "concepto_sugerido": "Sugerido (confianza baja)",
+        "numero_interno_texto": "N° interno identificado", "placa_metodo": "Método de identificación",
+        "placa_validacion": "Validación placa / N° interno", "origen": "Clasificado por", "confianza": "Confianza", "concepto_sugerido": "Sugerido (confianza baja)",
         "tercero": "Proveedor / tercero", "texto": st.column_config.TextColumn("Texto original", width="large"),
         "documento": "Documento", "cuenta_nombre": "Cuenta", "cc_nombre": "Centro de coste",
         "sub_rubro_sap": "Sub-rubro (SAP)", "valor": st.column_config.NumberColumn("Valor", format="accounting"),
@@ -2514,15 +2522,30 @@ def _admin_placas(ctx):
                           "tipo": df[c_ti].str.strip() if c_ti else None})
         t = t[t["placa"] != ""]
         n_filas = len(t)
+        t = t.assign(numero_interno=t["numero_interno"].map(lambda x: "" if pd.isna(x) else L._como_texto(x).strip()))
+        incons = L.inconsistencias_maestro(t)           # antes de unificar: una placa con dos N° internos se conservaría solo con el primero
         t = t.groupby("placa", sort=False).agg("first").reset_index()
         ctx.con.execute("DELETE FROM mtto_placas")
         _insertar_por_lotes(ctx, "mtto_placas(placa, numero_interno, tipo)",
                             [(r.placa, r.numero_interno if pd.notna(r.numero_interno) else "",
                               r.tipo if pd.notna(r.tipo) else "") for r in t.itertuples(index=False)])
         ctx.con.commit()
-        ctx.registrar_carga(ctx.usuario, "Placas flota", f.name, f"{len(t)} placas únicas de {n_filas} filas")
+        ctx.registrar_carga(ctx.usuario, "Placas flota", f.name, f"{len(t)} placas únicas de {n_filas} filas"
+                            + (f"; {len(incons)} inconsistencias placa / N° interno" if len(incons) else ""))
+        st.session_state["mt_placas_incons"] = incons
         st.success(f"{len(t)} placas únicas guardadas ({n_filas - len(t)} filas repetidas unificadas).")
         st.rerun()
+    previa = st.session_state.get("mt_placas_incons")     # lo detectado al cargar (una placa con dos N° internos se guarda solo con el primero)
+    incons = L.inconsistencias_maestro(ctx.leer("SELECT placa, numero_interno FROM mtto_placas"))
+    if previa is not None and len(previa):
+        incons = pd.concat([incons, previa], ignore_index=True).drop_duplicates()
+    if incons.empty:
+        st.caption("Maestro de placas: cada N° interno corresponde a una sola placa y cada placa a un solo N° interno.")
+    else:
+        st.warning(f"El maestro tiene {len(incons)} inconsistencias entre PLACA y NÚMERO INTERNO. Mientras no se corrijan, esos N° internos "
+                   "NO se usan para asignar placa (los movimientos quedan pendientes de identificación).", icon=":material/warning:")
+        st.dataframe(incons.rename(columns={"problema": "Problema", "numero_interno": "N° interno", "placa": "Placa", "detalle": "Efecto"}),
+                     hide_index=True, width="stretch")
 
 
 def _admin_ppto_flota(ctx, empresa, oficial):
