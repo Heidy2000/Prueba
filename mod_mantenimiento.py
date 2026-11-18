@@ -42,7 +42,7 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, grafico_distribucion, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, titulo_tarjeta
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -2412,10 +2412,6 @@ def _tab_mantenimiento(S):
     with st.container(key="mt_card_rubro_graf"):
         titulo_tarjeta("Dónde se concentra el presupuesto", "Presupuesto vs ejecutado por sub-rubro (millones de pesos)")
         _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.")
-    with st.container(key="mt_card_rubro_dist"):
-        titulo_tarjeta("Distribución del costo ejecutado", f"Por sub-rubro · {S.hasta} · % del total en pesos")
-        if not grafico_distribucion(t["sub_rubro"], t["ejecutado"]):
-            st.caption("Aún no hay costo ejecutado para repartir.")
     if S.multi:
         filas = []
         for e in S.sel:
