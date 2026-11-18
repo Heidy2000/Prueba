@@ -1598,6 +1598,13 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: 
 
 # Sub-rubros que el soporte de ejecución resume en la hoja «Presupuesto» pero para los que no abre hoja de movimientos.
 SUBRUBROS_SIN_HOJA_SOPORTE = ("Inventarios",)
+EMPRESAS_SIN_CONTENEDORES = ("ALSM",)                     # la ejecución de Mantenimiento de SM no tiene Contenedores (ALDC sí)
+
+
+def es_contenedor(sub_rubro: pd.Series) -> pd.Series:
+    """True donde el sub-rubro es de Contenedores."""
+    return sub_rubro.fillna("").astype(str).map(norm_texto).str.contains("CONTENEDOR")
+
 
 
 def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",

@@ -88,6 +88,9 @@ def _asegurar_tablas(ctx):
                 pass
             ctx.con.execute("ALTER TABLE oper_sispo ADD COLUMN concepto TEXT")
             ctx.con.commit()
+        for tabla in ("oper_sispo", "oper_ppto", "oper_mapeo"):     # la hoja «Otros» se llama «Bolsas»: lo guardado con el nombre anterior se actualiza
+            ctx.con.execute(f"UPDATE {tabla} SET hoja=? WHERE hoja=?", (OS.HOJA_OTROS, "Otros"))
+        ctx.con.commit()
         st.session_state["_oper_tablas2"] = True
 
 
@@ -1488,9 +1491,13 @@ def _descarga_ejecucion(S):
     etiqueta = c1.selectbox("Compañía del informe", list(INFORME_EMPRESAS), key="op_empresa_informe",
                             help="El archivo se genera solo con los datos, movimientos, cuentas y clasificación de la compañía elegida.")
     e = INFORME_EMPRESAS[etiqueta]
+    d = S.datos_e[e]
+    vacio = d.ejec.empty and not len(d.lin_pap)                 # sin ejecución en el período no se ofrece un archivo vacío
+    if vacio:
+        st.warning(f"No hay ejecución de {etiqueta} en {S.hasta}: el archivo saldría vacío. Cárgala en Administración.", icon=":material/warning:")
     c2.download_button(f"Descargar informe {etiqueta} (Excel)", lambda: _informe(_vista_empresa(S, e)),
                        f"informe_operaciones_{etiqueta}_{S.escenario.replace(' ', '_')}_{S.hasta_mes:02d}.xlsx",
-                       icon=":material/download:", key=f"op_dl_informe_{etiqueta}",
+                       icon=":material/download:", key=f"op_dl_informe_{etiqueta}", disabled=vacio,
                        help="Resumen general + Papelería, Consumibles, Herramientas y Bolsas. Sin los movimientos de Staf Mantenimiento.")
 
 
@@ -1515,6 +1522,7 @@ def _mostrar(ctx, tecnico: bool = False):
     lin_sispo = leer("SELECT empresa, periodo, hoja, id_kardex, fecha, bodega, codigo, articulo, grupo, cuenta, cc_codigo, cc_nombre, cantidad, valor, concepto "
                      "FROM oper_sispo")
     per_sispo = leer("SELECT empresa, periodo, total_otros FROM oper_sispo_periodo")
+    lin_sispo["hoja"] = lin_sispo["hoja"].replace({"Otros": OS.HOJA_OTROS})              # por si quedó algo guardado con el nombre anterior
     for c in ("periodo", "cantidad", "valor"):
         if c in lin_sispo:
             lin_sispo[c] = pd.to_numeric(lin_sispo[c], errors="coerce")
@@ -1586,7 +1594,10 @@ def _mostrar(ctx, tecnico: bool = False):
 
     for aviso in S.avisos:                                  # SISPO que difiere de SAP, o mes con SAP y sin SISPO
         st.warning(aviso, icon=":material/rule:")
-    if _tecnico():                                      # Administración: todo el detalle técnico y las descargas por hoja
+    if _tecnico():                                      # Administración: descarga del informe, detalle técnico y descargas por hoja
+        with st.container(border=True):
+            titulo_tarjeta("Descargas de ejecución · Operaciones", f"{S.hasta} · una compañía a la vez")
+            _descarga_ejecucion(S)
         _admin(S)
         _tab_resumen(S)
         for hoja in S.hojas:

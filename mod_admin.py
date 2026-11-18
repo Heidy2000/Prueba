@@ -2076,7 +2076,7 @@ def _cargar_mantenimiento_operaciones(ctx):
                         operaciones.admin_presupuesto(ctx, e)
 
     st.divider()
-    st.markdown("**Revisión técnica** (validaciones, conciliación, SISPO aplicado, reclasificación y descargas de control; usa los mismos cálculos de cada módulo)")
+    st.markdown("**Descargas de ejecución y revisión técnica** (archivo de ejecución, informe de placas, validaciones, conciliación y reclasificación; usa los mismos cálculos de cada módulo)")
     c_rm, c_ro = st.columns(2)
     if c_rm.toggle("Mantenimiento", key="adm_rev_mtto", help="Se calcula solo al activarlo."):
         mod_mantenimiento.admin_revision_tecnica(ctx)

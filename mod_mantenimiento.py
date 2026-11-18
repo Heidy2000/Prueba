@@ -1473,7 +1473,7 @@ def _tab_flota(S):
                        "sin concepto asignado.")
     if _tecnico():
         nombre_inf = "ejecucion_vs_presupuesto_por_mes_" + str(S.hasta).replace(" ", "_").replace("–", "-") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
-        st.download_button("Descargar informe ejecución vs presupuesto por mes", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
+        st.download_button("Descargar informe de placas (ejecución vs presupuesto por mes)", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
                            nombre_inf, icon=":material/download:", key="mt_dl_informe_meses", disabled=t.empty and g_gen.empty,
                            help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
                                 ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
@@ -2221,6 +2221,10 @@ def _rubro(S, empresa: str, detalle_flota: bool = False):
     if len(ejec):
         ejec["llave"] = L.llave_movimiento(ejec.assign(empresa=empresa))
         ejec = ejec[~ejec["llave"].isin(set(S.excluidos["llave"]))]
+    if empresa in L.EMPRESAS_SIN_CONTENEDORES:                # SM no tiene Contenedores: nada de eso entra a su Mantenimiento ni a su soporte
+        ec_, pc_ = L.es_contenedor(ejec["sub_rubro"]) if len(ejec) else pd.Series(dtype=bool), L.es_contenedor(ppto["sub_rubro"]) if len(ppto) else pd.Series(dtype=bool)
+        S.contenedores_omitidos[empresa] = (int(pc_.sum()), int(ec_.sum()), float(ejec.loc[ec_, "valor"].sum()) if len(ejec) else 0.0)
+        ppto, ejec = (ppto[~pc_] if len(ppto) else ppto), (ejec[~ec_] if len(ejec) else ejec)
     S.rubro_cache[ck] = (ppto, ejec)
     return S.rubro_cache[ck]
 
@@ -2370,9 +2374,15 @@ def _descarga_soporte(S):
                            icon=":material/rule:")
         cols_dl = st.columns(len(S.sel))
         for cdl, e in zip(cols_dl, S.sel):
+            pe_, ee_ = _rubro(S, e)
+            if len(ee_) and not (pd.to_numeric(ee_["mes"], errors="coerce") >= L.desde_mes(S.cfg)).any():
+                ee_ = ee_.iloc[0:0]
+            vacio = pe_.empty and ee_.empty                   # sin presupuesto ni ejecución no se ofrece un archivo vacío
+            if vacio:
+                cdl.warning(f"{e}: sin presupuesto ni ejecución en {S.hasta}.", icon=":material/warning:")
             cdl.download_button(f"Descargar archivo de ejecución · {e}", lambda e=e: _soporte(S, e, S.hasta_mes, not unico),
                                 f"{S.hasta_mes:02d}_{e}_Archivo_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
-                                key=f"mt_soporte_{e}",
+                                key=f"mt_soporte_{e}", disabled=vacio,
                                 help="Hoja «Presupuesto»: presupuesto de todos los meses y ejecución del período elegido, por sub-rubro. "
                                      "Una hoja por sub-rubro con sus movimientos.")
 
@@ -2413,6 +2423,11 @@ def _tab_mantenimiento(S):
         titulo_tarjeta("Mes a mes", "Presupuesto vs ejecutado del rubro (millones de pesos)")
         _grafico_ts_mensual(S, ppto, ejec)
     _descarga_soporte(S)
+
+
+def _subtitulo(sel) -> str:
+    cont = " · Contenedores" if any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel) else ""
+    return f"Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT{cont}: presupuesto vs ejecución · valores en pesos"
 
 
 def _tab_contenedores(S):
@@ -2777,7 +2792,7 @@ def _mostrar(ctx, tecnico: bool = False):
     if not (ppto_todo["es_global"] != 2).any():
         zona_encabezado.html(E.encabezado(
             "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
-            "Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT · Contenedores: presupuesto vs ejecución · valores en pesos", [(vista_emp, "filtro")]))
+            _subtitulo(sel), [(vista_emp, "filtro")]))
         st.warning(f"No hay presupuesto de flota cargado para **{escenario}** en ninguna compañía. El administrador lo carga en "
                    "Administración, pestaña «Mantenimiento y Operaciones».", icon=":material/warning:")
         return
@@ -2800,7 +2815,7 @@ def _mostrar(ctx, tecnico: bool = False):
         placa = None
     zona_encabezado.html(E.encabezado(
         "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
-        "Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT · Contenedores: presupuesto vs ejecución · valores en pesos",
+        _subtitulo(sel),
         [(vista_emp if not multi else f"Consolidado · {' + '.join(sel)}", "filtro")] + ([(f"Placa {placa}", "filtro")] if placa else [])))
     if placa:
         st.html(f'<div class="mt-filtro" style="display:inline-block;margin:.2rem 0 .6rem;padding:.35rem .8rem;border-radius:8px;'
@@ -2890,7 +2905,7 @@ def _mostrar(ctx, tecnico: bool = False):
         ctx=ctx, asig=asig, sap_pool=pool_sap, sap_salidas=sap_salidas, oficial=oficial, tipos=tipos, ppto_sel=ppto_sel, lin_sispo=sispo_flota[0], sispo_flota=sispo_flota, sispo_otras=sispo_otras, registro_placas=oficial[["placa", "numero_interno"]], ver_todo=ver_todo, sel=sel, multi=multi, escenario=escenario, cfg=cfg, m0=m0, m1=m1, hasta=hasta, hasta_mes=hasta_mes,
         placa=placa, vistas=vistas, vistas_emp=vistas_emp, catalogo=catalogo, placas_edit=placas_edit, manual=manual,
         es_admin=es_admin, ts_scen=ts_scen, ppto_mes=ppto_mes, datos_e=datos_e, mov_pre=mov_pre, mov_todos=mov_todos,
-        mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, tipo_ppto=tipo_ppto, ult=ult,
+        mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, contenedores_omitidos={}, tipo_ppto=tipo_ppto, ult=ult,
         emp_placa=_empresas_por_placa(ppto_sel, mov_todos[mov_todos["empresa"].isin(sel)]),
         ts_original=ts_per_sel.drop_duplicates("concepto").set_index("concepto")["texto_original"] if len(ts_per_sel) else {},
         manual_prev={r.llave: (r.concepto or "", r.placa or "") for r in man.itertuples()})
@@ -2928,19 +2943,29 @@ def _mostrar(ctx, tecnico: bool = False):
             st.caption("El Excel se genera con las mismas tablas de la pantalla, por eso sus totales coinciden.")
 
     # ------------------------------------------------------------------ pestañas
-    nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT", "Contenedores"]
+    con_cont = any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel)       # SM no tiene Contenedores: sin pestaña si solo se ve SM
+    nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])
     if not _tecnico():
-        t_m, t_f, t_t, t_c = st.tabs(nombres_tabs)
-        with t_m:
+        tabs_ = st.tabs(nombres_tabs)
+        with tabs_[0]:
             _tab_mantenimiento(S)
-        with t_f:
+        with tabs_[1]:
             _tab_flota(S)
-        with t_t:
+        with tabs_[2]:
             _tab_ts(S)
-        with t_c:
-            _tab_contenedores(S)
+        if con_cont:
+            with tabs_[3]:
+                _tab_contenedores(S)
     else:
-        with st.expander("Conciliación de Tecnomecánica y SOAT contra SAP", icon=":material/balance:", expanded=True):
+        with st.expander("Descargas de ejecución · Archivo de ejecución e informe de placas", icon=":material/download:", expanded=True):
+            _descarga_soporte(S)
+            st.caption("El informe de placas (ejecución vs presupuesto por mes, con hojas por concepto, por placa y por placa y concepto) "
+                       "está en «Detalle de Flota», más abajo.")
+        for e_, (np_, ne_, ve_) in S.contenedores_omitidos.items():
+            if np_ or ne_:
+                st.warning(f"{e_}: la compañía no tiene Contenedores; se dejaron fuera {np_} filas de presupuesto y {ne_} movimientos "
+                           f"({E.pesos(ve_)}) que venían marcados como Contenedores.", icon=":material/rule:")
+        with st.expander("Conciliación de Tecnomecánica y SOAT contra SAP", icon=":material/balance:"):
             _mostrar_conciliacion_ts(S)
         with st.expander("Control de Staf Mantenimiento y genéricos de SAP sin reemplazar", icon=":material/rule:"):
             _control_staf(S)
@@ -2952,7 +2977,7 @@ def _mostrar(ctx, tecnico: bool = False):
                         "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
         with st.expander("Flota por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
             _tabla(S.vistas["resumen"], 190)
-        with st.expander("Detalle de Flota (descargas por concepto y por mes)", icon=":material/directions_car:"):
+        with st.expander("Informe de placas y descargas de Flota", icon=":material/directions_car:", expanded=True):
             _tab_flota(S)
 
     # lo que sigue es técnico y solo del administrador: vive en Administración (la lógica de cada función lo vuelve a exigir)
