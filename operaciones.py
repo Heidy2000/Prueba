@@ -263,10 +263,11 @@ def _hojas_de(df: pd.DataFrame, mapeo: dict) -> list:
 
 
 def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFrame, per: pd.DataFrame, empresa: str, items: dict, cfg: dict,
-                mtto_per: set = frozenset()):
+                mtto_per: set = frozenset(), con_ppto: bool = True):
     """La ejecución de Operaciones sale SOLO del SISPO (Consumibles, Herramientas y Bolsas en pesos): no se usa ningún valor de SAP.
     Se toma todo periodo con SISPO guardado, cuadre o no con SAP. SAP solo presta la GERENCIA: cada línea hereda la de los movimientos
     de SAP del mismo centro de costo (o la predominante). La comparación con la cuenta OTROS de SAP es informativa y va en `avisos`.
+    `con_ppto`: la compañía tiene presupuesto en Consumibles, Herramientas o Bolsas; si no, que falte el SISPO no es un aviso (no hay nada que comparar).
     Devuelve (ejecución, avisos); la ejecución trae las columnas que usa el resto del módulo."""
     avisos, nuevos = [], []
     m0, m1 = cfg["meses"]
@@ -297,7 +298,7 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
     con_sispo = {int(x) for x in per["periodo"]}
     for m in range(m0, m1 + 1):                                  # meses con genérico en SAP y sin SISPO: Operaciones queda en cero ahí
         pn = cfg["anio"] * 100 + m
-        if pn not in con_sispo and not _generico_otros_sap(ejec_all, empresa, pn).empty:
+        if con_ppto and pn not in con_sispo and not _generico_otros_sap(ejec_all, empresa, pn).empty:
             if (empresa, pn) in mtto_per:
                 avisos.append(f"{empresa} {pn}: Mantenimiento ya aplicó este SISPO, pero Operaciones no lo tiene (Mantenimiento no guarda el grupo del "
                               "artículo ni Papelería, que Operaciones necesita). Elige ese mismo SISPO (cargado en Administración) en Mantenimiento («Cargar SISPO del mes») y "
@@ -315,6 +316,22 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
     ejec["pend_sispo"] = ejec["pend_sispo"].fillna(False).astype(bool)
     return ejec, avisos
 
+
+def _tiene_ppto_pesos(ctx, empresa: str, ppto_base: pd.DataFrame) -> bool:
+    """True si la compañía tiene presupuesto en Consumibles, Herramientas o Bolsas: sub-rubros asignados a esas hojas en el presupuesto de
+    SAP (rubro 3.1) o ítems de esas hojas en el libro de Operaciones. SM no los tiene: ahí la ejecución de esas hojas no se espera."""
+    hojas = set(OS.HOJAS_PESOS) | {"Otros"}
+    if len(ppto_base) and "hoja" in ppto_base and ppto_base["hoja"].isin(hojas).any():
+        return True
+    try:
+        n = ctx.leer("SELECT COUNT(*) AS n FROM oper_ppto WHERE empresa=? AND hoja IN (" + ",".join("?" * len(hojas)) + ")", (empresa, *sorted(hojas)))
+        return bool(len(n) and int(n["n"].iloc[0]) > 0)
+    except Exception:
+        try:
+            ctx.con.rollback()
+        except Exception:
+            pass
+        return True                                    # ante la duda, el aviso se conserva
 
 def _generico_otros_sap(ejec_all: pd.DataFrame, empresa: str, periodo: int) -> pd.DataFrame:
     """Movimientos de SAP «Salida de inventario» de la cuenta OTROS de un periodo (todos los rubros)."""
@@ -349,9 +366,10 @@ def _datos_empresa(ctx, empresa: str, cfg: dict, asig, mapeo: dict, sispo=None) 
             ctx.con.rollback()
         except Exception:
             pass
-    ejec, avisos = _solo_sispo(ejec, ejec_all, lin, per, empresa, items, cfg, mtto_per)
+    con_ppto = _tiene_ppto_pesos(ctx, empresa, ppto_base)
+    ejec, avisos = _solo_sispo(ejec, ejec_all, lin, per, empresa, items, cfg, mtto_per, con_ppto)
     ejec["_sub"] = ejec["sub_rubro"].fillna("").map(cargas.norm)
-    return SimpleNamespace(empresa=empresa, ppto_base=ppto_base, ejec=ejec, ejec_sap=ejec_sap, ejec_all=ejec_all, avisos=avisos,
+    return SimpleNamespace(empresa=empresa, ppto_base=ppto_base, ejec=ejec, ejec_sap=ejec_sap, ejec_all=ejec_all, avisos=avisos, con_ppto=con_ppto,
                            lin_pap=OS.papeleria(lin, cfg, empresa, items))
 
 
@@ -635,6 +653,8 @@ def _control_meses(S):
             dif = round(val(gen) - sis_otros, 2)
             if per.empty and gen.empty and not len(sap):
                 dx = "Sin SAP ni SISPO de este mes."
+            elif per.empty and not d.con_ppto:
+                dx = "Sin presupuesto en Consumibles, Herramientas ni Bolsas: no se espera ejecución de esas hojas."
             elif per.empty:
                 dx = "Falta el SISPO: aplícalo en Mantenimiento («Cargar SISPO del mes»); se guarda también en Operaciones."
             elif gen.empty:
