@@ -2239,6 +2239,37 @@ def _fila_total_df(t: pd.DataFrame, col: str, nombre: str = "Total") -> pd.DataF
     return L.con_metricas(base)[[col, "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]]
 
 
+def _conciliacion_ts(S):
+    """Tecnomecánica y SOAT contra SAP (columna «BASE GASTOS EXPLOTACIO»): (resumen, detalle) del período elegido. La diferencia debe ser $0;
+    si no, se descompone en causas y lo que quede sin explicar se señala. Nada se ajusta para forzar la coincidencia."""
+    rep_ = S.sispo_flota[1]
+    llaves_rep = set(rep_["llave"]) if len(rep_) else set()
+    pool = S.sap_pool[S.sap_pool["empresa"].isin(S.sel)] if len(S.sap_pool) else S.sap_pool
+    return L.conciliar_ts(pool, S.mov_todos[S.mov_todos["empresa"].isin(S.sel)], S.mov_excl, llaves_rep, L.desde_mes(S.cfg), S.hasta_mes)
+
+
+def _mostrar_conciliacion_ts(S):
+    resumen, detalle = _conciliacion_ts(S)
+    titulo_tarjeta("Tecnomecánica y SOAT · SAP vs ejecución", f"{S.hasta} · SAP = columna «BASE GASTOS EXPLOTACIO» · la diferencia debe ser $0")
+    if resumen.empty:
+        st.info("No hay movimientos de SAP en el período.")
+        return
+    nc = st.column_config.NumberColumn
+    st.dataframe(resumen, hide_index=True, width="stretch", column_config={
+        "empresa": "Compañía", "concepto": "Concepto", "movimientos_sap": nc("Mov. SAP", format="%d"), "total_sap": nc("Total SAP", format="accounting"),
+        "movimientos_ejecucion": nc("Mov. ejecución", format="%d"), "total_ejecucion": nc("Total ejecución", format="accounting"),
+        "diferencia": nc("Diferencia", format="accounting"), "perdidos": nc("No llegaron", format="%d"),
+        "excluidos_a_mano": nc("Excluidos a mano", format="%d"), "reemplazados_sispo": nc("Reemplazados SISPO", format="%d"),
+        "reclasificados_a_otro_concepto": nc("A otro concepto", format="%d"), "no_marcados_en_sap": nc("Solo por texto/mano", format="%d"),
+        "duplicados": nc("Duplicados", format="%d"), "pendientes": nc("Pendientes", format="%d"),
+        "sin_correspondencia_sispo": nc("Sin SISPO", format="%d"), "sin_explicar": nc("Sin explicar", format="accounting")})
+    st.caption("SISPO no trae SOAT ni Tecnomecánica (no son salidas de inventario): estos movimientos conservan su valor de SAP y no pasan por la "
+               "reclasificación de SISPO; «Sin SISPO» es informativo.")
+    if len(detalle):
+        cols = [c for c in ("motivo", "concepto_ts", "empresa", "fecha", "documento", "tercero", "texto", "valor") if c in detalle]
+        st.dataframe(detalle[cols], hide_index=True, width="stretch")
+
+
 def _control_staf(S):
     """Control (solo administrador) de las líneas de SAP con clase de coste OTROS y objeto «Staf Mantenimiento», que se suman a
     «Flota y Equipo de transporte» y por tanto salen en el soporte de ejecución. Muestra, por compañía y mes, cuántas hay y cuánto
@@ -2837,6 +2868,15 @@ def _mostrar(ctx, tecnico: bool = False):
             valid.loc[len(valid)] = ["Consolidado = suma de las compañías", "✔ Correcto" if abs(dp) < 1 and abs(de) < 1 else "⚠ Revisar",
                                      f"Diferencia en presupuesto: {E.pesos(dp)}; en ejecución: {E.pesos(de)}. El Excel se arma por compañía."]
 
+    if es_admin and valid is not None:
+        rs_ts, _ = _conciliacion_ts(SimpleNamespace(sap_pool=pool_sap, sel=sel, mov_todos=mov_todos, mov_excl=mov_excl, sispo_flota=sispo_flota,
+                                                    cfg=cfg, hasta_mes=hasta_mes))
+        mala = rs_ts[(rs_ts["diferencia"].abs() >= 0.5) | (rs_ts["sin_explicar"].abs() >= 0.5) | (rs_ts["duplicados"] > 0)] if len(rs_ts) else rs_ts
+        valid.loc[len(valid)] = ["Tecnomecánica y SOAT = SAP (BASE GASTOS EXPLOTACIO)", "✔ Correcto" if mala.empty else "⚠ Revisar",
+                                 "SOAT y Tecnomecánica de la ejecución suman lo mismo que SAP, sin duplicados." if mala.empty else
+                                 "Diferencia vs SAP: " + "; ".join(f"{r.empresa} {r.concepto} {E.pesos(r.diferencia)}" for r in mala.itertuples())
+                                 + ". El detalle está en Administración → Revisión técnica → Conciliación de Tecnomecánica y SOAT."]
+
     ts_mes_sel = pd.concat([datos_e[e].ts_mes for e in sel], ignore_index=True)
     ts_scen = ts_mes_sel[(ts_mes_sel["anio"] == cfg["anio"]) & (ts_mes_sel["mes"] >= m0) & (ts_mes_sel["mes"] <= m1)]
     ts_per_sel = pd.concat([datos_e[e].ts_per for e in sel], ignore_index=True)
@@ -2900,6 +2940,8 @@ def _mostrar(ctx, tecnico: bool = False):
         with t_c:
             _tab_contenedores(S)
     else:
+        with st.expander("Conciliación de Tecnomecánica y SOAT contra SAP", icon=":material/balance:", expanded=True):
+            _mostrar_conciliacion_ts(S)
         with st.expander("Control de Staf Mantenimiento y genéricos de SAP sin reemplazar", icon=":material/rule:"):
             _control_staf(S)
             for e_ in S.sel:

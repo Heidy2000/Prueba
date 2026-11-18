@@ -264,13 +264,34 @@ def ts_periodo(ts_mensual: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return t[cols]
 
 
+PATRON_TS_SAP = {CONCEPTO_SOAT: re.compile(r"SOAT|SEGURO OBLIGATORIO"),
+                 CONCEPTO_TECNO: re.compile(r"TECNOMEC|TECNO MEC|REVISION TECNICO|REV TECNICO")}
+
+
+def concepto_ts_sap(ej: pd.DataFrame) -> pd.Series:
+    """Concepto de Tecnomecánica/SOAT que SAP asigna al movimiento en su columna «BASE GASTOS EXPLOTACIO» (que la base guarda como
+    `sub_rubro`; `sub_rubro_sap` conserva el nombre original si el movimiento se pasó a otro sub-rubro). Es la fuente de verdad de estos
+    dos conceptos: '' si SAP no lo marca como SOAT ni Tecnomecánica."""
+    if ej.empty:
+        return pd.Series("", index=ej.index, dtype=object)
+    col = "sub_rubro_sap" if "sub_rubro_sap" in ej else ("sub_rubro" if "sub_rubro" in ej else None)
+    if col is None:
+        return pd.Series("", index=ej.index, dtype=object)
+    cache = {}
+    for s in ej[col].fillna("").astype(str).unique():
+        n = norm_texto(s)
+        cache[s] = next((c for c, p in PATRON_TS_SAP.items() if p.search(n)), "")
+    return ej[col].fillna("").astype(str).map(cache)
+
+
 def candidatos_ts(ej: pd.DataFrame) -> pd.Series:
-    """Movimientos cuyo texto o nombre de cuenta habla de SOAT o tecnomecánica (para traerlos aunque estén en otro sub-rubro)."""
+    """Movimientos que entran a Tecnomecánica/SOAT aunque estén en otro sub-rubro: los que SAP marca así en «BASE GASTOS EXPLOTACIO»
+    y, además, los que solo por su texto o nombre de cuenta hablan de SOAT o tecnomecánica."""
     if ej.empty:
         return pd.Series(False, index=ej.index)
     base = ej["texto"].fillna("").astype(str) + " " + (ej["cuenta_nombre"].fillna("").astype(str) if "cuenta_nombre" in ej else "")
     cache = {t: bool(PATRON_TS.search(norm_texto(t))) for t in base.unique()}
-    return base.map(cache)
+    return base.map(cache) | (concepto_ts_sap(ej) != "")
 
 
 def catalogo_conceptos(ppto: pd.DataFrame) -> list[str]:
@@ -490,7 +511,60 @@ def clasificar(ej: pd.DataFrame, reglas: pd.DataFrame, manual: pd.DataFrame | No
             res.append(cache[(t, v)])
     for i, c in enumerate(["concepto", "concepto_sugerido", "regla", "confianza", "tipo_clasif", "origen"]):
         ej[c] = [r[i] for r in res]
+    # SOAT y Tecnomecánica: manda la columna «BASE GASTOS EXPLOTACIO» de SAP (solo lo reclasificado a mano la supera)
+    ts = concepto_ts_sap(ej)
+    pone = (ts != "") & (ej["origen"] != "Manual") & ts.map(ok)
+    if pone.any():
+        ej.loc[pone, "concepto"] = ts[pone]
+        ej.loc[pone, "concepto_sugerido"] = ""
+        ej.loc[pone, "regla"] = None
+        ej.loc[pone, "confianza"] = "Alta"
+        ej.loc[pone, "tipo_clasif"] = "BASE GASTOS EXPLOTACIO (SAP)"
+        ej.loc[pone, "origen"] = "SAP"
     return ej
+
+
+def conciliar_ts(pool: pd.DataFrame, vigentes: pd.DataFrame, excluidos: pd.DataFrame, reemplazados: set, m0: int, hasta: int):
+    """Control de Tecnomecánica y SOAT contra SAP, por compañía y concepto. `pool` = movimientos de SAP con su llave (antes de clasificar);
+    `vigentes` = movimientos ya clasificados que alimentan la pantalla y el Excel. La diferencia (ejecución − SAP) se descompone en
+    sus causas; lo que no explican las causas queda en «sin explicar» y debe ser $0. Nada se ajusta para forzar la coincidencia.
+    Devuelve (resumen, detalle): `detalle` lista los movimientos de SAP que explican la diferencia o que merecen revisión."""
+    p = pool[(pool["mes"] >= m0) & (pool["mes"] <= hasta)] if len(pool) else pool
+    p = p.assign(concepto_sap=concepto_ts_sap(p)) if len(p) else p.assign(concepto_sap=pd.Series(dtype=str))
+    p = p[p["concepto_sap"] != ""]
+    k_vig, k_exc = set(vigentes["llave"]), set(excluidos["llave"]) if len(excluidos) else set()
+    concepto_de = dict(zip(vigentes["llave"], vigentes["concepto"]))
+    emps = sorted(set(pool["empresa"]) | set(vigentes["empresa"])) if len(pool) or len(vigentes) else []
+    filas, det = [], []
+    for emp in emps:
+        for c in CONCEPTOS_TS:
+            g = p[(p["empresa"] == emp) & (p["concepto_sap"] == c)]
+            ej = vigentes[(vigentes["empresa"] == emp) & (vigentes["concepto"] == c)]
+            sap_t, ej_t = float(g["valor"].sum()), float(ej["valor"].sum())
+            perdidos = g[~g["llave"].isin(k_vig | k_exc | reemplazados)]
+            excl = g[g["llave"].isin(k_exc)]
+            reemp = g[g["llave"].isin(reemplazados) & ~g["llave"].isin(k_vig)]
+            a_otro = g[g["llave"].isin(k_vig) & (g["llave"].map(concepto_de) != c)]
+            extra = ej[~ej["llave"].isin(set(g["llave"]))]
+            dups = int(ej["llave"].duplicated().sum())
+            dif = ej_t - sap_t
+            causas = (-float(perdidos["valor"].sum()) - float(excl["valor"].sum()) - float(reemp["valor"].sum())
+                      - float(a_otro["valor"].sum()) + float(extra["valor"].sum()))
+            filas.append({"empresa": emp, "concepto": c, "movimientos_sap": len(g), "total_sap": sap_t, "movimientos_ejecucion": len(ej),
+                          "total_ejecucion": ej_t, "diferencia": dif, "perdidos": len(perdidos), "excluidos_a_mano": len(excl),
+                          "reemplazados_sispo": len(reemp), "reclasificados_a_otro_concepto": len(a_otro),
+                          "no_marcados_en_sap": len(extra), "duplicados": dups,
+                          "pendientes": int((g["llave"].map(concepto_de) == PENDIENTE).sum()),
+                          "sin_correspondencia_sispo": int((~g["llave"].isin(reemplazados)).sum()), "sin_explicar": round(dif - causas, 2)})
+            for motivo, x in (("No llegó a la ejecución", perdidos), ("Excluido a mano", excl), ("Reemplazado por SISPO", reemp),
+                              ("Reclasificado a otro concepto", a_otro)):
+                if len(x):
+                    det.append(x.assign(motivo=motivo, concepto_ts=c))
+            if len(extra):
+                det.append(extra.assign(motivo="Clasificado aquí por texto o a mano; SAP no lo marca así", concepto_ts=c))
+    resumen = pd.DataFrame(filas)
+    detalle = pd.concat(det, ignore_index=True) if det else pd.DataFrame()
+    return resumen, detalle
 
 
 # ================================================================== indicadores
