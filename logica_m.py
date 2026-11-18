@@ -2064,6 +2064,28 @@ def sispo_sap_generico(pool: pd.DataFrame, empresa: str, periodo: int, cuenta: s
     return pool[es].copy()
 
 
+def valor_sap_ajustado(lin: pd.DataFrame, sap: pd.DataFrame) -> pd.Series:
+    """Valor con el que cada línea de SISPO entra a la ejecución (signo de SAP). El total, y el de cada centro de costo, queda IGUAL al de
+    SAP: la diferencia de redondeo (hasta `TOLERANCIA_CENTAVOS`; SAP en pesos enteros, SISPO con decimales) se suma a la línea de mayor valor
+    del centro de costo y, si aún queda un resto, a la de mayor valor de toda la cuenta. El costo original de SISPO no se toca."""
+    v = pd.Series([-centavos(x) for x in pd.to_numeric(lin["costo_con_iva"], errors="coerce").fillna(0.0)], index=lin.index, dtype="int64")
+    if lin.empty or sap.empty:
+        return v / 100
+    kl = lin["cc_codigo"].fillna("").astype(str).str.strip().str.upper()
+    kr = sap["cc"].fillna("").astype(str).str.strip().str.upper() if "cc" in sap else pd.Series("", index=sap.index)
+    sap_cc = pd.Series([centavos(x) for x in pd.to_numeric(sap["valor"], errors="coerce").fillna(0.0)], index=sap.index).groupby(kr).sum()
+    for cc, objetivo in sap_cc.items():
+        idx = kl.index[kl == cc]
+        if len(idx):
+            d = int(objetivo) - int(v[idx].sum())
+            if d and cuadra_c(d):
+                v[v[idx].abs().idxmax()] += d
+    resto = int(sap_cc.sum()) - int(v.sum())
+    if resto and cuadra_c(resto):
+        v[v.abs().idxmax()] += resto
+    return v / 100
+
+
 def sispo_conciliar(lineas: pd.DataFrame, sap: pd.DataFrame) -> dict:
     """Conciliación por VALOR, con tolerancia de redondeo de hasta $1 (`cuadra_c`). SAP carga el costo en positivo y SISPO lo trae negativo
     (salida): el total de SAP debe ser igual a −SISPO y lo distribuido por concepto debe sumar exactamente lo mismo que SISPO. No se compara

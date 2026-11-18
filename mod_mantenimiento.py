@@ -1644,7 +1644,7 @@ def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFra
     for t in ("mtto_sispo_reemplazados", "mtto_sispo_periodo"):
         cond, par = _cond_cuenta("cuenta", cuenta)
         ctx.con.execute(f"DELETE FROM {t} WHERE empresa=? AND periodo=? AND {cond}", (empresa, int(periodo), *par))
-    guardar = lin.assign(fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"), cuenta_nombre=cuenta, valor_sap=-lin["costo_con_iva"])
+    guardar = lin.assign(fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"), cuenta_nombre=cuenta, valor_sap=L.valor_sap_ajustado(lin, sap))
     _sispo_guardar_lineas(ctx, empresa, periodo, cuenta, guardar)
     vacia = pd.Series("", index=sap.index)
     col = lambda c: (sap[c] if c in sap else vacia).fillna("")
