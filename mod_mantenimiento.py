@@ -42,7 +42,7 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, figura_ppto_ejec_empresas, titulo_tarjeta
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -396,9 +396,11 @@ def _sin_ceros(t: pd.DataFrame) -> pd.DataFrame:
     return t[(num("presupuesto").abs() > 0.5) | (num("ejecutado").abs() > 0.5) | (num("movimientos") > 0)]
 
 
-def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False):
+def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False, por_empresa: dict | None = None):
     """Presupuesto vs ejecutado por concepto (los 12 mayores). Responde: ¿dónde se concentra el gasto y qué tanto se ha usado?
-    «Pendiente» (movimientos sin concepto) se omite, salvo que la tabla de al lado también lo muestre (con_pendiente)."""
+    «Pendiente» (movimientos sin concepto) se omite, salvo que la tabla de al lado también lo muestre (con_pendiente).
+    `por_empresa` ({compañía: tabla con «concepto» y «ejecutado»}): con varias compañías la ejecución se apila por compañía y el
+    presupuesto se marca sobre la barra."""
     t = t if con_pendiente else t[t["concepto"] != L.PENDIENTE]
     t = t.copy()
     for c in ("presupuesto", "ejecutado"):                   # con filtros que dejan la tabla vacía las columnas llegan como texto
@@ -409,6 +411,15 @@ def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False):
         st.caption("Aún no hay presupuesto ni ejecución para graficar.")
         return
     nombres = [c[:48] for c in top["concepto"]]
+    if por_empresa and len(por_empresa) > 1:
+        ejec_e = {}
+        for emp, d in por_empresa.items():
+            v = pd.to_numeric(d.set_index("concepto")["ejecutado"], errors="coerce").groupby(level=0).sum() if len(d) else pd.Series(dtype=float)
+            ejec_e[emp] = (v.reindex(top["concepto"]).fillna(0.0).to_numpy() / 1e6)
+        fig = figura_ppto_ejec_empresas(nombres, top["presupuesto"].to_numpy() / 1e6, ejec_e, horizontal=True, modo_ppto="marca")
+        st.plotly_chart(estilo_grafico(fig, 420), width="stretch", config={"displayModeBar": False})
+        st.caption(nota + " Barra = ejecutado, una porción por compañía; la marca oscura es el presupuesto (suma de las compañías).")
+        return
     fig = go.Figure()
     fig.add_bar(y=nombres, x=top["presupuesto"] / 1e6, name="Presupuesto", orientation="h", marker_color="#c9d4e4",
                 hovertemplate="%{y}: %{x:,.1f} M<extra>Presupuesto</extra>")
@@ -425,6 +436,16 @@ def _grafico_ts_mensual(S, presupuesto_mes: pd.DataFrame, ejecucion: pd.DataFram
     em = (ejecucion.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6).astype(float)
     em[em.index > S.hasta_mes] = None                       # no se dibuja lo que aún no ha pasado
     x = [f"{MESES[m - 1]} {str(S.cfg['anio'])[2:]}" for m in meses]
+    if S.multi and "empresa" in ejecucion and ejecucion["empresa"].nunique() > 1:      # varias compañías: ejecución apilada por compañía
+        por_e = {}
+        for emp in [e for e in S.sel if e in set(ejecucion["empresa"])]:
+            v = (ejecucion[ejecucion["empresa"] == emp].groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6).astype(float)
+            v[v.index > S.hasta_mes] = None
+            por_e[emp] = v
+        fig = figura_ppto_ejec_empresas(x, pm.to_numpy(), por_e)
+        fig.update_layout(bargap=.25)
+        st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
+        return
     fig = go.Figure()
     fig.add_bar(x=x, y=pm, name="Presupuesto", marker_color="#c9d4e4", marker_line_width=0, hovertemplate="%{y:,.1f} M")
     fig.add_bar(x=x, y=em, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0, hovertemplate="%{y:,.1f} M")
@@ -1514,7 +1535,8 @@ def _tab_flota(S):
         titulo_tarjeta("Conceptos de gasto que más pesan", "Presupuesto vs ejecutado (millones de pesos)")
         _barras_ppto_ejec(t[["concepto", "presupuesto", "ejecutado"]],
                           "Los 12 conceptos de gasto con mayor presupuesto o ejecución" + (f" (placa {S.placa})." if S.placa else "."),
-                          con_pendiente=True)
+                          con_pendiente=True,
+                          por_empresa={e: S.vistas_emp[e]["por_concepto"][["concepto", "ejecutado"]] for e in S.sel} if S.multi else None)
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
 
 
@@ -2411,7 +2433,13 @@ def _tab_mantenimiento(S):
         _tabla(_fila_total_df(t, "sub_rubro"), 40 + 35 * (len(t) + 1))
     with st.container(key="mt_card_rubro_graf"):
         titulo_tarjeta("Dónde se concentra el presupuesto", "Presupuesto vs ejecutado por sub-rubro (millones de pesos)")
-        _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.")
+        por_e = None
+        if S.multi:
+            por_e = {}
+            for e in S.sel:
+                pe_, ee_ = _rubro(S, e)
+                por_e[e] = L.tabla_subrubros(pe_, ee_, S.cfg, S.hasta_mes).rename(columns={"sub_rubro": "concepto"})[["concepto", "ejecutado"]]
+        _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.", por_empresa=por_e)
     if S.multi:
         filas = []
         for e in S.sel:

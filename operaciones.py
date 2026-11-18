@@ -53,7 +53,7 @@ import datos
 import estilo as E
 import logica_m as L
 import sispo_oper as OS
-from ui import EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, grafico_distribucion, titulo_tarjeta
+from ui import COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, figura_ppto_ejec_empresas, grafico_distribucion, titulo_tarjeta
 
 VERSION = "v3 · 9-nov-2026"          # se muestra en el encabezado: sirve para confirmar qué versión está corriendo
 RUBRO_COD = "3.1"
@@ -513,13 +513,42 @@ def _columnas_mes(S=None):
             "pct_acum": nc("% acumulado", format="percent")}
 
 
+def _solo_empresa(S, e: str):
+    """La misma vista de `S` pero solo con los datos de la compañía `e`: sirve para repartir por compañía con los MISMOS cálculos de las tablas."""
+    q = SimpleNamespace(**vars(S))
+    q.sel, q.multi = [e], False
+    for nombre in ("ppto", "ejec", "lin_pap"):
+        d = getattr(S, nombre, None)
+        if d is not None and len(d) and "empresa" in d:
+            setattr(q, nombre, d[d["empresa"] == e])
+    return q
+
+
+def _ejec_hoja_empresa(S, e: str, hoja: str) -> float:
+    """Ejecutado hasta el corte de una hoja (o de «Sin hoja asignada») para una compañía; coincide con las cifras de la tabla."""
+    q = _solo_empresa(S, e)
+    if hoja == SIN_HOJA:
+        x = q.ejec[(q.ejec["hoja"] == SIN_HOJA) & (q.ejec["mes"] <= S.hasta_mes)]
+        return float(pd.to_numeric(x["valor"], errors="coerce").fillna(0.0).sum())
+    return _cifras(q, hoja)["ejecutado"]
+
+
 def _graficos_mes(S, t: pd.DataFrame, hoja: str):
     """Un solo gráfico por hoja: presupuesto vs ejecutado mes a mes (el acumulado ya está en la tabla)."""
     m = t[t["mes"] > 0]
     x = [f"{MESES[mm - 1]} {str(S.cfg['anio'])[2:]}" for mm in m["mes"]]
     div, suf, que = (1.0, "", "unidades") if S.cant else (1e6, " M", "millones de pesos")
     with st.container(key=f"op_card_graf_mes_{hoja}"):
-        titulo_tarjeta("Mes a mes", f"Presupuesto vs ejecutado ({que})")
+        titulo_tarjeta("Mes a mes", f"Presupuesto vs ejecutado ({que})" + (" · ejecución por compañía" if S.multi else ""))
+        if S.multi:                                       # varias compañías: ejecución apilada por compañía; el presupuesto, como línea
+            por_e = {}
+            for e in S.sel:
+                te = _mensual(_solo_empresa(S, e), hoja)
+                por_e[e] = te[te["mes"] > 0].set_index("mes")["ejecutado"].reindex(m["mes"]).to_numpy() / div
+            fig = figura_ppto_ejec_empresas(x, (m["presupuesto"] / div).to_numpy(), por_e, sufijo=suf)
+            fig.update_layout(bargap=.3, legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
+            return
         fig = go.Figure()
         for nombre, col, color in (("Presupuesto", "presupuesto", "#c9d4e4"), ("Ejecutado", "ejecutado", E.AZUL)):
             fig.add_bar(x=x, y=m[col] / div, name=nombre, marker_color=color, marker_line_width=0, hovertemplate="%{y:,.1f}" + suf,
@@ -693,10 +722,20 @@ def _graficos_costo(S):
     with c2, st.container(key="op_card_conc"):
         titulo_tarjeta("Concentración por ítem", f"Los 10 ítems con mayor costo · {S.hasta} · millones de pesos")
         col = "item_vista" if "item_vista" in e else "texto"
-        it = e.assign(_i=e[col].fillna("Sin ítem (SAP, sin detalle de SISPO)")).groupby("_i")["valor"].sum()
+        e = e.assign(_i=e[col].fillna("Sin ítem (SAP, sin detalle de SISPO)"))
+        it = e.groupby("_i")["valor"].sum()
         it = it[it > 0].nlargest(10).iloc[::-1]
         if it.empty:
             st.caption("Aún no hay costo ejecutado por ítem.")
+        elif S.multi and e["empresa"].nunique() > 1:      # varias compañías: cada barra se reparte entre las compañías
+            fig = go.Figure()
+            for emp in [x for x in S.sel if x in set(e["empresa"])]:
+                v = e[e["empresa"] == emp].groupby("_i")["valor"].sum().reindex(it.index).fillna(0.0)
+                fig.add_bar(y=[x[:42] for x in it.index], x=v.values / 1e6, orientation="h", name=emp, marker_color=COLOR_EMPRESA.get(emp, E.AZUL),
+                            marker_line_width=0, hovertemplate="%{y}: %{x:,.1f} M<extra>" + emp + "</extra>")
+            fig.update_layout(barmode="stack", xaxis=dict(tickformat=",.0f", ticksuffix=" M"), yaxis=dict(type="category"),
+                              legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
         else:
             fig = go.Figure(go.Bar(y=[x[:42] for x in it.index], x=it.values / 1e6, orientation="h", marker_color=E.AZUL,
                                    hovertemplate="%{y}: %{x:,.1f} M<extra></extra>"))
@@ -739,17 +778,23 @@ def _tab_resumen(S):
     graf = graf[(graf["presupuesto"] > 0) | (graf["ejecutado"] != 0)]
     if not graf.empty:
         with st.container(key="op_card_resumen_graf"):
-            titulo_tarjeta("Por hoja", "Presupuesto al corte vs ejecutado (millones de pesos)")
-            fig = go.Figure()
-            fig.add_bar(x=graf["hoja"], y=graf["presupuesto"] / 1e6, name="Presupuesto al corte", marker_color="#c9d4e4", marker_line_width=0,
-                        hovertemplate="%{y:,.1f} M")
-            fig.add_bar(x=graf["hoja"], y=graf["ejecutado"] / 1e6, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0,
-                        hovertemplate="%{y:,.1f} M")
-            fig.update_traces(text=None)
-            fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
-            fig.data[0].update(text=(graf["presupuesto"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
-            fig.data[1].update(text=(graf["ejecutado"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
-            st.plotly_chart(estilo_grafico(fig, 320), width="stretch", config={"displayModeBar": False})
+            titulo_tarjeta("Por hoja", "Presupuesto al corte vs ejecutado (millones de pesos)" + (" · ejecución por compañía" if S.multi else ""))
+            if S.multi:                                    # varias compañías: ejecución apilada por compañía; presupuesto como marca
+                por_e = {e: [_ejec_hoja_empresa(S, e, h) / 1e6 for h in graf["hoja"]] for e in S.sel}
+                fig = figura_ppto_ejec_empresas(list(graf["hoja"]), (graf["presupuesto"] / 1e6).to_numpy(), por_e, modo_ppto="marca",
+                                                nombre_ppto="Presupuesto al corte")
+                st.plotly_chart(estilo_grafico(fig, 320), width="stretch", config={"displayModeBar": False})
+            else:
+                fig = go.Figure()
+                fig.add_bar(x=graf["hoja"], y=graf["presupuesto"] / 1e6, name="Presupuesto al corte", marker_color="#c9d4e4", marker_line_width=0,
+                            hovertemplate="%{y:,.1f} M")
+                fig.add_bar(x=graf["hoja"], y=graf["ejecutado"] / 1e6, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0,
+                            hovertemplate="%{y:,.1f} M")
+                fig.update_traces(text=None)
+                fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
+                fig.data[0].update(text=(graf["presupuesto"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
+                fig.data[1].update(text=(graf["ejecutado"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
+                st.plotly_chart(estilo_grafico(fig, 320), width="stretch", config={"displayModeBar": False})
     _graficos_costo(S)
     if OS.HOJA_PAPELERIA in S.hojas:                    # Papelería: en cantidades, aparte de los pesos
         q = _vista_cantidades(S)
