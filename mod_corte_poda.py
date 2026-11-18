@@ -310,6 +310,6 @@ def mostrar(ctx):
         st.dataframe(poda, hide_index=True, width="stretch", column_config=cfg_p)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf) as w:
-        corte.to_excel(w, "Corte", index=False)
-        poda.to_excel(w, "Poda", index=False)
+        corte.to_excel(w, sheet_name="Corte", index=False)
+        poda.to_excel(w, sheet_name="Poda", index=False)
     st.download_button("Descargar Excel", buf.getvalue(), f"corte_poda_{anio}_{per.mes:02d}.xlsx", icon=":material/download:", key="cp_dl")
