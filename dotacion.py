@@ -139,15 +139,20 @@ def equivalencias(articulos: pd.DataFrame, elementos: list[str], guardadas: dict
 
 
 # ================================================================== comparación presupuesto vs ejecución
-def sap_por_mes(pool: pd.DataFrame, empresa: str, anio: int) -> dict[int, float]:
-    """Ejecución OFICIAL de dotación: SAP código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s», neta (incluye anulados y reversos), por mes."""
+def sap_filas(pool: pd.DataFrame, empresa: str, anio: int) -> pd.DataFrame:
+    """Líneas de SAP de dotación: código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s» (incluye anulados y reversos)."""
     if pool is None or pool.empty:
-        return {}
+        return pd.DataFrame(columns=["mes", "valor"])
     k = lambda x: re.sub(r"[^A-Z0-9]", "", _norm(x))
     es = ((pool["empresa"] == empresa) & (pd.to_numeric(pool["anio"], errors="coerce") == anio)
           & (pool["codigo"].astype(str).str.strip() == CODIGO_SAP) & (pool["sub_rubro"].map(k) == k(SUBRUBRO_SAP)))
-    g = pool[es].assign(mes=lambda d: pd.to_numeric(d["mes"], errors="coerce")).groupby("mes")["valor"].sum()
-    return {int(m): round(float(v), 2) for m, v in g.items()}
+    return pool[es].assign(mes=lambda d: pd.to_numeric(d["mes"], errors="coerce"))
+
+
+def sap_por_mes(pool: pd.DataFrame, empresa: str, anio: int) -> dict[int, float]:
+    """Ejecución OFICIAL de dotación por mes: SAP código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s», neta."""
+    f = sap_filas(pool, empresa, anio)
+    return {int(m): round(float(v), 2) for m, v in f.groupby("mes")["valor"].sum().items()} if not f.empty else {}
 
 
 def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses: list[int], sap_mes: dict | None = None) -> pd.DataFrame:
@@ -196,3 +201,26 @@ def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo
         return dict(sap=None, sispo=sispo, diferencia=None)
     s = float(pd.to_numeric(sap["valor"], errors="coerce").sum())
     return dict(sap=s, sispo=sispo, diferencia=round(s - sispo, 2))
+
+
+def libro_ejecucion(t: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sap: pd.DataFrame, meses: list[int]) -> bytes:
+    """Excel de la ejecución de dotación: comparación por elemento, detalle del SISPO (con su elemento) y líneas de SAP que el SISPO
+    no detalla (movimientos que no son «Salida de inventario»). Solo los meses pedidos."""
+    from io import BytesIO
+    c = t.rename(columns={"seccion": "Sección", "elemento": "Elemento", "ppto_cant": "Cant. presupuesto", "presupuesto": "Presupuesto",
+                          "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado", "movimientos": "Salidas", "saldo": "Saldo",
+                          "pct": "% ejecución", "estado": "Estado"})
+    det = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
+    det["elemento"] = det["elemento"].fillna(SIN_ELEMENTO)
+    det = det.rename(columns={"periodo": "Periodo", "mes": "Mes", "codigo": "Código", "articulo": "Artículo", "cc_codigo": "Centro de costo",
+                              "cc_nombre": "Nombre centro de costo", "cantidad": "Cantidad", "valor": "Valor", "elemento": "Elemento del presupuesto"})
+    s = sap[sap["mes"].isin(meses)]
+    gen = s["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False) if "texto" in s and len(s) else pd.Series(False, index=s.index)
+    otros = s[~gen]
+    cols = [x for x in ("mes", "fecha", "documento", "cc_sap", "cuenta_nombre", "texto", "valor") if x in otros]
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        c.to_excel(w, sheet_name="Presupuesto vs ejecutado", index=False)
+        det.to_excel(w, sheet_name="Detalle SISPO", index=False)
+        otros[cols].to_excel(w, sheet_name="SAP sin detalle SISPO", index=False)
+    return buf.getvalue()

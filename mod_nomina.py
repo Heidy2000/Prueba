@@ -426,21 +426,24 @@ def _dotacion(ctx):
     tot = D.totales(t)
     txt_per = ", ".join(MESES[m - 1] for m in meses) if len(meses) <= 3 else f"{MESES[meses[0] - 1]}–{MESES[meses[-1] - 1]}"
 
-    st.html(E.kpis([
-        dict(label="Presupuesto", valor=E.millones(tot["presupuesto"]), sub=f"Dotación y EPP's · {txt_per}", icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
-        dict(label="Ejecutado (SAP)", valor=E.millones(tot["ejecutado"]), sub="SAP 3.1 · Dotación y EPP's, detallado con SISPO", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
-        dict(label="Variación", valor=f'<span style="color:{E.VERDE if tot["variacion"] <= 0 else E.ROJO}">{"+" if tot["variacion"] >= 0 else ""}{E.millones(tot["variacion"])}</span>',
-             sub="Ejecutado − presupuesto (negativo: por debajo)", icono="check" if tot["variacion"] <= 0 else "alert",
-             color=E.VERDE if tot["variacion"] <= 0 else E.ROJO, fondo=E.VERDE_SUAVE if tot["variacion"] <= 0 else E.ROJO_SUAVE),
-        dict(label="% de ejecución", valor=E.pct_txt(tot["pct"]), sub="Del presupuesto del periodo", icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE),
-    ]))
+    def kpis(tt, sub):
+        tv = D.totales(tt)
+        ok = tv["variacion"] <= 0
+        return E.kpis([
+            dict(label="Presupuesto", valor=E.millones(tv["presupuesto"]), sub=sub, icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
+            dict(label="Ejecutado", valor=E.millones(tv["ejecutado"]), sub="SAP 3.1 · Dotación y EPP's, detallado con SISPO", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
+            dict(label="Variación", valor=f'<span style="color:{E.VERDE if ok else E.ROJO}">{"+" if tv["variacion"] >= 0 else ""}{E.millones(tv["variacion"])}</span>',
+                 sub="Ejecutado − presupuesto (negativo: por debajo)", icono="check" if ok else "alert",
+                 color=E.VERDE if ok else E.ROJO, fondo=E.VERDE_SUAVE if ok else E.ROJO_SUAVE),
+            dict(label="% de ejecución", valor=E.pct_txt(tv["pct"]), sub="Del presupuesto del periodo", icono="calendar",
+                 color=E.color_barra(tv["pct"], tv["ejecutado"], False), fondo=E.AZUL_SUAVE)])
+
     if tot["sin_elemento"] > 0:
         n = int((eq["origen"] == "Pendiente").sum())
-        st.warning(f"{E.millones(tot['sin_elemento'])} del ejecutado corresponden a artículos que aún no tienen elemento del presupuesto "
-                   f"({n} sin asignar). Se muestran abajo como «Sin elemento asignado»; asígnalos en Administración → Nómina → Dotación.")
-    # cuadre con SAP de los meses mostrados
+        st.warning(f"{E.millones(tot['sin_elemento'])} del ejecutado son artículos que aún no tienen elemento del presupuesto "
+                   f"({n} sin asignar): están en la pestaña «Sin asignar». Asígnalos en Administración → Nómina → Dotación.")
     if tot["sin_detalle"]:
-        st.caption(f"{E.millones(tot['sin_detalle'])} de SAP no los detalla el SISPO (movimientos que no son «Salida de inventario» o meses sin SISPO); van en la fila «Sin detalle de SISPO».")
+        st.caption(f"{E.millones(tot['sin_detalle'])} de SAP no los detalla el SISPO (movimientos que no son «Salida de inventario» o meses sin SISPO); están en «Sin asignar».")
     difs = []
     for m in [m for m in meses if m in set(ejec["mes"])]:
         r = D.cuadre_sap(ejec, pool, empresa, anio * 100 + m)
@@ -450,42 +453,87 @@ def _dotacion(ctx):
             difs.append(f"{MESES[m - 1]}: SAP {E.millones(r['sap'])} vs SISPO {E.millones(r['sispo'])}")
     if difs:
         st.warning("El SISPO no cuadra con SAP en la cuenta DOTACIÓN PERSONAL → " + " · ".join(difs))
-    else:
-        st.caption("✓ El SISPO de DOTACIÓN PERSONAL cuadra con SAP en los meses mostrados.")
 
-    with st.container(key="card_dot_elem"):
-        titulo_tarjeta("Presupuesto vs ejecutado por elemento", f"{empresa} {anio} · {txt_per}. Solo aparecen elementos con presupuesto o ejecución.")
-        g = t[(t["presupuesto"] > 0) | (t["ejecutado"] > 0)].copy()
-        top = g.sort_values(["ejecutado", "presupuesto"], ascending=False).head(15).iloc[::-1]
+    def barras(g, clave):
+        """Una fila por elemento: barra gris = presupuesto, barra de color encima = ejecutado (verde, naranja o rojo según el % de ejecución)."""
+        g = g[(g["presupuesto"] > 0) | (g["ejecutado"] > 0)].sort_values("presupuesto", ascending=True)
+        if g.empty:
+            st.info("No hay presupuesto ni ejecución en este grupo para el periodo elegido.")
+            return
+        colores = [E.color_barra(p, e, False) for p, e in zip(g["pct"], g["ejecutado"])]
+        etiqueta = [f"{E.millones(e)} · {E.pct_txt(p)}" if p == p else f"{E.millones(e)} · sin presupuesto" for e, p in zip(g["ejecutado"], g["pct"])]
         fig = go.Figure()
-        fig.add_bar(y=top["elemento"], x=top["presupuesto"] / 1e6, orientation="h", name="Presupuesto", marker_color="#b9c6d8")
-        fig.add_bar(y=top["elemento"], x=top["ejecutado"] / 1e6, orientation="h", name="Ejecutado", marker_color=E.AZUL)
-        fig.update_layout(barmode="group", xaxis_title="Millones de pesos")
-        estilo_grafico(fig, 80 + 34 * len(top))
-        st.plotly_chart(fig, width="stretch", key="dot_graf_elem")
-        st.caption("Se muestran los 15 elementos con mayor ejecución; el detalle completo está en la tabla.")
-    with st.container(key="card_dot_tabla"):
-        titulo_tarjeta("Detalle", "Por sección y elemento. Cantidades en unidades; valores en pesos.")
-        vista = g.rename(columns={"seccion": "Sección", "elemento": "Elemento", "ppto_cant": "Cant. ppto", "presupuesto": "Presupuesto",
-                                  "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado", "movimientos": "Salidas", "saldo": "Saldo",
-                                  "pct": "% ejecución", "estado": "Estado"})
-        st.dataframe(vista, hide_index=True, width="stretch", column_config={
-            "Presupuesto": st.column_config.NumberColumn(format="$ %.0f"), "Ejecutado": st.column_config.NumberColumn(format="$ %.0f"),
-            "Saldo": st.column_config.NumberColumn(format="$ %.0f"), "% ejecución": st.column_config.NumberColumn(format="percent"),
-            "Cant. ppto": st.column_config.NumberColumn(format="%.0f"), "Cant. ejecutada": st.column_config.NumberColumn(format="%.0f")})
-        st.download_button("Descargar comparación (Excel)", a_excel(vista), file_name=f"dotacion_{empresa}_{anio}_{txt_per.replace(' ', '')}.xlsx",
-                           key="dot_desc")
-    with st.container(key="card_dot_mes"):
-        titulo_tarjeta("Mes a mes", "Presupuesto de Dotación y EPP's vs ejecutado, solo meses con SISPO.")
-        mm = []
-        for m in meses_ej:
-            if m > per.mes:
-                continue
-            tm = D.totales(D.comparar(ppto, ejec, eq, [m], sap_mes))
-            mm.append((MESES[m - 1], tm["presupuesto"], tm["ejecutado"]))
-        fig2 = go.Figure()
-        fig2.add_bar(x=[a for a, _, _ in mm], y=[b / 1e6 for _, b, _ in mm], name="Presupuesto", marker_color="#b9c6d8")
-        fig2.add_bar(x=[a for a, _, _ in mm], y=[c_ / 1e6 for _, _, c_ in mm], name="Ejecutado", marker_color=E.AZUL)
-        fig2.update_layout(barmode="group", yaxis_title="Millones de pesos")
-        estilo_grafico(fig2, 300)
-        st.plotly_chart(fig2, width="stretch", key="dot_graf_mes")
+        fig.add_bar(y=g["elemento"], x=g["presupuesto"] / 1e6, orientation="h", name="Presupuesto", marker_color="#dbe3ee", width=0.75,
+                    hovertemplate="%{y}<br>Presupuesto: $%{x:,.1f} M<extra></extra>")
+        fig.add_bar(y=g["elemento"], x=g["ejecutado"] / 1e6, orientation="h", name="Ejecutado", marker_color=colores, width=0.42,
+                    text=etiqueta, textposition="outside", cliponaxis=False,
+                    hovertemplate="%{y}<br>Ejecutado: $%{x:,.1f} M<extra></extra>")
+        fig.update_layout(barmode="overlay", xaxis_title="Millones de pesos", yaxis_title=None)
+        estilo_grafico(fig, 90 + 38 * len(g))
+        st.plotly_chart(fig, width="stretch", key=f"dot_graf_{clave}")
+        st.caption("Barra gris: presupuesto. Barra de color: ejecutado (azul dentro del presupuesto, naranja cerca del límite, rojo si lo supera). "
+                   "A la derecha: valor ejecutado y % del presupuesto.")
+
+    def tabla(g, clave):
+        v = g[(g["presupuesto"] > 0) | (g["ejecutado"] > 0)].rename(columns={
+            "elemento": "Elemento", "ppto_cant": "Cant. ppto", "presupuesto": "Presupuesto", "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado",
+            "movimientos": "Salidas", "saldo": "Saldo", "pct": "% ejecución", "estado": "Estado"})
+        st.dataframe(v[["Elemento", "Cant. ppto", "Cant. ejecutada", "Presupuesto", "Ejecutado", "Saldo", "% ejecución", "Estado"]], hide_index=True, width="stretch",
+                     key=f"dot_tab_{clave}", column_config={
+                         "Presupuesto": st.column_config.NumberColumn(format="$ %.0f"), "Ejecutado": st.column_config.NumberColumn(format="$ %.0f"),
+                         "Saldo": st.column_config.NumberColumn(format="$ %.0f"), "% ejecución": st.column_config.NumberColumn(format="percent"),
+                         "Cant. ppto": st.column_config.NumberColumn(format="%.0f"), "Cant. ejecutada": st.column_config.NumberColumn(format="%.0f")})
+
+    tr, td_, te, tsa = st.tabs(["Resumen", "Dotación", "EPP's", "Sin asignar"], on_change="rerun", key="dot_tabs")
+    with tr:
+        if tr.open:
+            st.html(kpis(t, f"Dotación y EPP's · {txt_per}"))
+            with st.container(key="card_dot_res"):
+                titulo_tarjeta("Por grupo", f"{empresa} {anio} · {txt_per}. Dotación (ropa), EPP's (protección) y lo que aún no se puede asignar a un elemento.")
+                grupos = []
+                for nombre, secs in (("Dotación", [D.DOTACION]), ("EPP's", [D.EPPS]), ("Sin asignar", [D.SIN_ELEMENTO, D.SIN_DETALLE])):
+                    x = t[t["seccion"].isin(secs)]
+                    grupos.append(dict(elemento=nombre, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum())))
+                gg = pd.DataFrame(grupos).assign(pct=lambda d: (d["ejecutado"] / d["presupuesto"]).where(d["presupuesto"] > 0))
+                barras(gg.iloc[::-1], "grupos")
+            with st.container(key="card_dot_mes"):
+                titulo_tarjeta("Mes a mes", "Presupuesto de Dotación y EPP's vs ejecutado, en los meses con ejecución.")
+                mm = []
+                for m in meses_ej:
+                    if m <= per.mes:
+                        tm = D.totales(D.comparar(ppto, ejec, eq, [m], sap_mes))
+                        mm.append((MESES[m - 1], tm["presupuesto"], tm["ejecutado"], tm["pct"]))
+                fig2 = go.Figure()
+                fig2.add_bar(x=[a for a, *_ in mm], y=[b / 1e6 for _, b, *_ in mm], name="Presupuesto", marker_color="#dbe3ee")
+                fig2.add_bar(x=[a for a, *_ in mm], y=[c_ / 1e6 for _, _, c_, _ in mm], name="Ejecutado", marker_color=E.AZUL,
+                             text=[E.pct_txt(p) for *_, p in mm], textposition="outside", cliponaxis=False)
+                fig2.update_layout(barmode="group", yaxis_title="Millones de pesos")
+                estilo_grafico(fig2, 300)
+                st.plotly_chart(fig2, width="stretch", key="dot_graf_mes")
+            with st.container(key="card_dot_desc"):
+                titulo_tarjeta("Archivo de ejecución", "Excel con tres hojas: presupuesto vs ejecutado por elemento, detalle del SISPO con su elemento, y las líneas de SAP que el SISPO no detalla.")
+                sap_f = D.sap_filas(pool, empresa, anio)
+                st.download_button("Descargar ejecución de dotación (Excel)", lambda: D.libro_ejecucion(t, ejec, eq, sap_f, meses),
+                                   file_name=f"ejecucion_dotacion_{empresa}_{anio}_{txt_per.replace(' ', '').replace('–', '-')}.xlsx", key="dot_desc")
+    for pestana, sec, nombre in ((td_, D.DOTACION, "Dotación"), (te, D.EPPS, "EPP's")):
+        with pestana:
+            if pestana.open:
+                x = t[t["seccion"] == sec]
+                st.html(kpis(x, f"{nombre} · {txt_per}"))
+                with st.container(key=f"card_dot_{sec}"):
+                    titulo_tarjeta(f"{nombre} por elemento", f"{empresa} {anio} · {txt_per}")
+                    barras(x, sec)
+                with st.container(key=f"card_dot_t_{sec}"):
+                    titulo_tarjeta("Detalle", "Cantidades en unidades; valores en pesos.")
+                    tabla(x, sec)
+    with tsa:
+        if tsa.open:
+            x = t[t["seccion"].isin([D.SIN_ELEMENTO, D.SIN_DETALLE])]
+            st.caption("Ejecutado que no se puede llevar a un elemento: artículos del SISPO sin equivalencia y movimientos de SAP que el SISPO no detalla. "
+                       "Cuenta en el total, pero no tiene presupuesto por elemento.")
+            if x.empty:
+                st.success("Todo el ejecutado está asignado a un elemento del presupuesto.")
+            else:
+                st.html(E.kpis([dict(label="Sin asignar", valor=E.millones(float(x["ejecutado"].sum())), sub=f"{len(x)} artículos / conceptos",
+                                     icono="alert", color=E.ROJO, fondo=E.ROJO_SUAVE)]))
+                tabla(x, "sa")
