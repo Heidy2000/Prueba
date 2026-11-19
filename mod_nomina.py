@@ -438,12 +438,11 @@ def _dotacion(ctx):
             dict(label="% de ejecución", valor=E.pct_txt(tv["pct"]), sub="Del presupuesto del periodo", icono="calendar",
                  color=E.color_barra(tv["pct"], tv["ejecutado"], False), fondo=E.AZUL_SUAVE)])
 
-    if tot["sin_elemento"] > 0:
+    if tot["otros"] > 0:
         n = int((eq["origen"] == "Pendiente").sum())
-        st.warning(f"{E.millones(tot['sin_elemento'])} del ejecutado son artículos que aún no tienen elemento del presupuesto "
-                   f"({n} sin asignar): están en la pestaña «Sin asignar». Asígnalos en Administración → Nómina → Dotación.")
-    if tot["sin_detalle"]:
-        st.caption(f"{E.millones(tot['sin_detalle'])} de SAP no los detalla el SISPO (movimientos que no son «Salida de inventario» o meses sin SISPO); están en «Sin asignar».")
+        st.warning(f"{E.millones(tot['otros'])} del ejecutado están en «Otros (sin clasificar)», dentro de Dotación: artículos del SISPO sin elemento "
+                   f"({n} sin asignar) y movimientos de SAP que el SISPO no detalla. Asígnalos en Administración → Nómina → Dotación; "
+                   "el detalle de cada línea va en el archivo de ejecución.")
     difs = []
     for m in [m for m in meses if m in set(ejec["mes"])]:
         r = D.cuadre_sap(ejec, pool, empresa, anio * 100 + m)
@@ -484,14 +483,14 @@ def _dotacion(ctx):
                          "Saldo": st.column_config.NumberColumn(format="$ %.0f"), "% ejecución": st.column_config.NumberColumn(format="percent"),
                          "Cant. ppto": st.column_config.NumberColumn(format="%.0f"), "Cant. ejecutada": st.column_config.NumberColumn(format="%.0f")})
 
-    tr, td_, te, tsa = st.tabs(["Resumen", "Dotación", "EPP's", "Sin asignar"], on_change="rerun", key="dot_tabs")
+    tr, td_, te = st.tabs(["Resumen", "Dotación", "EPP's"], on_change="rerun", key="dot_tabs")
     with tr:
         if tr.open:
             st.html(kpis(t, f"Dotación y EPP's · {txt_per}"))
             with st.container(key="card_dot_res"):
-                titulo_tarjeta("Por grupo", f"{empresa} {anio} · {txt_per}. Dotación (ropa), EPP's (protección) y lo que aún no se puede asignar a un elemento.")
+                titulo_tarjeta("Por grupo", f"{empresa} {anio} · {txt_per}. Dotación (ropa; incluye «Otros» sin clasificar) y EPP's (protección).")
                 grupos = []
-                for nombre, secs in (("Dotación", [D.DOTACION]), ("EPP's", [D.EPPS]), ("Sin asignar", [D.SIN_ELEMENTO, D.SIN_DETALLE])):
+                for nombre, secs in (("Dotación", [D.DOTACION]), ("EPP's", [D.EPPS])):
                     x = t[t["seccion"].isin(secs)]
                     grupos.append(dict(elemento=nombre, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum())))
                 gg = pd.DataFrame(grupos).assign(pct=lambda d: (d["ejecutado"] / d["presupuesto"]).where(d["presupuesto"] > 0))
@@ -526,14 +525,3 @@ def _dotacion(ctx):
                 with st.container(key=f"card_dot_t_{sec}"):
                     titulo_tarjeta("Detalle", "Cantidades en unidades; valores en pesos.")
                     tabla(x, sec)
-    with tsa:
-        if tsa.open:
-            x = t[t["seccion"].isin([D.SIN_ELEMENTO, D.SIN_DETALLE])]
-            st.caption("Ejecutado que no se puede llevar a un elemento: artículos del SISPO sin equivalencia y movimientos de SAP que el SISPO no detalla. "
-                       "Cuenta en el total, pero no tiene presupuesto por elemento.")
-            if x.empty:
-                st.success("Todo el ejecutado está asignado a un elemento del presupuesto.")
-            else:
-                st.html(E.kpis([dict(label="Sin asignar", valor=E.millones(float(x["ejecutado"].sum())), sub=f"{len(x)} artículos / conceptos",
-                                     icono="alert", color=E.ROJO, fondo=E.ROJO_SUAVE)]))
-                tabla(x, "sa")

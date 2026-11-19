@@ -19,7 +19,7 @@ CUENTA_SISPO = "DOTACIÓN PERSONAL"
 DOTACION, EPPS, ACTIVIDADES = "Dotación", "EPP's", "Actividades"
 SECCIONES_COMPARADAS = (DOTACION, EPPS)
 SIN_ELEMENTO = "Sin elemento asignado"
-SIN_DETALLE = "Sin detalle de SISPO"
+OTROS = "Otros (sin clasificar)"                    # en Dotación: artículos sin elemento y movimientos de SAP que el SISPO no detalla
 CODIGO_SAP, SUBRUBRO_SAP = "3.1", "Dotación y epp´s"      # SAP: código 3.1 y BASE GASTOS EXPLOTACIO (sub_rubro)
 MESES_NOMBRE = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 
@@ -163,33 +163,30 @@ def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses:
     pp = p.groupby(["seccion", "elemento"], as_index=False).agg(ppto_cant=("cantidad", "sum"), presupuesto=("valor", "sum"))
     seccion_de = p.drop_duplicates("elemento").set_index("elemento")["seccion"].to_dict()
     e = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
-    e["elemento"] = e["elemento"].fillna(SIN_ELEMENTO)
-    e["clave"] = e["elemento"].where(e["elemento"] != SIN_ELEMENTO, SIN_ELEMENTO + " · " + e["articulo"])
-    ee = e.groupby("clave", as_index=False).agg(ejec_cant=("cantidad", "sum"), ejecutado=("valor", "sum"), movimientos=("valor", "size"))
-    ee["seccion"] = ee["clave"].map(lambda k: seccion_de.get(k, SIN_ELEMENTO))
-    ee = ee.rename(columns={"clave": "elemento"})
-    if sap_mes is not None:                                       # el total es el de SAP: lo que el SISPO no detalla va en una fila aparte
+    e["elemento"] = e["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
+    ee = e.groupby("elemento", as_index=False).agg(ejec_cant=("cantidad", "sum"), ejecutado=("valor", "sum"), movimientos=("valor", "size"))
+    ee["seccion"] = ee["elemento"].map(lambda k: DOTACION if k == OTROS else seccion_de.get(k, DOTACION))
+    if sap_mes is not None:                                       # el total es el de SAP: lo que el SISPO no detalla también va en «Otros»
         sispo_mes = ejec.groupby("mes")["valor"].sum().round(2)
         resto = round(sum(sap_mes.get(m, 0.0) - float(sispo_mes.get(m, 0.0)) for m in meses), 2)
         if abs(resto) >= 0.005:
-            ee = pd.concat([ee, pd.DataFrame([dict(elemento="Otros movimientos de SAP (SISPO no los detalla)", ejec_cant=0.0, ejecutado=resto,
-                                                   movimientos=0, seccion=SIN_DETALLE)])], ignore_index=True)
+            ee = pd.concat([ee, pd.DataFrame([dict(elemento=OTROS, ejec_cant=0.0, ejecutado=resto, movimientos=0, seccion=DOTACION)])], ignore_index=True)
+        ee = ee.groupby(["seccion", "elemento"], as_index=False).agg(ejec_cant=("ejec_cant", "sum"), ejecutado=("ejecutado", "sum"), movimientos=("movimientos", "sum"))
     t = pp.merge(ee, on=["seccion", "elemento"], how="outer")
     for c in ("ppto_cant", "presupuesto", "ejec_cant", "ejecutado", "movimientos"):
         t[c] = t[c].fillna(0.0)
     t["movimientos"] = t["movimientos"].astype(int)
     t = L.con_metricas(t.assign(concepto=t["elemento"]))
-    orden = {DOTACION: 0, EPPS: 1, SIN_ELEMENTO: 2, SIN_DETALLE: 3}
-    t["_o"] = t["seccion"].map(orden).fillna(4)
-    return t.sort_values(["_o", "ejecutado", "presupuesto"], ascending=[True, False, False]).drop(columns=["_o", "concepto"]).reset_index(drop=True)
+    t["_o"] = t["seccion"].map({DOTACION: 0, EPPS: 1}).fillna(2)
+    t["_otros"] = (t["elemento"] == OTROS).astype(int)               # «Otros» siempre al final de su sección
+    return t.sort_values(["_o", "_otros", "ejecutado", "presupuesto"], ascending=[True, True, False, False]).drop(columns=["_o", "_otros", "concepto"]).reset_index(drop=True)
 
 
 def totales(t: pd.DataFrame) -> dict:
-    """Presupuesto, ejecutado y % de la tabla comparada (todas las filas, incluidas las «Sin elemento asignado»)."""
+    """Presupuesto, ejecutado y % de la tabla comparada. `otros` = ejecutado en «Otros (sin clasificar)» (ya incluido en el total)."""
     p, e = float(t["presupuesto"].sum()), float(t["ejecutado"].sum())
     return dict(presupuesto=p, ejecutado=e, variacion=e - p, pct=(e / p) if p > 0 else float("nan"),
-                sin_elemento=float(t.loc[t["seccion"] == SIN_ELEMENTO, "ejecutado"].sum()),
-                sin_detalle=float(t.loc[t["seccion"] == SIN_DETALLE, "ejecutado"].sum()))
+                otros=float(t.loc[t["elemento"] == OTROS, "ejecutado"].sum()))
 
 
 def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo: int) -> dict:
@@ -211,7 +208,7 @@ def libro_ejecucion(t: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sa
                           "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado", "movimientos": "Salidas", "saldo": "Saldo",
                           "pct": "% ejecución", "estado": "Estado"})
     det = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
-    det["elemento"] = det["elemento"].fillna(SIN_ELEMENTO)
+    det["elemento"] = det["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
     det = det.rename(columns={"periodo": "Periodo", "mes": "Mes", "codigo": "Código", "articulo": "Artículo", "cc_codigo": "Centro de costo",
                               "cc_nombre": "Nombre centro de costo", "cantidad": "Cantidad", "valor": "Valor", "elemento": "Elemento del presupuesto"})
     s = sap[sap["mes"].isin(meses)]
