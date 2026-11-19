@@ -1080,6 +1080,44 @@ def _revertir_sispo(ctx, empresa: str, periodo: int):
     ctx.con.commit()
 
 
+def _recalcular_sispo(ctx):
+    """Vuelve a calcular las líneas de Operaciones de un periodo a partir del archivo SISPO guardado en Administración, con las reglas
+    vigentes, sin pasar por Mantenimiento. Reemplaza lo guardado antes en Operaciones (no duplica y no toca Mantenimiento)."""
+    import sispo_fuente
+    try:
+        g = sispo_fuente.listar(ctx.leer)
+    except Exception:
+        g = pd.DataFrame()
+    if g.empty:
+        st.caption("Para recalcular desde aquí, primero guarda el archivo SISPO en Administración (pestaña «Mantenimiento y Operaciones»).")
+        return
+    opciones = [f"{r.empresa} · {r.periodo}" for r in g.itertuples()]
+    c_sel, c_btn = st.columns([3, 1], vertical_alignment="bottom")
+    elegido = c_sel.selectbox("Recalcular Operaciones con el SISPO guardado en Administración", opciones, key="op_sispo_recalc",
+                              help="Lee el archivo guardado, aplica las reglas actuales y reemplaza las líneas de Operaciones de ese periodo.")
+    if c_btn.button("Recalcular", key="op_sispo_recalc_btn", icon=":material/sync:"):
+        emp, per_ = elegido.split(" · ")
+        up = sispo_fuente.abrir(ctx.leer, emp, int(per_))
+        if up is None:
+            st.error("No encontré el archivo guardado.")
+            return
+        try:
+            a = sispo_analizar(ctx, up)
+        except Exception as e:
+            st.error(f"No pude leer el SISPO: {e}")
+            return
+        if a["bloqueos"]:
+            for b in a["bloqueos"]:
+                st.error(f"No se recalcula: {b}", icon=":material/block:")
+            return
+        n = sispo_guardar(ctx, emp, int(per_), a, up.name)
+        pesos = float(a["resumen"].loc[a["resumen"]["hoja"].isin(OS.HOJAS_PESOS), "valor"].sum())
+        st.session_state["_op_recalc_msg"] = f"Recalculado {emp} {per_}: {n} líneas guardadas; Consumibles + Herramientas + Bolsas = {pesos:,.2f}."
+        st.rerun()
+    if st.session_state.get("_op_recalc_msg"):
+        st.success(st.session_state.pop("_op_recalc_msg"))
+
+
 def _admin_sispo(S):
     _exigir_admin(S.ctx)
     ctx = S.ctx
@@ -1094,6 +1132,7 @@ def _admin_sispo(S):
     st.info("El SISPO se carga UNA sola vez, en Administración (pestaña «Mantenimiento y Operaciones»), y se aplica en Mantenimiento. Al aplicarlo, "
             "ese mismo archivo también se guarda aquí: Operaciones toma toda la cuenta OTROS (de cualquier centro de costo) y la Papelería de sus centros autorizados (ALDC: 5; ALSM: 4), "
             "sin las líneas cuya denominación del objeto es «Staf Mantenimiento», que van a Mantenimiento. Volver a aplicar el mismo periodo lo reemplaza, no lo duplica.", icon=":material/sync_alt:")
+    _recalcular_sispo(ctx)
     if not cargado.empty:
         opciones = [f"{r.empresa} · {r.periodo}" for r in cargado.itertuples()]
         c_sel, c_ok, c_btn = st.columns([2, 2, 1], vertical_alignment="bottom")
