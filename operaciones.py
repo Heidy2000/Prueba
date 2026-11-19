@@ -53,7 +53,7 @@ import datos
 import estilo as E
 import logica_m as L
 import sispo_oper as OS
-from ui import COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, figura_ppto_ejec_empresas, grafico_distribucion, titulo_tarjeta
+from ui import COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, figura_ppto_ejec_empresas, grafico_distribucion, texto_periodo, titulo_tarjeta
 
 VERSION = "v3 · 9-nov-2026"          # se muestra en el encabezado: sirve para confirmar qué versión está corriendo
 RUBRO_COD = "3.1"
@@ -1550,11 +1550,37 @@ def _vista_empresa(S, empresa: str):
                               "lin_sispo": S.lin_sispo[S.lin_sispo["empresa"] == empresa], "per_sispo": S.per_sispo[S.per_sispo["empresa"] == empresa]})
 
 
-def _descarga_ejecucion(S):
-    """Descarga del informe de una compañía a la vez (SM o ALDC): nunca mezcla ni completa una con los datos de la otra."""
-    c1, c2 = st.columns([1, 2], vertical_alignment="bottom")
+def _con_mes(S0, mes: int):
+    """La misma vista de la página para otro período: `mes` = 0 es el acumulado (desde el inicio del escenario hasta el último mes con
+    ejecución); un número es solo ese mes. Presupuesto, ejecución y Papelería se recortan igual que en la pantalla."""
+    if mes == S0.sel_mes:
+        return S0
+    m0, hasta_mes = (mes, mes) if mes else (S0.m0_esc, S0.ult)
+    datos = {}
+    for e, d in S0.datos_e.items():
+        ejec, lin_pap = S0.completos[e]
+        if mes:
+            ejec = ejec[pd.to_numeric(ejec["mes"], errors="coerce") == mes]
+            if len(lin_pap):
+                lin_pap = lin_pap[pd.to_numeric(lin_pap["mes"], errors="coerce") == mes]
+        datos[e] = SimpleNamespace(**{**vars(d), "ejec": ejec, "lin_pap": lin_pap})
+    return SimpleNamespace(**{**vars(S0), "m0": m0, "hasta_mes": hasta_mes, "sel_mes": mes, "hasta": texto_periodo(m0, hasta_mes, S0.cfg["anio"]),
+                              "datos_e": datos})
+
+
+def _descarga_ejecucion(S0):
+    """Descarga del informe de una compañía a la vez (SM o ALDC) y del mes que se elija aquí (por defecto, el período de la página):
+    nunca mezcla ni completa una compañía con los datos de la otra."""
+    m0, m1 = S0.cfg["meses"]
+    opciones = ["pagina", 0, *range(m0, m1 + 1)]
+    c1, c3, c2 = st.columns([1, 1, 2], vertical_alignment="bottom")
     etiqueta = c1.selectbox("Compañía del informe", list(INFORME_EMPRESAS), key="op_empresa_informe",
                             help="El archivo se genera solo con los datos, movimientos, cuentas y clasificación de la compañía elegida.")
+    elegido = c3.selectbox("Mes del informe", opciones, key=f"op_mes_informe_{S0.escenario}",
+                           format_func=lambda m: f"Igual que la página ({S0.hasta})" if m == "pagina"
+                           else (f"Acumulado a {MESES_L[S0.ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize()),
+                           help="El archivo se genera con el mes elegido, sin cambiar lo que ves en la página.")
+    S = S0 if elegido == "pagina" else _con_mes(S0, elegido)
     e = INFORME_EMPRESAS[etiqueta]
     d = S.datos_e[e]
     vacio = d.ejec.empty and not len(d.lin_pap)                 # sin ejecución en el período no se ofrece un archivo vacío
@@ -1607,6 +1633,8 @@ def _mostrar(ctx, tecnico: bool = False):
     sel_mes = c_hasta.selectbox("Período", [0, *range(m0, m1 + 1)], key=f"op_mes_{escenario}",
                                 format_func=lambda m: f"Acumulado a {MESES_L[ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
                                 help="Un mes muestra y descarga SOLO ese mes (sin acumular). «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución.")
+    completos = {e: (d.ejec, d.lin_pap) for e, d in datos_e.items()}     # sin recortar: el archivo puede pedir otro mes distinto al de la página
+    m0_esc = m0
     if sel_mes:                                         # un solo mes: presupuesto, ejecución, gráficos y archivo usan exactamente ese mes
         m0, hasta_mes = sel_mes, sel_mes
         for d in datos_e.values():
@@ -1615,8 +1643,7 @@ def _mostrar(ctx, tecnico: bool = False):
                 d.lin_pap = d.lin_pap[pd.to_numeric(d.lin_pap["mes"], errors="coerce") == sel_mes]
     else:
         hasta_mes = ult
-    hasta = f"{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 == hasta_mes else (
-        f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {cfg['anio']}")
+    hasta = texto_periodo(m0, hasta_mes, cfg["anio"])
 
     ppto_v = ppto_op[(ppto_op["anio"] == cfg["anio"]) & ppto_op["mes"].between(m0, m1) & ppto_op["empresa"].isin(sel)]
     ejec = pd.concat([datos_e[e].ejec for e in sel], ignore_index=True)
@@ -1624,7 +1651,8 @@ def _mostrar(ctx, tecnico: bool = False):
     S = SimpleNamespace(ctx=ctx, cfg=cfg, escenario=escenario, sel=sel, multi=len(sel) > 1, m0=m0, m1=m1, hasta_mes=hasta_mes, hasta=hasta,
                         ppto=ppto_v, ppto_todo=ppto_op, ejec=ejec, mapeo=mapeo, datos_e=datos_e, ver_todo=ver_todo, cant=False, items=items_eq, lin_sispo=lin_sispo, per_sispo=per_sispo,
                         lin_pap=(pd.concat([datos_e[e].lin_pap for e in sel], ignore_index=True) if ver_todo else OS.papeleria(pd.DataFrame(), cfg, "", {})),
-                        avisos=[a for e in sel for a in datos_e[e].avisos])
+                        avisos=[a for e in sel for a in datos_e[e].avisos],
+                        sel_mes=sel_mes, ult=ult, m0_esc=m0_esc, completos=completos)
     zona_encabezado.html(E.encabezado(
         "Operaciones" + ("" if ver_todo else f" · {usuario}"),
         "Operaciones · Papelería · Consumibles · Herramientas · Bolsas: presupuesto vs ejecución · valores en pesos · " + VERSION,

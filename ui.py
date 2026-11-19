@@ -58,6 +58,13 @@ def grafico_distribucion(etiquetas, valores, alto=300, max_partes=7):
     return True
 
 
+def texto_periodo(m0: int, hasta_mes: int, anio: int) -> str:
+    """«octubre 2026», «septiembre–octubre 2026» o «a octubre 2026» (si el período empieza en enero)."""
+    if m0 == hasta_mes:
+        return f"{MESES_L[hasta_mes - 1]} {anio}"
+    return f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {anio}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {anio}"
+
+
 COLOR_EMPRESA = {"ALDC": "#1f5fc4", "ALSM": "#e8892c"}     # los mismos de Combustible: ALDC azul, ALSM naranja
 COLOR_PPTO_LINEA = "#0f2a4a"
 

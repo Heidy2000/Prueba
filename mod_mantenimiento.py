@@ -42,7 +42,7 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, figura_ppto_ejec_empresas, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, figura_ppto_ejec_empresas, texto_periodo, titulo_tarjeta
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -2390,12 +2390,34 @@ def _genericos_sin_reemplazar(S, empresa: str, mes: int) -> pd.DataFrame:
     return pd.DataFrame(filas, columns=cols)
 
 
-def _descarga_soporte(S):
-    """«Archivo de ejecución» (Excel por compañía): usa EXACTAMENTE el período elegido en la página. Un mes = solo ese mes; acumulado =
-    desde el inicio del escenario hasta el último mes con ejecución. Es la única descarga de la página."""
-    unico = L.desde_mes(S.cfg) > S.cfg["meses"][0]           # se eligió un solo mes
+def _con_mes(S, mes: int):
+    """La misma vista de la página pero para otro período: `mes` = 0 es el acumulado (desde el inicio del escenario hasta el último mes con
+    ejecución); un número es solo ese mes. El presupuesto sigue siendo el del escenario; solo cambia el recorte de la ejecución."""
+    if mes == S.sel_mes:
+        return S
+    cfg = {k: v for k, v in S.cfg.items() if k != "desde"}
+    if mes:
+        cfg["desde"] = mes
+    hasta_mes = mes or S.ult
+    return SimpleNamespace(**{**vars(S), "cfg": cfg, "hasta_mes": hasta_mes, "sel_mes": mes,
+                              "hasta": texto_periodo(L.desde_mes(cfg), hasta_mes, cfg["anio"])})
+
+
+def _descarga_soporte(S0):
+    """«Archivo de ejecución» (Excel por compañía) del mes que se elija aquí: por defecto, el período de la página. Un mes = solo ese mes;
+    acumulado = desde el inicio del escenario hasta el último mes con ejecución. Es la única descarga de la página."""
+    m0, m1 = S0.cfg["meses"]
+    opciones = ["pagina", 0, *range(m0, m1 + 1)]
     with st.container(key="mt_card_soporte"):
-        titulo_tarjeta("Archivo de ejecución", f"Excel por compañía · ejecución {S.hasta} · mismas cifras que esta página")
+        titulo_tarjeta("Archivo de ejecución", "Excel por compañía · elige el mes del archivo")
+        c_mes, _ = st.columns([1, 2])
+        elegido = c_mes.selectbox("Mes del archivo", opciones, key=f"mt_mes_archivo_{S0.escenario}",
+                                  format_func=lambda m: f"Igual que la página ({S0.hasta})" if m == "pagina"
+                                  else (f"Acumulado a {MESES_L[S0.ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize()),
+                                  help="El archivo se genera con el mes elegido, sin cambiar lo que ves en la página.")
+        S = S0 if elegido == "pagina" else _con_mes(S0, elegido)
+        unico = L.desde_mes(S.cfg) > S.cfg["meses"][0]           # se eligió un solo mes
+        st.caption(f"Ejecución {S.hasta} · mismas cifras que la página para ese período.")
         for e in S.sel:                                   # inconsistencias SAP vs SISPO: se avisan, no se corrigen solas
             pend = _genericos_sin_reemplazar(S, e, S.hasta_mes)
             if len(pend):
@@ -2955,7 +2977,7 @@ def _mostrar(ctx, tecnico: bool = False):
         mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, contenedores_omitidos={}, tipo_ppto=tipo_ppto, ult=ult,
         emp_placa=_empresas_por_placa(ppto_sel, mov_todos[mov_todos["empresa"].isin(sel)]),
         ts_original=ts_per_sel.drop_duplicates("concepto").set_index("concepto")["texto_original"] if len(ts_per_sel) else {},
-        manual_prev={r.llave: (r.concepto or "", r.placa or "") for r in man.itertuples()})
+        manual_prev={r.llave: (r.concepto or "", r.placa or "") for r in man.itertuples()}, sel_mes=sel_mes)
 
     # ------------------------------------------------------------------ validación cruzada del rubro (administrador)
     if es_admin and not placa:
