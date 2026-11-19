@@ -188,6 +188,39 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-bar {{ height:6px; background:{GRIS_BARRA}; border-radius:99px; overflow:hidden; }}
 .nf-bar > div {{ height:100%; border-radius:99px; }}
 
+/* ---------- tabla visual: cifras + barra (bullet) + participación ---------- */
+.tv {{ border:1px solid {BORDE}; border-radius:14px; background:#fff; overflow:hidden; font-size:.86rem; }}
+.tv-row {{ display:grid; grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr) minmax(170px,1.7fr);
+          align-items:center; gap:.7rem; padding:.62rem .9rem; border-bottom:1px solid #eef1f6; }}
+.tv-row.tv-sin-bullet {{ grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr); }}
+.tv-row > div:not(:first-child):not(:last-child) {{ text-align:right; font-variant-numeric:tabular-nums; }}
+.tv-head {{ background:#f7f9fc; color:{TEXTO_2}; font-size:.74rem; font-weight:600; border-bottom:1px solid {BORDE}; }}
+.tv details > summary {{ list-style:none; cursor:pointer; }}
+.tv details > summary::-webkit-details-marker {{ display:none; }}
+.tv details > summary:hover {{ background:#f7faff; }}
+.tv-n {{ display:flex; align-items:center; gap:.45rem; min-width:0; font-weight:600; color:{TEXTO}; }}
+.tv-n span.t {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.tv-n small {{ color:{TEXTO_2}; font-weight:500; white-space:nowrap; }}
+.tv-hijo .tv-n {{ padding-left:1.4rem; font-weight:500; }}
+.tv-hijo {{ background:#fbfcfe; }}
+.tv-chev {{ display:inline-block; width:.5rem; color:{TEXTO_2}; transition:transform .12s; }}
+details[open] > summary .tv-chev {{ transform:rotate(90deg); }}
+.tv-sp {{ display:inline-block; width:.5rem; }}
+.tv-pos {{ color:{VERDE}; font-weight:600; }}  .tv-neg {{ color:{ROJO}; font-weight:700; }}
+.tv-part {{ position:relative; }}
+.tv-part i {{ display:block; height:3px; border-radius:99px; background:#b9c6d8; margin-top:3px; margin-left:auto; }}
+.tv-pct {{ font-weight:700; }}
+.tv-bar {{ position:relative; height:12px; background:{GRIS_BARRA}; border-radius:99px; }}
+.tv-bar > div.f {{ position:absolute; left:0; top:0; height:100%; border-radius:99px; }}
+.tv-bar > div.m {{ position:absolute; top:-3px; width:2px; height:18px; background:{TEXTO}; border-radius:2px; opacity:.75; }}
+.tv-total {{ background:#f7f9fc; font-weight:700; border-bottom:none; }}
+.tv-total .tv-n {{ font-weight:700; }}
+.tv-leg {{ display:flex; flex-wrap:wrap; gap:.35rem .9rem; font-size:.76rem; color:{TEXTO_2}; margin:.45rem 0 .1rem 0; }}
+.tv-leg i {{ display:inline-block; width:9px; height:9px; border-radius:3px; margin-right:.35rem; vertical-align:-1px; }}
+.tv-seg {{ display:flex; width:100%; height:22px; border-radius:8px; overflow:hidden; background:{GRIS_BARRA}; }}
+.tv-seg > div {{ height:100%; min-width:2px; }}
+.tv-seg > div + div {{ border-left:2px solid #fff; }}
+
 /* ---------- tabla desplegable ---------- */
 .nf-t {{ font-size:.82rem; color:{TEXTO}; }}
 .nf-row {{ display:grid; grid-template-columns: minmax(220px,2.6fr) repeat(4, minmax(90px,1fr)) minmax(130px,1.3fr) minmax(120px,1fr);
@@ -761,3 +794,111 @@ def tabla_meses(nodos: list[dict], columnas: list[str], abierto: bool = False,
     cuerpo = "".join(render(nd, 0) for nd in nodos)
     return (f'<div class="nf-scroll notranslate" translate="no"><div class="nf-t nf-tm" '
             f'style="min-width:{min_ancho}px">{cab}{cuerpo}</div></div>')
+
+
+# ------------------------------------------------------------------ tabla visual (presupuesto vs ejecución en una sola línea)
+PALETA_PARTICIPACION = ["#1f5fc4", "#2e9e5b", "#e8892c", "#7a5cc4", "#17a2b8", "#d4a017", "#c2417e", "#5b7083"]
+COLOR_OTROS = "#b9c6d8"
+
+
+def _cop(v) -> str:
+    """Pesos colombianos con punto de miles: $1.343.584.811 (negativo: −$1.234)."""
+    if v is None or pd.isna(v):
+        return "—"
+    return ("−" if v < -0.5 else "") + "$" + f"{abs(v):,.0f}".replace(",", ".")
+
+
+def _uni(v) -> str:
+    return "—" if v is None or pd.isna(v) else f"{v:,.0f}".replace(",", ".")
+
+
+def _bullet(pres: float, ejec: float, color: str) -> str:
+    """Barra de progreso tipo bullet: el relleno es lo ejecutado; la marca vertical, el presupuesto. Si se pasa del presupuesto, el relleno
+    sobrepasa la marca (la escala de la fila es el mayor de los dos). Sin presupuesto: relleno completo y sin marca."""
+    tope = max(pres, ejec, 0.0)
+    if tope <= 0:
+        return '<div class="tv-bar"></div>'
+    marca = f'<div class="m" style="left:calc({pres / tope * 100:.1f}% - 1px)"></div>' if pres > 0 else ""
+    return f'<div class="tv-bar"><div class="f" style="width:{max(ejec, 0) / tope * 100:.1f}%;background:{color}"></div>{marca}</div>'
+
+
+def barra_segmentada(segmentos: list[tuple], formato=None, minimo_leyenda: float = 0.0) -> str:
+    """Barra apilada al 100 %: (nombre, valor, color|None) -> cada tramo mide su participación en el total; la leyenda trae valor y %.
+    Los valores no positivos no se dibujan."""
+    formato = formato or _cop
+    seg = [(n, float(v), c) for n, v, c in segmentos if v and v > 0]
+    total = sum(v for _, v, _ in seg)
+    if total <= 0:
+        return ""
+    tramos, leyenda = "", ""
+    for i, (n, v, c) in enumerate(seg):
+        c = c or (COLOR_OTROS if str(n).startswith("Otros") else PALETA_PARTICIPACION[i % len(PALETA_PARTICIPACION)])
+        p = v / total
+        tramos += f'<div title="{escape(str(n))}: {formato(v)} · {pct_txt(p)}" style="width:{p * 100:.2f}%;background:{c}"></div>'
+        if p >= minimo_leyenda:
+            leyenda += f'<span><i style="background:{c}"></i>{escape(str(n))} · <b>{pct_txt(p)}</b></span>'
+    return f'<div class="notranslate" translate="no"><div class="tv-seg">{tramos}</div><div class="tv-leg">{leyenda}</div></div>'
+
+
+def tabla_visual(filas: list[dict], columna: str = "Concepto", formato=None, total: bool = True, abierto: bool = False,
+                 etiqueta_total: str = "Total", barra_col: bool = True, nombre_barra: str = "Ejecución vs presupuesto") -> str:
+    """
+    Tabla de una línea por concepto: Presupuesto | Ejecutado | Saldo | Participación | % ejecución | barra bullet (relleno = ejecutado, marca = presupuesto).
+    Semáforo: azul dentro del presupuesto, naranja por encima del 90 %, rojo si lo supera o ejecuta sin presupuesto (mismo criterio que `clase_estado`).
+    filas: dict(nombre, presupuesto, ejecutado, sub='' (texto pequeño), hijos=[dict(...)] (se abren con clic), color=None).
+    La participación es la del ejecutado de la fila sobre el total de las filas de primer nivel. Las cifras NO se recalculan: se muestran tal cual.
+    """
+    formato = formato or _cop
+    tot_p = sum(float(f["presupuesto"] or 0) for f in filas)
+    tot_e = sum(float(f["ejecutado"] or 0) for f in filas)
+    op = " open" if abierto else ""
+    extra = "" if barra_col else " tv-sin-bullet"
+
+    def celdas(f, base_e):
+        p, e = float(f["presupuesto"] or 0), float(f["ejecutado"] or 0)
+        pct = e / p if p > 0 else float("nan")
+        color = color_barra(pct, e, False)
+        saldo = p - e
+        part = e / base_e if base_e else float("nan")
+        clase_saldo = "tv-neg" if saldo < -0.5 else ("tv-pos" if saldo > 0.5 and p > 0 else "")
+        ancho = 0 if pd.isna(part) else max(0, min(part, 1)) * 100
+        txt_pct = pct_txt(pct) if p > 0 else ("s/ppto" if e > 0 else "—")
+        out = (f'<div>{formato(p)}</div><div>{formato(e)}</div><div class="{clase_saldo}">{formato(saldo)}</div>'
+               f'<div class="tv-part">{pct_txt(part)}<i style="width:{ancho:.0f}%"></i></div>'
+               f'<div class="tv-pct" style="color:{color}">{txt_pct}</div>')
+        if barra_col:
+            out += _bullet(p, e, color)
+        return out
+
+    def nombre(f, hijos):
+        sub = f'<small>{escape(str(f["sub"]))}</small>' if f.get("sub") else ""
+        marca = '<span class="tv-chev">›</span>' if hijos else '<span class="tv-sp"></span>'
+        return f'<div class="tv-n">{marca}<span class="t" title="{escape(str(f["nombre"]))}">{escape(str(f["nombre"]))}</span>{sub}</div>'
+
+    def fila(f, base_e, hijo=False):
+        hs = f.get("hijos") or []
+        cls = "tv-row" + extra + (" tv-hijo" if hijo else "")
+        if hs:
+            cuerpo = "".join(fila(h, base_e, True) for h in hs)
+            return f'<details{op}><summary class="{cls}">{nombre(f, True)}{celdas(f, base_e)}</summary>{cuerpo}</details>'
+        return f'<div class="{cls}">{nombre(f, False)}{celdas(f, base_e)}</div>'
+
+    cab = (f'<div class="tv-row tv-head{extra}"><div>{escape(columna)}</div><div>Presupuesto</div><div>Ejecutado</div><div>Saldo</div>'
+           f'<div>Participación</div><div>% ejec.</div>' + (f"<div>{escape(nombre_barra)}</div>" if barra_col else "") + "</div>")
+    cuerpo = "".join(fila(f, tot_e) for f in filas)
+    pie = ""
+    if total and len(filas) > 1:
+        pie = f'<div class="tv-row tv-total{extra}">{nombre(dict(nombre=etiqueta_total), False)}{celdas(dict(presupuesto=tot_p, ejecutado=tot_e), tot_e)}</div>'
+    leyenda = ('<div class="tv-leg" style="padding:.5rem .9rem;border-top:1px solid #eef1f6;margin:0"><span><i style="background:' + AZUL + '"></i>Dentro del presupuesto</span>'
+               '<span><i style="background:#e8892c"></i>Más del 90 %</span><span><i style="background:' + ROJO + '"></i>Supera el presupuesto / sin presupuesto</span>'
+               '<span><i style="background:' + TEXTO + ';width:2px;height:11px"></i>Marca = presupuesto</span></div>') if barra_col else ""
+    return f'<div class="tv notranslate" translate="no">{cab}{cuerpo}{pie}{leyenda}</div>'
+
+
+def segmentos_top(pares: list[tuple], n: int = 7, resto: str = "Otros") -> list[tuple]:
+    """Para `barra_segmentada`: los `n` mayores valores positivos y el resto agrupado en un solo tramo gris."""
+    x = sorted([(a, float(b)) for a, b in pares if b and b > 0], key=lambda t: -t[1])
+    seg = [(a, b, None) for a, b in x[:n]]
+    if len(x) > n:
+        seg.append((resto, sum(b for _, b in x[n:]), COLOR_OTROS))
+    return seg

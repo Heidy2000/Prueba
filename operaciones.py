@@ -597,8 +597,14 @@ def _tab_hoja(S, hoja: str):
                 "presupuesto_esc": nc("Presupuesto escenario", format=fm), "presupuesto": nc("Presupuesto al corte", format=fm),
                 "ejecutado": nc("Ejecutado", format=fm), "variacion": nc("Variación", format=fm),
                 "pct": nc("% ejecución", format="percent"), "peso": nc("% del total", format="percent")}
-        st.dataframe(_estilo(vis, "variacion"), hide_index=True, width="stretch", height=min(40 + 35 * len(vis), 460),
-                     column_config={k: v for k, v in conf.items() if k in vis.columns})
+        fv = _filas_items(it)
+        if fv:
+            st.html(E.tabla_visual(fv, "Ítem", formato=E._uni if S.cant else None, nombre_barra="Ejecución vs presupuesto"))
+            st.caption("Barra: relleno = lo ejecutado, marca = lo presupuestado al corte." + (" Valores en unidades." if S.cant else ""))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in fv], "Participación de cada ítem en lo ejecutado", E._uni if S.cant else None)
+        with st.expander("Ver como tabla (con cantidades, costo unitario y variación)", icon=":material/table:"):
+            st.dataframe(_estilo(vis, "variacion"), hide_index=True, width="stretch", height=min(40 + 35 * len(vis), 460),
+                         column_config={k: v for k, v in conf.items() if k in vis.columns})
     e = _ejec_hoja(S, hoja)
     e = e[e["mes"] <= S.hasta_mes]
     cols_mov = ["empresa", "fecha", "mes", "documento", "tercero", "texto", "codigo_articulo", "cuenta_nombre", "sub_rubro_sap", "cc_nombre"]
@@ -743,6 +749,21 @@ def _graficos_costo(S):
             st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
 
 
+def _filas_items(it: pd.DataFrame, tope: int | None = None) -> list[dict]:
+    """Ítems con presupuesto (al corte) o ejecución, de mayor a menor ejecutado, listos para `E.tabla_visual`. Las cifras son las de `_items`."""
+    g = it[(it["presupuesto"] > 0) | (it["ejecutado"] > 0)].sort_values(["ejecutado", "presupuesto"], ascending=False)
+    if tope:
+        g = g.head(tope)
+    return [dict(nombre=r.item, presupuesto=float(r.presupuesto), ejecutado=float(r.ejecutado)) for r in g.itertuples()]
+
+
+def _participacion(pares: list[tuple], titulo: str, formato=None):
+    seg = E.segmentos_top(pares)
+    if seg:
+        st.markdown(f"**{titulo}**")
+        st.html(E.barra_segmentada(seg, formato=formato))
+
+
 def _tab_resumen(S):
     res = _tabla_resumen(S)
     if res is None:
@@ -755,11 +776,21 @@ def _tab_resumen(S):
         titulo_tarjeta("Operaciones · presupuesto vs ejecución por hoja", f"{S.escenario} · ejecutado {S.hasta} · variación = ejecutado − presupuesto al corte")
         nc = st.column_config.NumberColumn
         vista = t[["hoja", "presupuesto_esc", "presupuesto", "ejecutado", "variacion", "pct", "saldo", "estado", "movimientos"]]
-        st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config={
-            "hoja": "Hoja", "presupuesto_esc": nc("Presupuesto escenario", format="accounting"), "presupuesto": nc("Presupuesto al corte", format="accounting"),
-            "ejecutado": nc("Ejecutado", format="accounting"), "variacion": nc("Variación", format="accounting"),
-            "pct": nc("% ejecución", format="percent"), "saldo": nc("Saldo del escenario", format="accounting"), "estado": "Estado",
-            "movimientos": nc("Movimientos", format="%d")})
+        cuerpo = t[t["hoja"] != "Total"]
+        filas_h = []
+        for r in cuerpo.itertuples():
+            hijos = _filas_items(_items(S, r.hoja)) if r.hoja in S.hojas else []
+            filas_h.append(dict(nombre=r.hoja, presupuesto=float(r.presupuesto), ejecutado=float(r.ejecutado), hijos=hijos,
+                                sub=f"escenario {E.pesos(r.presupuesto_esc)}" if r.presupuesto_esc else ""))
+        st.html(E.tabla_visual(sorted(filas_h, key=lambda f: -f["ejecutado"]), "Hoja"))
+        st.caption("Presupuesto y saldo al corte (el presupuesto del escenario completo va en gris junto al nombre). Cada hoja se abre en sus ítems.")
+        _participacion([(f["nombre"], f["ejecutado"]) for f in filas_h], "Participación de cada hoja en el gasto ejecutado")
+        with st.expander("Ver como tabla (con el saldo del escenario y el estado)", icon=":material/table:"):
+            st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config={
+                "hoja": "Hoja", "presupuesto_esc": nc("Presupuesto escenario", format="accounting"), "presupuesto": nc("Presupuesto al corte", format="accounting"),
+                "ejecutado": nc("Ejecutado", format="accounting"), "variacion": nc("Variación", format="accounting"),
+                "pct": nc("% ejecución", format="percent"), "saldo": nc("Saldo del escenario", format="accounting"), "estado": "Estado",
+                "movimientos": nc("Movimientos", format="%d")})
         if "pend_sispo" in sin:
             pend, resto = sin[sin["pend_sispo"].fillna(False).astype(bool)], sin[~sin["pend_sispo"].fillna(False).astype(bool)]
         else:

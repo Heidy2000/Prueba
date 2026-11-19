@@ -453,25 +453,26 @@ def _dotacion(ctx):
     if difs:
         st.warning("El SISPO no cuadra con SAP en la cuenta DOTACIÓN PERSONAL → " + " · ".join(difs))
 
-    def barras(g, clave):
-        """Una fila por elemento: barra gris = presupuesto, barra de color encima = ejecutado (verde, naranja o rojo según el % de ejecución)."""
-        g = g[(g["presupuesto"] > 0) | (g["ejecutado"] > 0)].sort_values("presupuesto", ascending=True)
-        if g.empty:
-            st.info("No hay presupuesto ni ejecución en este grupo para el periodo elegido.")
-            return
-        colores = [E.color_barra(p, e, False) for p, e in zip(g["pct"], g["ejecutado"])]
-        etiqueta = [f"{E.millones(e)} · {E.pct_txt(p)}" if p == p else f"{E.millones(e)} · sin presupuesto" for e, p in zip(g["ejecutado"], g["pct"])]
-        fig = go.Figure()
-        fig.add_bar(y=g["elemento"], x=g["presupuesto"] / 1e6, orientation="h", name="Presupuesto", marker_color="#dbe3ee", width=0.75,
-                    hovertemplate="%{y}<br>Presupuesto: $%{x:,.1f} M<extra></extra>")
-        fig.add_bar(y=g["elemento"], x=g["ejecutado"] / 1e6, orientation="h", name="Ejecutado", marker_color=colores, width=0.42,
-                    text=etiqueta, textposition="outside", cliponaxis=False,
-                    hovertemplate="%{y}<br>Ejecutado: $%{x:,.1f} M<extra></extra>")
-        fig.update_layout(barmode="overlay", xaxis_title="Millones de pesos", yaxis_title=None)
-        estilo_grafico(fig, 90 + 38 * len(g))
-        st.plotly_chart(fig, width="stretch", key=f"dot_graf_{clave}")
-        st.caption("Barra gris: presupuesto. Barra de color: ejecutado (azul dentro del presupuesto, naranja cerca del límite, rojo si lo supera). "
-                   "A la derecha: valor ejecutado y % del presupuesto.")
+    def filas_visual(g):
+        """Filas para la tabla visual (solo elementos con presupuesto o ejecución), de mayor a menor ejecutado; «Otros» al final."""
+        g = g[(g["presupuesto"] > 0) | (g["ejecutado"] > 0)]
+        g = pd.concat([g[g["elemento"] != D.OTROS].sort_values(["ejecutado", "presupuesto"], ascending=False), g[g["elemento"] == D.OTROS]])
+        return [dict(nombre=r.elemento, presupuesto=r.presupuesto, ejecutado=r.ejecutado,
+                     sub="" if r.ppto_cant == 0 and r.ejec_cant == 0 else f"{r.ejec_cant:,.0f} de {r.ppto_cant:,.0f} und".replace(",", "."))
+                for r in g.itertuples()]
+
+    def participacion(g, titulo):
+        """Barra al 100 %: cuánto pesa cada elemento en lo ejecutado (los 7 mayores y el resto en «Otros elementos»; «Otros (sin clasificar)» aparte)."""
+        x = g[g["ejecutado"] > 0].sort_values("ejecutado", ascending=False)
+        fijo = x[x["elemento"] == D.OTROS]
+        x = x[x["elemento"] != D.OTROS]
+        seg = [(r.elemento, r.ejecutado, None) for r in x.head(7).itertuples()]
+        if len(x) > 7:
+            seg.append(("Otros elementos", float(x.iloc[7:]["ejecutado"].sum()), None))
+        seg += [(D.OTROS, float(r.ejecutado), "#8fa3bd") for r in fijo.itertuples()]
+        if seg:
+            st.markdown(f"**{titulo}**")
+            st.html(E.barra_segmentada(seg))
 
     def tabla(g, clave):
         v = g[(g["presupuesto"] > 0) | (g["ejecutado"] > 0)].rename(columns={
@@ -488,13 +489,14 @@ def _dotacion(ctx):
         if tr.open:
             st.html(kpis(t, f"Dotación y EPP's · {txt_per}"))
             with st.container(key="card_dot_res"):
-                titulo_tarjeta("Por grupo", f"{empresa} {anio} · {txt_per}. Dotación (ropa; incluye «Otros» sin clasificar) y EPP's (protección).")
+                titulo_tarjeta("Por grupo", f"{empresa} {anio} · {txt_per}. Cada grupo se abre en sus elementos. Barra: relleno = ejecutado, marca = presupuesto.")
                 grupos = []
-                for nombre, secs in (("Dotación", [D.DOTACION]), ("EPP's", [D.EPPS])):
-                    x = t[t["seccion"].isin(secs)]
-                    grupos.append(dict(elemento=nombre, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum())))
-                gg = pd.DataFrame(grupos).assign(pct=lambda d: (d["ejecutado"] / d["presupuesto"]).where(d["presupuesto"] > 0))
-                barras(gg.iloc[::-1], "grupos")
+                for nombre, sec in (("Dotación", D.DOTACION), ("EPP's", D.EPPS)):
+                    x = t[t["seccion"] == sec]
+                    grupos.append(dict(nombre=nombre, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum()),
+                                       sub=f"{int(((x['presupuesto'] > 0) | (x['ejecutado'] > 0)).sum())} elementos", hijos=filas_visual(x)))
+                st.html(E.tabla_visual(grupos, "Grupo", abierto=False))
+                participacion(t, "Participación de cada elemento en lo ejecutado")
             with st.container(key="card_dot_mes"):
                 titulo_tarjeta("Mes a mes", "Presupuesto de Dotación y EPP's vs ejecutado, en los meses con ejecución.")
                 mm = []
@@ -520,8 +522,13 @@ def _dotacion(ctx):
                 x = t[t["seccion"] == sec]
                 st.html(kpis(x, f"{nombre} · {txt_per}"))
                 with st.container(key=f"card_dot_{sec}"):
-                    titulo_tarjeta(f"{nombre} por elemento", f"{empresa} {anio} · {txt_per}")
-                    barras(x, sec)
-                with st.container(key=f"card_dot_t_{sec}"):
-                    titulo_tarjeta("Detalle", "Cantidades en unidades; valores en pesos.")
-                    tabla(x, sec)
+                    titulo_tarjeta(f"{nombre} por elemento", f"{empresa} {anio} · {txt_per}. Presupuesto, ejecutado, saldo y participación en una sola línea. "
+                                   "Barra: relleno = ejecutado, marca = presupuesto.")
+                    fv = filas_visual(x)
+                    if fv:
+                        st.html(E.tabla_visual(fv, "Elemento"))
+                        participacion(x, f"Participación de cada elemento en el ejecutado de {nombre}")
+                    else:
+                        st.info("No hay presupuesto ni ejecución en este grupo para el periodo elegido.")
+                    with st.expander("Ver como tabla (cantidades y estado)", icon=":material/table:"):
+                        tabla(x, sec)

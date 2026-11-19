@@ -396,6 +396,33 @@ def _sin_ceros(t: pd.DataFrame) -> pd.DataFrame:
     return t[(num("presupuesto").abs() > 0.5) | (num("ejecutado").abs() > 0.5) | (num("movimientos") > 0)]
 
 
+def _filas_visual(t: pd.DataFrame, col: str = "concepto", por_empresa: dict | None = None, sub=None) -> list[dict]:
+    """Filas de `E.tabla_visual` desde una tabla con presupuesto y ejecutado (mismas cifras, sin recalcular), de mayor a menor ejecución.
+    `por_empresa` ({compañía: tabla con `col`, `presupuesto` y `ejecutado`}): cada fila se abre en sus compañías."""
+    t = t.copy()
+    for c in ("presupuesto", "ejecutado"):
+        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0.0)
+    t = t[(t["presupuesto"] != 0) | (t["ejecutado"] != 0)].sort_values(["ejecutado", "presupuesto"], ascending=False)
+    filas = []
+    for r in t.to_dict("records"):
+        hijos = []
+        for emp, d in (por_empresa or {}).items():
+            if {"presupuesto", "ejecutado", col} <= set(d.columns):
+                x = d[d[col] == r[col]]
+                if len(x) and (x["presupuesto"].sum() or x["ejecutado"].sum()):
+                    hijos.append(dict(nombre=emp, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum())))
+        filas.append(dict(nombre=r[col], presupuesto=r["presupuesto"], ejecutado=r["ejecutado"], hijos=hijos if len(hijos) > 1 else [],
+                          sub=sub(r) if sub else ""))
+    return filas
+
+
+def _participacion(pares: list[tuple], titulo: str):
+    seg = E.segmentos_top(pares)
+    if seg:
+        st.markdown(f"**{titulo}**")
+        st.html(E.barra_segmentada(seg))
+
+
 def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False, por_empresa: dict | None = None):
     """Presupuesto vs ejecutado por concepto (los 12 mayores). Responde: ¿dónde se concentra el gasto y qué tanto se ha usado?
     «Pendiente» (movimientos sin concepto) se omite, salvo que la tabla de al lado también lo muestre (con_pendiente).
@@ -1531,12 +1558,36 @@ def _tab_flota(S):
         dp, de = tot["presupuesto"] - esperado["presupuesto"], tot["ejecutado"] - esperado["ejecutado"]
         if abs(dp) >= 1 or abs(de) >= 1:
             st.error(f"Los indicadores no coinciden con Placas + Generales: presupuesto {E.pesos(dp)}, ejecutado {E.pesos(de)}.")
+    with st.container(key="mt_card_tipo_veh"):
+        titulo_tarjeta("Por tipo de vehículo", f"{S.escenario} · ejecutado {S.hasta}. Cada tipo se abre en sus placas. Barra: relleno = ejecutado, marca = presupuesto.")
+        filas_t = []
+        for c in cats:
+            hijos = [dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
+                          sub=(f"N° {n['numero_interno']}" if n.get("numero_interno") else ""))
+                     for n in sorted(c["nodos"], key=lambda n: (-float(n["ejecutado"]), -float(n["presupuesto"])))
+                     if n["presupuesto"] != 0 or n["ejecutado"] != 0]
+            filas_t.append(dict(nombre=c["nombre"], presupuesto=c["presupuesto"], ejecutado=c["ejecutado"], hijos=hijos,
+                                sub=_pl(c["placas"], "placa") if c["placas"] else ("general" if c["general"] else "")))
+        filas_t = [f for f in filas_t if f["presupuesto"] != 0 or f["ejecutado"] != 0]
+        if filas_t:
+            st.html(E.tabla_visual(sorted(filas_t, key=lambda f: -f["ejecutado"]), "Tipo de vehículo / placa"))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in filas_t], "Participación de cada tipo de vehículo en lo ejecutado")
+            top = sorted([n for c in cats for n in c["nodos"] if n["placa"] != L.SIN_PLACA and n["ejecutado"] > 0], key=lambda n: -float(n["ejecutado"]))[:10]
+            if top:
+                st.markdown("**Las 10 placas con mayor ejecución**")
+                st.html(E.tabla_visual([dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
+                                             sub=_categoria_placa(S, n)) for n in top], "Placa", total=False))
+        else:
+            st.caption("Aún no hay presupuesto ni ejecución por tipo de vehículo.")
     with st.container(key="mt_card_graf_placas"):
-        titulo_tarjeta("Conceptos de gasto que más pesan", "Presupuesto vs ejecutado (millones de pesos)")
-        _barras_ppto_ejec(t[["concepto", "presupuesto", "ejecutado"]],
-                          "Los 12 conceptos de gasto con mayor presupuesto o ejecución" + (f" (placa {S.placa})." if S.placa else "."),
-                          con_pendiente=True,
-                          por_empresa={e: S.vistas_emp[e]["por_concepto"][["concepto", "ejecutado"]] for e in S.sel} if S.multi else None)
+        titulo_tarjeta("Conceptos de gasto que más pesan", "Presupuesto, ejecutado, saldo y participación en una sola línea" + (" · cada concepto se abre por compañía" if S.multi else ""))
+        fc = _filas_visual(t[["concepto", "presupuesto", "ejecutado"]],
+                           por_empresa={e: S.vistas_emp[e]["por_concepto"] for e in S.sel} if S.multi else None)
+        if fc:
+            st.html(E.tabla_visual(fc, "Concepto de gasto"))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in fc], "Participación de cada concepto en el gasto ejecutado")
+        else:
+            st.caption("Sin presupuesto ni ejecución por concepto para los filtros elegidos.")
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
 
 
@@ -2451,17 +2502,20 @@ def _tab_mantenimiento(S):
     if S.placa:
         st.caption(f"El filtro de placa ({S.placa}) no cambia el rubro completo de esta pestaña; solo afecta la tabla de ámbitos de abajo.")
     with st.container(key="mt_card_rubro"):
-        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto del escenario completo · ejecutado {S.hasta}")
-        _tabla(_fila_total_df(t, "sub_rubro"), 40 + 35 * (len(t) + 1))
-    with st.container(key="mt_card_rubro_graf"):
-        titulo_tarjeta("Dónde se concentra el presupuesto", "Presupuesto vs ejecutado por sub-rubro (millones de pesos)")
+        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto del escenario completo · ejecutado {S.hasta}"
+                       + (" · cada sub-rubro se abre por compañía" if S.multi else "") + ". Barra: relleno = ejecutado, marca = presupuesto.")
         por_e = None
         if S.multi:
             por_e = {}
             for e in S.sel:
                 pe_, ee_ = _rubro(S, e)
-                por_e[e] = L.tabla_subrubros(pe_, ee_, S.cfg, S.hasta_mes).rename(columns={"sub_rubro": "concepto"})[["concepto", "ejecutado"]]
-        _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.", por_empresa=por_e)
+                por_e[e] = L.tabla_subrubros(pe_, ee_, S.cfg, S.hasta_mes)
+        fs = _filas_visual(t, "sub_rubro", por_e)
+        if fs:
+            st.html(E.tabla_visual(fs, "Sub-rubro"))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in fs], "Participación de cada sub-rubro en lo ejecutado")
+        with st.expander("Ver como tabla (con movimientos y estado)", icon=":material/table:"):
+            _tabla(_fila_total_df(t, "sub_rubro"), 40 + 35 * (len(t) + 1))
     if S.multi:
         filas = []
         for e in S.sel:
