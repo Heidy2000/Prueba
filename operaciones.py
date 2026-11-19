@@ -57,6 +57,7 @@ from ui import COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, f
 
 VERSION = "v3 · 9-nov-2026"          # se muestra en el encabezado: sirve para confirmar qué versión está corriendo
 RUBRO_COD = "3.1"
+MOSTRAR_PAPELERIA = False        # False: la página no muestra Papelería (ni su pestaña ni su resumen en cantidades); los datos y el informe no cambian
 HOJAS = [OS.HOJA_PAPELERIA, OS.HOJA_CONSUMIBLES, OS.HOJA_HERRAMIENTAS, OS.HOJA_OTROS]
 RAIZ_HOJA = {"PAPELERIA": "Papelería", "CONSUMIBLE": "Consumibles", "HERRAMIENTA": "Herramientas", "BOLSA": "Bolsas"}   # sub-rubros de SAP
 RAIZ_LIBRO = {**RAIZ_HOJA, "OTROS": "Bolsas"}                    # nombres de hoja del libro (acepta «Bolsas» u «Otros»)
@@ -861,7 +862,7 @@ def _tab_resumen(S):
                 fig.data[1].update(text=(graf["ejecutado"] / 1e6).map(lambda v: f"{v:,.0f}"), textposition="outside", cliponaxis=False)
                 st.plotly_chart(estilo_grafico(fig, 320), width="stretch", config={"displayModeBar": False})
     _graficos_costo(S)
-    if OS.HOJA_PAPELERIA in S.hojas:                    # Papelería: en cantidades, aparte de los pesos
+    if MOSTRAR_PAPELERIA and OS.HOJA_PAPELERIA in S.hojas:       # Papelería: en cantidades, aparte de los pesos
         q = _vista_cantidades(S)
         if len(_ppto_hoja(q, OS.HOJA_PAPELERIA)) or len(q.ejec):
             c = _cifras(q, OS.HOJA_PAPELERIA)
@@ -1764,10 +1765,11 @@ def _mostrar(ctx, tecnico: bool = False):
             with st.expander(f"Detalle y descarga · {hoja}", icon=":material/table:"):
                 _tab_hoja(S, hoja)
         return
-    pestanas = st.tabs(["Resumen", *S.hojas])
+    visibles = [h for h in S.hojas if MOSTRAR_PAPELERIA or h != OS.HOJA_PAPELERIA]
+    pestanas = st.tabs(["Resumen", *visibles])
     with pestanas[0]:
         _tab_resumen(S)
-    for tab, hoja in zip(pestanas[1:], S.hojas):
+    for tab, hoja in zip(pestanas[1:], visibles):
         with tab:
             _tab_hoja(S, hoja)
     _descarga_ejecucion(S)
