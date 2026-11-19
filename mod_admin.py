@@ -1199,6 +1199,87 @@ def _cargar_nomina(ctx):
                        + ". Agrégalos al archivo de centros de coste y vuelve a subirlo.")
 
 
+def _cargar_dotacion(ctx):
+    """Dotación y EPP's: carga del presupuesto por elemento y equivalencia artículo SISPO -> elemento."""
+    import dotacion as D
+    import sispo_fuente
+    con, leer, usuario = ctx.con, ctx.leer, ctx.usuario
+    con.crear_tablas(D.TABLAS)
+    guardados = sispo_fuente.listar(leer)
+    ult_sispo = int(guardados["periodo"].max()) // 100 if not guardados.empty else None
+    with st.container(key="card_adm_dot"):
+        titulo_tarjeta("Dotación y EPP's · presupuesto",
+                       "Sube el libro «3.1 DOTACION Y EPPS». Reemplaza el presupuesto de esa compañía y año. "
+                       "La ejecución sale del SISPO (cuenta DOTACIÓN PERSONAL) ya cargado en Operaciones/Mantenimiento.")
+        c1, c2 = st.columns([2, 1])
+        f = c1.file_uploader("Presupuesto de dotación", type=["xlsx", "xlsm"], key="dot_ppto_up")
+        empresa = c2.selectbox("Compañía", ["ALDC", "ALSM"], key="dot_ppto_emp")
+        if f:
+            try:
+                d, info = D.leer_ppto(f)
+            except Exception as err:
+                st.error(f"No pude leer {f.name}: {err}")
+            else:
+                anio_hoja = info["anio"]
+                por_defecto = ult_sispo or anio_hoja or 2026
+                anio = int(st.number_input("Año del presupuesto", 2020, 2100, int(por_defecto), key="dot_ppto_anio"))
+                if anio_hoja and anio != anio_hoja:
+                    st.warning(f"La hoja se llama «{info['hoja']}» (año {anio_hoja}) pero la vas a guardar como {anio}. "
+                               "Confirma que es el año correcto: la comparación usa este año para cruzar con el SISPO.")
+                st.markdown(f"**{f.name}:** {info['elementos']} elementos · " + " · ".join(
+                    f"{k}: {E.millones(v)}" for k, v in info["por_seccion"].items()) + f" · total {E.millones(info['valor_total'])}")
+                st.caption("«Actividades» (exámenes, capacitaciones…) se guarda pero no se compara: no pasa por el inventario del SISPO.")
+                if st.button("Cargar presupuesto de dotación", type="primary", key="dot_ppto_ok"):
+                    con.execute("DELETE FROM dot_ppto WHERE empresa=? AND anio=?", (empresa, anio))
+                    con.anexar(d.assign(empresa=empresa, anio=anio)[["empresa", "anio", "seccion", "elemento", "precio", "mes", "cantidad", "valor"]],
+                               "dot_ppto")
+                    con.commit()
+                    ctx.registrar_carga(usuario, "Dotación presupuesto", f.name, f"{empresa} {anio} · {E.millones(d['valor'].sum())}")
+                    st.success("Presupuesto de dotación cargado.")
+                    st.rerun()
+    # ---- equivalencias
+    with st.container(key="card_adm_dot_map"):
+        titulo_tarjeta("Dotación y EPP's · equivalencia de artículos",
+                       "Cada artículo del SISPO se lleva a un elemento del presupuesto. Las sugerencias son solo coincidencias evidentes; "
+                       "lo que dejes en «Sin elemento asignado» aparece aparte en la comparación (no se pierde del total).")
+        emp = st.selectbox("Compañía", ["ALDC", "ALSM"], key="dot_map_emp")
+        pp = leer("SELECT DISTINCT seccion, elemento FROM dot_ppto WHERE empresa=?", (emp,))
+        elementos = sorted(pp.loc[pp["seccion"].isin(D.SECCIONES_COMPARADAS), "elemento"])
+        arts = []
+        for per in guardados.loc[guardados["empresa"] == emp, "periodo"]:
+            try:
+                arts.append(D.ejecucion_sispo(L.sispo_leer(sispo_fuente.abrir(leer, emp, int(per)))))
+            except Exception as err:
+                st.error(f"No pude leer el SISPO {emp} {per}: {err}")
+        if not elementos:
+            st.info("Primero carga el presupuesto de dotación de esa compañía.")
+        elif not arts:
+            st.info("No hay SISPO guardado de esa compañía (se carga en Administración → Mantenimiento/Operaciones).")
+        else:
+            ej = pd.concat(arts, ignore_index=True)
+            gu = leer("SELECT codigo, elemento FROM dot_map WHERE empresa=?", (emp,))
+            eq = D.equivalencias(ej, elementos, dict(zip(gu["codigo"], gu["elemento"])))
+            val = ej.groupby("codigo")["valor"].sum()
+            eq["ejecutado"] = eq["codigo"].map(val)
+            opciones = [D.SIN_ELEMENTO] + elementos
+            ed = st.data_editor(eq[["codigo", "articulo", "elemento", "origen", "ejecutado"]].sort_values("ejecutado", ascending=False),
+                                hide_index=True, width="stretch", key=f"dot_map_ed_{emp}",
+                                disabled=["codigo", "articulo", "origen", "ejecutado"],
+                                column_config={"elemento": st.column_config.SelectboxColumn("Elemento del presupuesto", options=opciones, required=True),
+                                               "ejecutado": st.column_config.NumberColumn("Ejecutado SISPO", format="$ %.0f")})
+            st.caption(f"{(eq['origen'] == 'Pendiente').sum()} artículos sin elemento · {(eq['origen'] == 'Sugerido').sum()} con sugerencia sin confirmar.")
+            if st.button("Guardar equivalencias", type="primary", key="dot_map_ok"):
+                filas = ed[ed["elemento"] != D.SIN_ELEMENTO][["codigo", "articulo", "elemento"]].assign(
+                    empresa=emp, usuario=usuario, fecha=pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"))
+                con.execute("DELETE FROM dot_map WHERE empresa=?", (emp,))
+                if not filas.empty:
+                    con.anexar(filas[["empresa", "codigo", "articulo", "elemento", "usuario", "fecha"]], "dot_map")
+                con.commit()
+                ctx.registrar_carga(usuario, "Dotación equivalencias", "pantalla", f"{emp}: {len(filas)} artículos")
+                st.success("Equivalencias guardadas.")
+                st.rerun()
+
+
 AUTO = "(sugerencia automática)"
 
 
@@ -2101,13 +2182,16 @@ def mostrar(ctx):
             _cargar_cartera(ctx)
     with t5:
         if t5.open:   # solo se calcula la pestaña abierta
-            n1, n2 = st.tabs(["Cargar archivos", "Homologar cargos"], on_change="rerun", key="adm_nom")
+            n1, n2, n3 = st.tabs(["Cargar archivos", "Homologar cargos", "Dotación"], on_change="rerun", key="adm_nom")
             with n1:
                 if n1.open:
                     _cargar_nomina(ctx)
             with n2:
                 if n2.open:
                     _homologar_cargos(ctx)
+            with n3:
+                if n3.open:
+                    _cargar_dotacion(ctx)
 
 
     with t1:

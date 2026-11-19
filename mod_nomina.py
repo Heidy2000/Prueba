@@ -5,6 +5,9 @@ import streamlit as st
 
 import estilo as E
 import nomina
+import dotacion as D
+import logica_m as L
+import sispo_fuente
 from ui import MESES, MESES_L, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
 
 SIN_AREA = "SIN ÁREA"
@@ -37,7 +40,7 @@ def preparar(leer, anio: int):
     return ppto, ejec, pers
 
 
-def mostrar(ctx):
+def _mostrar_nomina(ctx):
     leer = ctx.leer
     zona_encabezado = st.container()
     anios = sorted(set(leer("SELECT DISTINCT anio FROM nomina_ppto")["anio"])
@@ -362,3 +365,130 @@ def mostrar(ctx):
                 st.dataframe(s2, hide_index=True, width="stretch",
                              column_config={"Valor": st.column_config.NumberColumn("Valor del mes", format="accounting"),
                                             "Personas": st.column_config.NumberColumn(format="%.0f")})
+
+
+# ====================================================================== DOTACIÓN Y EPP's
+def mostrar(ctx):
+    """Talento humano: Nómina y Dotación (la segunda funciona aunque aún no haya nómina cargada)."""
+    tn, td = st.tabs(["Nómina", "Dotación y EPP's"], on_change="rerun", key="th_tabs")
+    with tn:
+        if tn.open:
+            _mostrar_nomina(ctx)
+    with td:
+        if td.open:
+            _dotacion(ctx)
+
+
+def _ejecucion_dotacion(leer, empresa: str, anio: int):
+    """Ejecución de dotación desde el SISPO guardado de la compañía (todos los meses del año) y errores de lectura."""
+    partes, errores = [], []
+    g = sispo_fuente.listar(leer)
+    for per in sorted(g.loc[(g["empresa"] == empresa) & (g["periodo"] // 100 == anio), "periodo"]):
+        try:
+            partes.append(D.ejecucion_sispo(L.sispo_leer(sispo_fuente.abrir(leer, empresa, int(per)))))
+        except Exception as err:
+            errores.append(f"SISPO {empresa} {per}: {err}")
+    vacio = pd.DataFrame(columns=["periodo", "mes", "codigo", "articulo", "cc_codigo", "cc_nombre", "cantidad", "valor"])
+    return (pd.concat(partes, ignore_index=True) if partes else vacio), errores
+
+
+def _dotacion(ctx):
+    leer = ctx.leer
+    ctx.con.crear_tablas(D.TABLAS)
+    st.html(E.encabezado("Dotación y EPP's", "Presupuesto por elemento vs salidas de inventario del SISPO · cifras en millones de pesos", []))
+    pp_all = leer("SELECT empresa, anio, seccion, elemento, precio, mes, cantidad, valor FROM dot_ppto")
+    if pp_all.empty:
+        st.info("Aún no hay presupuesto de dotación. Financiera lo carga en Administración → Nómina → Dotación.")
+        return
+    with st.container(key="card_filtros_dot"):
+        st.html('<div class="nf-ftit">Filtros del informe</div>')
+        c = st.columns([0.9, 0.7, 1.4, 0.95], vertical_alignment="bottom")
+        empresa = c[0].selectbox("Compañía", sorted(pp_all["empresa"].unique()), key="dot_emp")
+        anios = sorted(pp_all.loc[pp_all["empresa"] == empresa, "anio"].unique(), reverse=True)
+        anio = int(c[1].selectbox("Año", anios, key="dot_anio"))
+        ppto = pp_all[(pp_all["empresa"] == empresa) & (pp_all["anio"] == anio)]
+        ejec, errores = _ejecucion_dotacion(leer, empresa, anio)
+        meses_ej = sorted(ejec["mes"].unique())
+        per = selector_periodo(c[2], c[3], int(max(meses_ej)) if meses_ej else 1, "dot")
+    for e in errores:
+        st.error(e)
+    if not meses_ej:
+        st.warning(f"No hay SISPO guardado de {empresa} para {anio}. Se carga en Administración (el mismo de Mantenimiento/Operaciones).")
+        return
+    meses = [m for m in per.meses() if m in meses_ej]
+    faltan = [m for m in per.meses() if m not in meses_ej]
+    if faltan and not per.solo:
+        st.caption("Sin SISPO cargado para: " + ", ".join(MESES[m - 1] for m in faltan)
+                   + ". Se compara solo con los meses que tienen SISPO (el presupuesto de esos meses).")
+    if not meses:
+        st.warning("No hay SISPO del mes elegido.")
+        return
+    gu = leer("SELECT codigo, elemento FROM dot_map WHERE empresa=?", (empresa,))
+    elementos = sorted(ppto.loc[ppto["seccion"].isin(D.SECCIONES_COMPARADAS), "elemento"].unique())
+    eq = D.equivalencias(ejec, elementos, dict(zip(gu["codigo"], gu["elemento"])))
+    t = D.comparar(ppto, ejec, eq, meses)
+    tot = D.totales(t)
+    txt_per = ", ".join(MESES[m - 1] for m in meses) if len(meses) <= 3 else f"{MESES[meses[0] - 1]}–{MESES[meses[-1] - 1]}"
+
+    st.html(E.kpis([
+        dict(label="Presupuesto", valor=E.millones(tot["presupuesto"]), sub=f"Dotación y EPP's · {txt_per}", icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="Ejecutado (SISPO)", valor=E.millones(tot["ejecutado"]), sub=f"{int(t['movimientos'].sum())} salidas de inventario", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="Variación", valor=f'<span style="color:{E.VERDE if tot["variacion"] <= 0 else E.ROJO}">{"+" if tot["variacion"] >= 0 else ""}{E.millones(tot["variacion"])}</span>',
+             sub="Ejecutado − presupuesto (negativo: por debajo)", icono="check" if tot["variacion"] <= 0 else "alert",
+             color=E.VERDE if tot["variacion"] <= 0 else E.ROJO, fondo=E.VERDE_SUAVE if tot["variacion"] <= 0 else E.ROJO_SUAVE),
+        dict(label="% de ejecución", valor=E.pct_txt(tot["pct"]), sub="Del presupuesto del periodo", icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE),
+    ]))
+    if tot["sin_elemento"] > 0:
+        n = int((eq["origen"] == "Pendiente").sum())
+        st.warning(f"{E.millones(tot['sin_elemento'])} del ejecutado corresponden a artículos que aún no tienen elemento del presupuesto "
+                   f"({n} sin asignar). Se muestran abajo como «Sin elemento asignado»; asígnalos en Administración → Nómina → Dotación.")
+    # cuadre con SAP de los meses mostrados
+    pool = leer("SELECT * FROM ejecucion WHERE empresa=? AND anio=?", (empresa, anio))
+    difs = []
+    for m in meses:
+        r = D.cuadre_sap(ejec, pool, empresa, anio * 100 + m)
+        if r["sap"] is None:
+            difs.append(f"{MESES[m - 1]}: SAP no trae «Salida de inventario» de DOTACIÓN PERSONAL")
+        elif abs(r["diferencia"]) > 1:
+            difs.append(f"{MESES[m - 1]}: SAP {E.millones(r['sap'])} vs SISPO {E.millones(r['sispo'])}")
+    if difs:
+        st.warning("El SISPO no cuadra con SAP en la cuenta DOTACIÓN PERSONAL → " + " · ".join(difs))
+    else:
+        st.caption("✓ El SISPO de DOTACIÓN PERSONAL cuadra con SAP en los meses mostrados.")
+
+    with st.container(key="card_dot_elem"):
+        titulo_tarjeta("Presupuesto vs ejecutado por elemento", f"{empresa} {anio} · {txt_per}. Solo aparecen elementos con presupuesto o ejecución.")
+        g = t[(t["presupuesto"] > 0) | (t["ejecutado"] > 0)].copy()
+        top = g.sort_values(["ejecutado", "presupuesto"], ascending=False).head(15).iloc[::-1]
+        fig = go.Figure()
+        fig.add_bar(y=top["elemento"], x=top["presupuesto"] / 1e6, orientation="h", name="Presupuesto", marker_color="#b9c6d8")
+        fig.add_bar(y=top["elemento"], x=top["ejecutado"] / 1e6, orientation="h", name="Ejecutado", marker_color=E.AZUL)
+        fig.update_layout(barmode="group", xaxis_title="Millones de pesos")
+        estilo_grafico(fig, 80 + 34 * len(top))
+        st.plotly_chart(fig, width="stretch", key="dot_graf_elem")
+        st.caption("Se muestran los 15 elementos con mayor ejecución; el detalle completo está en la tabla.")
+    with st.container(key="card_dot_tabla"):
+        titulo_tarjeta("Detalle", "Por sección y elemento. Cantidades en unidades; valores en pesos.")
+        vista = g.rename(columns={"seccion": "Sección", "elemento": "Elemento", "ppto_cant": "Cant. ppto", "presupuesto": "Presupuesto",
+                                  "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado", "movimientos": "Salidas", "saldo": "Saldo",
+                                  "pct": "% ejecución", "estado": "Estado"})
+        st.dataframe(vista, hide_index=True, width="stretch", column_config={
+            "Presupuesto": st.column_config.NumberColumn(format="$ %.0f"), "Ejecutado": st.column_config.NumberColumn(format="$ %.0f"),
+            "Saldo": st.column_config.NumberColumn(format="$ %.0f"), "% ejecución": st.column_config.NumberColumn(format="percent"),
+            "Cant. ppto": st.column_config.NumberColumn(format="%.0f"), "Cant. ejecutada": st.column_config.NumberColumn(format="%.0f")})
+        st.download_button("Descargar comparación (Excel)", a_excel(vista), file_name=f"dotacion_{empresa}_{anio}_{txt_per.replace(' ', '')}.xlsx",
+                           key="dot_desc")
+    with st.container(key="card_dot_mes"):
+        titulo_tarjeta("Mes a mes", "Presupuesto de Dotación y EPP's vs ejecutado, solo meses con SISPO.")
+        mm = []
+        for m in meses_ej:
+            if m > per.mes:
+                continue
+            tm = D.totales(D.comparar(ppto, ejec, eq, [m]))
+            mm.append((MESES[m - 1], tm["presupuesto"], tm["ejecutado"]))
+        fig2 = go.Figure()
+        fig2.add_bar(x=[a for a, _, _ in mm], y=[b / 1e6 for _, b, _ in mm], name="Presupuesto", marker_color="#b9c6d8")
+        fig2.add_bar(x=[a for a, _, _ in mm], y=[c_ / 1e6 for _, _, c_ in mm], name="Ejecutado", marker_color=E.AZUL)
+        fig2.update_layout(barmode="group", yaxis_title="Millones de pesos")
+        estilo_grafico(fig2, 300)
+        st.plotly_chart(fig2, width="stretch", key="dot_graf_mes")
