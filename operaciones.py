@@ -670,6 +670,38 @@ def _tabla_resumen(S):
     return t, tot, m, sin
 
 
+def _control_lineas(S):
+    """Solo administrador. Por compañía y periodo: de las líneas del SISPO guardadas en Operaciones, cuántas y cuánto (en pesos) sobreviven en
+    cada paso hasta la ejecución que se muestra, y qué filtro descarta las que se pierden. Solo informa: no cambia ninguna cifra."""
+    raw = S.lin_guardadas
+    if raw is None or raw.empty:
+        st.caption("No hay líneas de SISPO guardadas en Operaciones.")
+        return
+    pesos = lambda x: x[x["hoja"].isin(OS.HOJAS_PESOS)]
+    filas = []
+    for e in S.sel:
+        for pn in sorted(raw.loc[raw["empresa"] == e, "periodo"].dropna().unique()):
+            pn = int(pn)
+            r = raw[(raw["empresa"] == e) & (raw["periodo"] == pn)]
+            f = S.lin_sispo[(S.lin_sispo["empresa"] == e) & (S.lin_sispo["periodo"] == pn)]
+            ej = S.datos_e[e].ejec
+            ej = ej[(ej["sispo"]) & (ej["mes"] == pn % 100) & (ej["anio"] == pn // 100)] if len(ej) else ej
+            m = OS._mascaras(OS.resolver_items(r, S.items_eq, S.presup))
+            motivos = ", ".join(f"{k}: {int((~v).sum())}" for k, v in m.items() if (~v).any()) or "—"
+            filas.append({"Compañía": e, "Periodo": pn,
+                          "Guardadas (líneas)": len(pesos(r)), "Guardadas ($)": float(pesos(r)["valor"].sum()),
+                          "Tras filtros (líneas)": len(pesos(f)), "Tras filtros ($)": float(pesos(f)["valor"].sum()),
+                          "En la ejecución (líneas)": len(ej), "En la ejecución ($)": float(ej["valor"].sum()) if len(ej) else 0.0,
+                          "Filtros que descartan": motivos})
+    if not filas:
+        return
+    nc = st.column_config.NumberColumn
+    st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch", column_config={
+        c: nc(c, format="accounting") for c in ("Guardadas ($)", "Tras filtros ($)", "En la ejecución ($)")})
+    st.caption("Solo Consumibles, Herramientas y Bolsas (pesos). Si «Guardadas» es mayor que «En la ejecución», la columna donde baja dice qué paso las pierde: "
+               "«Tras filtros» = filtros aplicados al mostrar (centro, grupo, cuenta, Staf); «En la ejecución» = periodo y hoja.")
+
+
 def _control_meses(S):
     """Solo administrador. Por compañía y mes (hasta el corte): lo que hay en SAP (rubro 3.1), lo que muestra Operaciones (solo SISPO) y
     la comparación de la cuenta OTROS entre SAP y SISPO. La comparación es informativa: no condiciona lo que se muestra."""
@@ -805,6 +837,8 @@ def _tab_resumen(S):
                        icon=":material/rule:")
     if S.ctx.es_admin and _tecnico():
         _control_meses(S)
+        with st.expander("Control: líneas del SISPO guardadas vs mostradas", expanded=False):
+            _control_lineas(S)
     graf = t[t["hoja"] != "Total"]
     graf = graf[(graf["presupuesto"] > 0) | (graf["ejecutado"] != 0)]
     if not graf.empty:
@@ -1655,6 +1689,7 @@ def _mostrar(ctx, tecnico: bool = False):
     for c in ("anio", "mes", "orden", "cantidad", "costo_unit", "valor"):
         ppto_op[c] = pd.to_numeric(ppto_op[c], errors="coerce")
     ppto_op["hoja"] = ppto_op["hoja"].replace({"Otros": OS.HOJA_OTROS})              # datos guardados con el nombre «Otros»
+    lin_guardadas = lin_sispo.copy()                                                # tal cual están guardadas (para el control de líneas)
     lin_sispo = OS.filtrar_guardado(lin_sispo, items_eq, OS.items_presupuestados(ppto_op))   # mismos filtros del SISPO sobre lo ya guardado
     lin_sispo = OS.hoja_por_item(lin_sispo, items_eq, OS.hojas_de_items(ppto_op))      # la lista presupuestada manda sobre el Grupo
     datos_e = {e: _datos_empresa(ctx, e, cfg, asig, mapeo, SimpleNamespace(lin=lin_sispo, per=per_sispo, items=items_eq)) for e in EMPRESAS}
@@ -1683,7 +1718,8 @@ def _mostrar(ctx, tecnico: bool = False):
                         ppto=ppto_v, ppto_todo=ppto_op, ejec=ejec, mapeo=mapeo, datos_e=datos_e, ver_todo=ver_todo, cant=False, items=items_eq, lin_sispo=lin_sispo, per_sispo=per_sispo,
                         lin_pap=(pd.concat([datos_e[e].lin_pap for e in sel], ignore_index=True) if ver_todo else OS.papeleria(pd.DataFrame(), cfg, "", {})),
                         avisos=[a for e in sel for a in datos_e[e].avisos],
-                        sel_mes=sel_mes, ult=ult, m0_esc=m0_esc, completos=completos)
+                        sel_mes=sel_mes, ult=ult, m0_esc=m0_esc, completos=completos, lin_guardadas=lin_guardadas,
+                        presup=OS.items_presupuestados(ppto_op), items_eq=items_eq)
     zona_encabezado.html(E.encabezado(
         "Operaciones" + ("" if ver_todo else f" · {usuario}"),
         "Operaciones · Papelería · Consumibles · Herramientas · Bolsas: presupuesto vs ejecución · valores en pesos · " + VERSION,
