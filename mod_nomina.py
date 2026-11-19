@@ -40,7 +40,7 @@ def preparar(leer, anio: int):
     return ppto, ejec, pers
 
 
-def _mostrar_nomina(ctx):
+def mostrar(ctx):
     leer = ctx.leer
     zona_encabezado = st.container()
     anios = sorted(set(leer("SELECT DISTINCT anio FROM nomina_ppto")["anio"])
@@ -368,15 +368,9 @@ def _mostrar_nomina(ctx):
 
 
 # ====================================================================== DOTACIÓN Y EPP's
-def mostrar(ctx):
-    """Talento humano: Nómina y Dotación (la segunda funciona aunque aún no haya nómina cargada)."""
-    tn, td = st.tabs(["Nómina", "Dotación y EPP's"], on_change="rerun", key="th_tabs")
-    with tn:
-        if tn.open:
-            _mostrar_nomina(ctx)
-    with td:
-        if td.open:
-            _dotacion(ctx)
+def mostrar_dotacion(ctx):
+    """Página «Dotación» de Talento humano (independiente de si hay nómina cargada)."""
+    _dotacion(ctx)
 
 
 def _ejecucion_dotacion(leer, empresa: str, anio: int):

@@ -165,11 +165,13 @@ MODULOS = [  # (nombre, ícono, sección del menú, función)
     ("Operaciones", ":material/engineering:", "Operación", Operaciones.mostrar),
     ("Corte y poda", ":material/park:", "Operación", mod_corte_poda.mostrar),
     ("Nómina", ":material/badge:", "Talento humano", mod_nomina.mostrar),
+    ("Dotación", ":material/checkroom:", "Talento humano", mod_nomina.mostrar_dotacion),
     ("Administración", ":material/settings:", "Control", mod_admin.mostrar),
 ]
 
 # acceso por defecto de módulos sensibles cuando secrets no dice nada (así no quedan abiertos a todos)
 ACCESO_DEFECTO = {"Nómina": ["Recursos Humanos"],
+                  "Dotación": ["Recursos Humanos"],
                   "Estados financieros": ["Dirección", "Administrativa y Financiera"],
                   "Cartera": ["Dirección", "Administrativa y Financiera"]}
 # acceso fijo: manda sobre secrets (Financiera, el administrador, siempre ve todo)
