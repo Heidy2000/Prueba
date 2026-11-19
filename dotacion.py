@@ -53,7 +53,7 @@ def leer_ppto(archivo) -> tuple[pd.DataFrame, dict]:
     col_mes = {}                                                 # mes -> columna de «Cant.»; la de «Valor» es la siguiente
     for fila in ws.iter_rows(min_row=1, max_row=12):
         hallados = {MESES_NOMBRE.index(_norm(c.value)) + 1: c.column for c in fila if c.value is not None and _norm(c.value) in MESES_NOMBRE}
-        if len(hallados) >= 6:
+        if len(hallados) >= 3:                                 # el UPA 2026 solo trae septiembre-diciembre
             col_mes = hallados
             break
     if not col_mes:
