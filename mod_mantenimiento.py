@@ -1986,7 +1986,7 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
         return None
     try:
         PO._asegurar_tablas(S.ctx)
-        llave = ("ops", getattr(up, "name", ""), len(up.getvalue()),
+        llave = ("ops", getattr(up, "name", ""), len(up.getvalue()), _huella_codigo(PO),      # la huella evita reusar un análisis hecho con reglas anteriores
                  tuple(S.ctx.leer("SELECT codigo, item FROM oper_item_map").itertuples(index=False, name=None)).__hash__(),
                  tuple(S.ctx.leer("SELECT item FROM oper_ppto")["item"]).__hash__())
         memo = st.session_state.get("_mt_sispo_ops_memo")
@@ -2020,6 +2020,15 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
     for b in a_ops["bloqueos"]:
         st.error(f"Operaciones no se guardará: {b}", icon=":material/block:")
     return dict(PO=PO, a=a_ops, estado=estado, bloqueos=a_ops["bloqueos"])
+
+
+def _huella_codigo(PO) -> str:
+    """Huella del código que clasifica el SISPO de Operaciones: si cambian las reglas, el análisis guardado en la sesión deja de valer."""
+    import hashlib
+    try:
+        return hashlib.md5(open(PO.OS.__file__, "rb").read()).hexdigest()
+    except Exception:
+        return ""
 
 
 def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):

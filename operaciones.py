@@ -1057,8 +1057,12 @@ def sispo_estado(ctx, empresa: str, periodo: int, a: dict) -> str:
     p = ctx.leer("SELECT n_lineas, total_otros FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
     if p.empty:
         return "nuevo"
-    n = len(OS.para_guardar(a["d"], empresa, periodo))
+    g = OS.para_guardar(a["d"], empresa, periodo)
+    n = len(g)
     igual = int(p.iloc[0]["n_lineas"]) == n and abs(float(p.iloc[0]["total_otros"]) * 100 - a["total_otros_c"]) < 0.5
+    if igual:       # el conteo y el total OTROS no bastan: si las líneas guardadas valen distinto (reglas anteriores), también es «distinto»
+        v = ctx.leer("SELECT COALESCE(SUM(valor), 0) AS v FROM oper_sispo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
+        igual = abs(float(v["v"].iloc[0]) - float(g["valor"].sum())) < 0.5
     return "igual" if igual else "distinto"
 
 
