@@ -408,31 +408,33 @@ def _dotacion(ctx):
         anio = int(c[1].selectbox("Año", anios, key="dot_anio"))
         ppto = pp_all[(pp_all["empresa"] == empresa) & (pp_all["anio"] == anio)]
         ejec, errores = _ejecucion_dotacion(leer, empresa, anio)
-        meses_ej = sorted(ejec["mes"].unique())
+        pool = leer("SELECT * FROM ejecucion WHERE empresa=? AND anio=?", (empresa, anio))
+        sap_mes = D.sap_por_mes(pool, empresa, anio)
+        meses_ej = sorted(set(ejec["mes"].unique()) | set(sap_mes))
         per = selector_periodo(c[2], c[3], int(max(meses_ej)) if meses_ej else 1, "dot")
     for e in errores:
         st.error(e)
     if not meses_ej:
-        st.warning(f"No hay SISPO guardado de {empresa} para {anio}. Se carga en Administración (el mismo de Mantenimiento/Operaciones).")
+        st.warning(f"No hay ejecución de SAP (3.1 · Dotación y EPP's) ni SISPO de {empresa} para {anio}.")
         return
     meses = [m for m in per.meses() if m in meses_ej]
     faltan = [m for m in per.meses() if m not in meses_ej]
     if faltan and not per.solo:
-        st.caption("Sin SISPO cargado para: " + ", ".join(MESES[m - 1] for m in faltan)
-                   + ". Se compara solo con los meses que tienen SISPO (el presupuesto de esos meses).")
+        st.caption("Sin ejecución en SAP para: " + ", ".join(MESES[m - 1] for m in faltan)
+                   + ". Se compara solo con los meses que tienen ejecución (el presupuesto de esos meses).")
     if not meses:
-        st.warning("No hay SISPO del mes elegido.")
+        st.warning("No hay ejecución del mes elegido.")
         return
     gu = leer("SELECT codigo, elemento FROM dot_map WHERE empresa=?", (empresa,))
     elementos = sorted(ppto.loc[ppto["seccion"].isin(D.SECCIONES_COMPARADAS), "elemento"].unique())
     eq = D.equivalencias(ejec, elementos, dict(zip(gu["codigo"], gu["elemento"])))
-    t = D.comparar(ppto, ejec, eq, meses)
+    t = D.comparar(ppto, ejec, eq, meses, sap_mes)
     tot = D.totales(t)
     txt_per = ", ".join(MESES[m - 1] for m in meses) if len(meses) <= 3 else f"{MESES[meses[0] - 1]}–{MESES[meses[-1] - 1]}"
 
     st.html(E.kpis([
         dict(label="Presupuesto", valor=E.millones(tot["presupuesto"]), sub=f"Dotación y EPP's · {txt_per}", icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
-        dict(label="Ejecutado (SISPO)", valor=E.millones(tot["ejecutado"]), sub=f"{int(t['movimientos'].sum())} salidas de inventario", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="Ejecutado (SAP)", valor=E.millones(tot["ejecutado"]), sub="SAP 3.1 · Dotación y EPP's, detallado con SISPO", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="Variación", valor=f'<span style="color:{E.VERDE if tot["variacion"] <= 0 else E.ROJO}">{"+" if tot["variacion"] >= 0 else ""}{E.millones(tot["variacion"])}</span>',
              sub="Ejecutado − presupuesto (negativo: por debajo)", icono="check" if tot["variacion"] <= 0 else "alert",
              color=E.VERDE if tot["variacion"] <= 0 else E.ROJO, fondo=E.VERDE_SUAVE if tot["variacion"] <= 0 else E.ROJO_SUAVE),
@@ -443,9 +445,10 @@ def _dotacion(ctx):
         st.warning(f"{E.millones(tot['sin_elemento'])} del ejecutado corresponden a artículos que aún no tienen elemento del presupuesto "
                    f"({n} sin asignar). Se muestran abajo como «Sin elemento asignado»; asígnalos en Administración → Nómina → Dotación.")
     # cuadre con SAP de los meses mostrados
-    pool = leer("SELECT * FROM ejecucion WHERE empresa=? AND anio=?", (empresa, anio))
+    if tot["sin_detalle"]:
+        st.caption(f"{E.millones(tot['sin_detalle'])} de SAP no los detalla el SISPO (movimientos que no son «Salida de inventario» o meses sin SISPO); van en la fila «Sin detalle de SISPO».")
     difs = []
-    for m in meses:
+    for m in [m for m in meses if m in set(ejec["mes"])]:
         r = D.cuadre_sap(ejec, pool, empresa, anio * 100 + m)
         if r["sap"] is None:
             difs.append(f"{MESES[m - 1]}: SAP no trae «Salida de inventario» de DOTACIÓN PERSONAL")
@@ -484,7 +487,7 @@ def _dotacion(ctx):
         for m in meses_ej:
             if m > per.mes:
                 continue
-            tm = D.totales(D.comparar(ppto, ejec, eq, [m]))
+            tm = D.totales(D.comparar(ppto, ejec, eq, [m], sap_mes))
             mm.append((MESES[m - 1], tm["presupuesto"], tm["ejecutado"]))
         fig2 = go.Figure()
         fig2.add_bar(x=[a for a, _, _ in mm], y=[b / 1e6 for _, b, _ in mm], name="Presupuesto", marker_color="#b9c6d8")

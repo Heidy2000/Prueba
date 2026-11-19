@@ -19,6 +19,8 @@ CUENTA_SISPO = "DOTACIÓN PERSONAL"
 DOTACION, EPPS, ACTIVIDADES = "Dotación", "EPP's", "Actividades"
 SECCIONES_COMPARADAS = (DOTACION, EPPS)
 SIN_ELEMENTO = "Sin elemento asignado"
+SIN_DETALLE = "Sin detalle de SISPO"
+CODIGO_SAP, SUBRUBRO_SAP = "3.1", "Dotación y epp´s"      # SAP: código 3.1 y BASE GASTOS EXPLOTACIO (sub_rubro)
 MESES_NOMBRE = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
 
 TABLAS = """
@@ -137,7 +139,18 @@ def equivalencias(articulos: pd.DataFrame, elementos: list[str], guardadas: dict
 
 
 # ================================================================== comparación presupuesto vs ejecución
-def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses: list[int]) -> pd.DataFrame:
+def sap_por_mes(pool: pd.DataFrame, empresa: str, anio: int) -> dict[int, float]:
+    """Ejecución OFICIAL de dotación: SAP código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s», neta (incluye anulados y reversos), por mes."""
+    if pool is None or pool.empty:
+        return {}
+    k = lambda x: re.sub(r"[^A-Z0-9]", "", _norm(x))
+    es = ((pool["empresa"] == empresa) & (pd.to_numeric(pool["anio"], errors="coerce") == anio)
+          & (pool["codigo"].astype(str).str.strip() == CODIGO_SAP) & (pool["sub_rubro"].map(k) == k(SUBRUBRO_SAP)))
+    g = pool[es].assign(mes=lambda d: pd.to_numeric(d["mes"], errors="coerce")).groupby("mes")["valor"].sum()
+    return {int(m): round(float(v), 2) for m, v in g.items()}
+
+
+def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses: list[int], sap_mes: dict | None = None) -> pd.DataFrame:
     """Presupuesto vs ejecutado por elemento en los `meses` pedidos (solo DOTACIÓN y EPP's). Las salidas sin elemento aparecen como
     «Sin elemento asignado» (una fila por artículo) para que el total cuadre con el SISPO. Columnas: seccion, elemento, ppto_cant, presupuesto,
     ejec_cant, ejecutado, movimientos, más saldo, pct y estado."""
@@ -150,13 +163,19 @@ def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses:
     ee = e.groupby("clave", as_index=False).agg(ejec_cant=("cantidad", "sum"), ejecutado=("valor", "sum"), movimientos=("valor", "size"))
     ee["seccion"] = ee["clave"].map(lambda k: seccion_de.get(k, SIN_ELEMENTO))
     ee = ee.rename(columns={"clave": "elemento"})
+    if sap_mes is not None:                                       # el total es el de SAP: lo que el SISPO no detalla va en una fila aparte
+        sispo_mes = ejec.groupby("mes")["valor"].sum().round(2)
+        resto = round(sum(sap_mes.get(m, 0.0) - float(sispo_mes.get(m, 0.0)) for m in meses), 2)
+        if abs(resto) >= 0.005:
+            ee = pd.concat([ee, pd.DataFrame([dict(elemento="Otros movimientos de SAP (SISPO no los detalla)", ejec_cant=0.0, ejecutado=resto,
+                                                   movimientos=0, seccion=SIN_DETALLE)])], ignore_index=True)
     t = pp.merge(ee, on=["seccion", "elemento"], how="outer")
     for c in ("ppto_cant", "presupuesto", "ejec_cant", "ejecutado", "movimientos"):
         t[c] = t[c].fillna(0.0)
     t["movimientos"] = t["movimientos"].astype(int)
     t = L.con_metricas(t.assign(concepto=t["elemento"]))
-    orden = {DOTACION: 0, EPPS: 1, SIN_ELEMENTO: 2}
-    t["_o"] = t["seccion"].map(orden).fillna(3)
+    orden = {DOTACION: 0, EPPS: 1, SIN_ELEMENTO: 2, SIN_DETALLE: 3}
+    t["_o"] = t["seccion"].map(orden).fillna(4)
     return t.sort_values(["_o", "ejecutado", "presupuesto"], ascending=[True, False, False]).drop(columns=["_o", "concepto"]).reset_index(drop=True)
 
 
@@ -164,7 +183,8 @@ def totales(t: pd.DataFrame) -> dict:
     """Presupuesto, ejecutado y % de la tabla comparada (todas las filas, incluidas las «Sin elemento asignado»)."""
     p, e = float(t["presupuesto"].sum()), float(t["ejecutado"].sum())
     return dict(presupuesto=p, ejecutado=e, variacion=e - p, pct=(e / p) if p > 0 else float("nan"),
-                sin_elemento=float(t.loc[t["seccion"] == SIN_ELEMENTO, "ejecutado"].sum()))
+                sin_elemento=float(t.loc[t["seccion"] == SIN_ELEMENTO, "ejecutado"].sum()),
+                sin_detalle=float(t.loc[t["seccion"] == SIN_DETALLE, "ejecutado"].sum()))
 
 
 def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo: int) -> dict:

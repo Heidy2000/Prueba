@@ -1210,7 +1210,7 @@ def _cargar_dotacion(ctx):
     with st.container(key="card_adm_dot"):
         titulo_tarjeta("Dotación y EPP's · presupuesto",
                        "Sube el libro «3.1 DOTACION Y EPPS». Reemplaza el presupuesto de esa compañía y año. "
-                       "La ejecución sale del SISPO (cuenta DOTACIÓN PERSONAL) ya cargado en Operaciones/Mantenimiento.")
+                       "La ejecución es la de SAP (código 3.1 · «Dotación y epp´s»); el SISPO (cuenta DOTACIÓN PERSONAL) la detalla por elemento.")
         c1, c2 = st.columns([2, 1])
         f = c1.file_uploader("Presupuesto de dotación", type=["xlsx", "xlsm"], key="dot_ppto_up")
         empresa = c2.selectbox("Compañía", ["ALDC", "ALSM"], key="dot_ppto_emp")
