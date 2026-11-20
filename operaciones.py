@@ -1313,14 +1313,9 @@ def _X_hoja_resumen(wb, meta, r, secciones=None):
         ("Estado", k["estado"], None, _X_estado_color(k["estado"]))], _X_F_PESOS)
     if r.get("mensual_hojas"):
         mh = r["mensual_hojas"]
-        fila = _X_seccion(ws, fila, "Presupuesto y ejecución mes a mes por hoja e ítem · pesos", 9)
-        items_de = {s.get("hoja"): s["items_mes"] for s in (secciones or []) if s.get("items_mes")}
-        filas_m = []
-        for etq, pl, el in mh["filas"]:                          # cada hoja es un grupo; debajo van sus ítems (mismo criterio que la hoja de detalle)
-            filas_m.append(dict(nombre=etq, p=pl, e=[v or 0.0 for v in el], nivel=0))
-            for it, pi, ei in items_de.get(etq, {}).get("filas", []):
-                filas_m.append(dict(nombre=it or "(sin nombre de ítem)", p=pi, e=[v or 0.0 for v in ei], nivel=1))
-        L.hoja_resumen_mensual(ws, filas_m, [m.split()[0].upper() for m in mh["meses"]], meta.get("rotulo", "PRESUPUESTO"), fila_enc=fila + 1, etiqueta_filas="Hoja / ítem")
+        fila = _X_seccion(ws, fila, "Presupuesto y ejecución mes a mes por hoja · pesos (el detalle por ítem está en cada hoja)", 9)
+        filas_m = [dict(nombre=etq, p=pl, e=[v or 0.0 for v in el], nivel=0) for etq, pl, el in mh["filas"]]   # solo Consumibles, Herramientas y Bolsas
+        L.hoja_resumen_mensual(ws, filas_m, [m.split()[0].upper() for m in mh["meses"]], meta.get("rotulo", "PRESUPUESTO"), fila_enc=fila + 1, etiqueta_filas="Hoja")
         fila = fila + 1 + 2 + len(filas_m) + 2
     if r.get("papeleria"):
         c = r["papeleria"]
