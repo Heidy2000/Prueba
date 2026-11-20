@@ -2495,8 +2495,8 @@ def _descarga_soporte(S0):
             cdl.download_button(f"Descargar archivo de ejecución · {e}", lambda e=e: _soporte(S, e, S.hasta_mes, not unico),
                                 f"{S.hasta_mes:02d}_{e}_Archivo_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
                                 key=f"mt_soporte_{e}", disabled=vacio,
-                                help="Hoja «Presupuesto»: presupuesto de todos los meses y ejecución del período elegido, por sub-rubro. "
-                                     "Una hoja por sub-rubro con sus movimientos.")
+                                help="Hoja «Resumen»: presupuesto de todos los meses y ejecución mes a mes, por sub-rubro. "
+                                     "Hoja «Movimientos»: todos los movimientos que componen esa ejecución (con el detalle de las salidas de inventario de Flota).")
 
 
 def _tab_mantenimiento(S):
@@ -2827,8 +2827,8 @@ def _diagnostico(ppto: pd.DataFrame, ejec: pd.DataFrame):
 
 
 def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
-    """Excel «Soporte de ejecución de mantenimiento» de UNA compañía: hoja Presupuesto (presupuesto de todos los meses y ejecución
-    acumulada hasta el mes elegido, por sub-rubro) y una hoja por sub-rubro con los movimientos de SAP del mes elegido. Lo puede
+    """Excel «Archivo de ejecución de mantenimiento» de UNA compañía, con dos hojas: «Resumen» (presupuesto de todos los meses y ejecución
+    mes a mes hasta el mes elegido, por sub-rubro) y «Movimientos» (todos los movimientos que componen esa ejecución). Lo puede
     descargar cualquier usuario (quien no ve todo recibe solo lo de su gerencia). Respeta los movimientos eliminados; no depende
     del filtro de placa (es el soporte del rubro completo)."""
     ctx, cfg = S.ctx, S.cfg                                  # lo puede descargar cualquier usuario; _rubro respeta su gerencia

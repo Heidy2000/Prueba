@@ -1346,7 +1346,7 @@ def _X_matriz(ws, fila, meses, filas, fmt, titulo_col, n_corte):
     return fila + 1
 
 
-def _X_hoja_resumen(wb, meta, r):
+def _X_hoja_resumen(wb, meta, r, secciones=None):
     ws = wb.active
     ws.title = "1 Resumen"
     _X_anchos(ws, [30, 18, 18, 18, 18, 14, 18, 24, 13])
@@ -1361,8 +1361,15 @@ def _X_hoja_resumen(wb, meta, r):
         ("Estado", k["estado"], None, _X_estado_color(k["estado"]))], _X_F_PESOS)
     if r.get("mensual_hojas"):
         mh = r["mensual_hojas"]
-        fila = _X_seccion(ws, fila, "Presupuesto mensual, ejecución mensual y % de cumplimiento por hoja · pesos", 9)
-        fila = _X_matriz(ws, fila, mh["meses"], mh["filas"], _X_F_PESOS, "Hoja", mh["n_corte"])
+        fila = _X_seccion(ws, fila, "Presupuesto y ejecución mes a mes por hoja e ítem · pesos", 9)
+        items_de = {s.get("hoja"): s["items_mes"] for s in (secciones or []) if s.get("items_mes")}
+        filas_m = []
+        for etq, pl, el in mh["filas"]:                          # cada hoja es un grupo; debajo van sus ítems (mismo criterio que la hoja de detalle)
+            filas_m.append(dict(nombre=etq, p=pl, e=[v or 0.0 for v in el], nivel=0))
+            for it, pi, ei in items_de.get(etq, {}).get("filas", []):
+                filas_m.append(dict(nombre=it or "(sin nombre de ítem)", p=pi, e=[v or 0.0 for v in ei], nivel=1))
+        L.hoja_resumen_mensual(ws, filas_m, [m.split()[0].upper() for m in mh["meses"]], meta.get("rotulo", "PRESUPUESTO"), fila_enc=fila + 1, etiqueta_filas="Hoja / ítem")
+        fila = fila + 1 + 2 + len(filas_m) + 2
     if r.get("papeleria"):
         c = r["papeleria"]
         fila = _X_seccion(ws, fila, "Papelería · cantidades (costo cero: no hay pesos que comparar)", 9)
@@ -1454,7 +1461,7 @@ def _X_hoja_detalle(wb, meta, s):
 
 def _construir_informe(meta: dict, resumen: dict, secciones: list) -> bytes:
     wb = Workbook()
-    _X_hoja_resumen(wb, meta, resumen)
+    _X_hoja_resumen(wb, meta, resumen, secciones)
     for s in secciones:
         _X_hoja_detalle(wb, meta, s)
     buf = BytesIO()
@@ -1614,11 +1621,11 @@ def _informe(S) -> bytes:
         if hoja not in S.hojas:
             continue
         Q = _vista_cantidades(S2) if hoja == OS.HOJA_PAPELERIA else S2
-        secciones.append(dict(hoja_excel=hoja_xl, titulo=titulo, unidad="unidades" if hoja == OS.HOJA_PAPELERIA else "pesos",
+        secciones.append(dict(hoja=hoja, hoja_excel=hoja_xl, titulo=titulo, unidad="unidades" if hoja == OS.HOJA_PAPELERIA else "pesos",
                               cifras=_cifras(Q, hoja), items=_items(Q, hoja), items_mes=_items_mes(Q, hoja),
                               movs=_movimientos_informe(Q, hoja)))
     if len(S2.ejec[(S2.ejec["hoja"] == SIN_HOJA) & (S2.ejec["mes"] <= S2.hasta_mes)]):      # para que el total del resumen cuadre con las hojas
-        secciones.append(dict(hoja_excel="6 Sin hoja asignada", titulo="6. EJECUCIÓN SIN HOJA ASIGNADA", unidad="pesos", cifras=_cifras(S2, SIN_HOJA),
+        secciones.append(dict(hoja=SIN_HOJA, hoja_excel="6 Sin hoja asignada", titulo="6. EJECUCIÓN SIN HOJA ASIGNADA", unidad="pesos", cifras=_cifras(S2, SIN_HOJA),
                               items=_items(S2, SIN_HOJA), items_mes=_items_mes(S2, SIN_HOJA),
                               movs=_movimientos_informe(S2, SIN_HOJA)))
         notas.append("La hoja «6 Sin hoja asignada» reúne ejecución del rubro 3.1 que aún no se reparte (SISPO sin cargar o sin cuadrar, o sub-rubro "
@@ -1635,7 +1642,7 @@ def _informe(S) -> bytes:
         if abs(float(s["movs"]["valor"].sum()) - float(s["cifras"]["ejecutado"])) >= 0.5:
             notas.append(f"ADVERTENCIA: en «{s['hoja_excel']}» los movimientos no suman el ejecutado del indicador.")
     sel_txt = " + ".join(S.sel)
-    meta = dict(subtitulo=f"Compañía: {sel_txt} · {S.escenario} · ejecutado {S.hasta} · generado {ahora().strftime('%d/%m/%Y %H:%M')}", notas=notas)
+    meta = dict(rotulo="UPA" if S.escenario.startswith("UPA") else "PRESUPUESTO", subtitulo=f"Compañía: {sel_txt} · {S.escenario} · ejecutado {S.hasta} · generado {ahora().strftime('%d/%m/%Y %H:%M')}", notas=notas)
     return _construir_informe(meta, resumen, secciones)
 
 

@@ -200,24 +200,79 @@ def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo
     return dict(sap=s, sispo=sispo, diferencia=round(s - sispo, 2))
 
 
-def libro_ejecucion(t: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sap: pd.DataFrame, meses: list[int]) -> bytes:
-    """Excel de la ejecución de dotación: comparación por elemento, detalle del SISPO (con su elemento) y líneas de SAP que el SISPO
-    no detalla (movimientos que no son «Salida de inventario»). Solo los meses pedidos."""
+def libro_ejecucion(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sap: pd.DataFrame, sap_mes: dict, meses: list[int],
+                    titulo: str = "", rotulo: str = "PRESUPUESTO") -> bytes:
+    """Excel de la ejecución de dotación con dos hojas, como el de Mantenimiento:
+    - «Resumen»: presupuesto (`rotulo`) de todos los meses del libro y EJECUCION mes a mes (solo los `meses` pedidos), por grupo (Dotación,
+      EPP's) y, debajo de cada grupo, por elemento. «Otros (sin clasificar)» va dentro de Dotación. Totales con fórmulas.
+    - «Movimientos»: todo lo que compone esa ejecución: las salidas del SISPO (con su elemento) y las líneas de SAP que el SISPO no detalla.
+      Si SAP y SISPO difieren en la «Salida de inventario», la diferencia aparece como una fila «Ajuste» para que los movimientos sumen la ejecución.
+    Debajo de los TOTALES hay un control: lo que suman los movimientos y su diferencia con la ejecución."""
     from io import BytesIO
-    c = t.rename(columns={"seccion": "Sección", "elemento": "Elemento", "ppto_cant": "Cant. presupuesto", "presupuesto": "Presupuesto",
-                          "ejec_cant": "Cant. ejecutada", "ejecutado": "Ejecutado", "movimientos": "Salidas", "saldo": "Saldo",
-                          "pct": "% ejecución", "estado": "Estado"})
-    det = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
-    det["elemento"] = det["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
-    det = det.rename(columns={"periodo": "Periodo", "mes": "Mes", "codigo": "Código", "articulo": "Artículo", "cc_codigo": "Centro de costo",
-                              "cc_nombre": "Nombre centro de costo", "cantidad": "Cantidad", "valor": "Valor", "elemento": "Elemento del presupuesto"})
-    s = sap[sap["mes"].isin(meses)]
-    gen = s["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False) if "texto" in s and len(s) else pd.Series(False, index=s.index)
-    otros = s[~gen]
-    cols = [x for x in ("mes", "fecha", "documento", "cc_sap", "cuenta_nombre", "texto", "valor") if x in otros]
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter as col
+
+    p = ppto[ppto["seccion"].isin(SECCIONES_COMPARADAS)]
+    meses_col = sorted(set(int(m) for m in p["mes"].unique()) | set(int(m) for m in meses))
+    p_mes = p.groupby(["seccion", "elemento", "mes"])["valor"].sum()
+    e_mes = {}                                                    # (sección, elemento, mes) -> ejecutado, igual que la pantalla (`comparar`)
+    for m in meses:
+        tm = comparar(ppto, ejec, equiv, [m], sap_mes)
+        for r in tm.itertuples():
+            e_mes[(r.seccion, r.elemento, int(m))] = float(r.ejecutado)
+    filas = []
+    for sec, nombre in ((DOTACION, "Dotación"), (EPPS, "EPP's")):
+        elems = {k[1] for k in p_mes.index if k[0] == sec} | {k[1] for k in e_mes if k[0] == sec}
+        hijos = []
+        for el in elems:
+            pv = [float(p_mes.get((sec, el, m), 0.0)) for m in meses_col]
+            ev = [float(e_mes.get((sec, el, m), 0.0)) if m in meses else 0.0 for m in meses_col]
+            if any(abs(v) >= 0.005 for v in pv + ev):
+                hijos.append(dict(nombre=el, p=pv, e=ev, nivel=1, _o=(el == OTROS, -sum(ev), -sum(pv), el)))
+        hijos.sort(key=lambda f: f["_o"])
+        filas.append(dict(nombre=nombre, p=[0.0] * len(meses_col), e=[0.0] * len(meses_col), nivel=0))
+        filas.extend(hijos)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumen"
+    ws.cell(row=1, column=1, value=titulo or "Dotación y EPP's: presupuesto vs ejecución").font = Font(bold=True, size=13)
+    ws.cell(row=2, column=1, value="Ejecución: " + ", ".join(MESES_NOMBRE[m - 1].capitalize() for m in meses)).font = Font(italic=True)
+    info = L.hoja_resumen_mensual(ws, filas, [MESES_NOMBRE[m - 1] for m in meses_col], rotulo, fila_enc=4)
+
+    sis = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
+    sis["elemento"] = sis["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
+    seccion_de = p.drop_duplicates("elemento").set_index("elemento")["seccion"].to_dict()
+    sis["seccion"] = sis["elemento"].map(lambda k: DOTACION if k == OTROS else seccion_de.get(k, DOTACION))
+    cols = ["Mes", "Fuente", "Sección", "Elemento", "Código", "Artículo / texto SAP", "Centro de costo", "Nombre centro de costo", "Documento SAP",
+            "Fecha", "Cantidad", "Valor"]
+    mov = []
+    for r in sis.sort_values(["mes", "seccion", "elemento", "articulo"]).itertuples():
+        mov.append([f"{MESES_NOMBRE[int(r.mes) - 1].capitalize()}", "SISPO", r.seccion, r.elemento, r.codigo, r.articulo, r.cc_codigo, r.cc_nombre,
+                    None, None, float(r.cantidad), float(r.valor)])
+    s_ = sap[sap["mes"].isin(meses)] if len(sap) else sap
+    gen = s_["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False) if len(s_) and "texto" in s_ else pd.Series(False, index=s_.index)
+    for r in s_[~gen].sort_values(["mes", "fecha"] if "fecha" in s_ else ["mes"]).to_dict("records"):
+        f = pd.to_datetime(r.get("fecha"), errors="coerce")
+        mov.append([MESES_NOMBRE[int(r["mes"]) - 1].capitalize(), "SAP (sin detalle SISPO)", DOTACION, OTROS, None, r.get("texto"), r.get("cc_sap"), None,
+                    r.get("documento"), None if pd.isna(f) else f.to_pydatetime(), None, float(r["valor"])])
+    for m in meses:                                               # diferencia entre la «Salida de inventario» de SAP y el SISPO: se muestra, no se oculta
+        total_m = sum(v for (sc, el, mm), v in e_mes.items() if mm == m)
+        suma_m = sum(x[-1] for x in mov if x[0] == MESES_NOMBRE[m - 1].capitalize())
+        if abs(total_m - suma_m) >= 0.005:
+            mov.append([MESES_NOMBRE[m - 1].capitalize(), "Ajuste SAP vs SISPO", DOTACION, OTROS, None,
+                        "Diferencia entre la «Salida de inventario» de SAP y el SISPO de DOTACIÓN PERSONAL", None, None, None, None, None, round(total_m - suma_m, 2)])
+    L.escribir_hoja_movimientos(wb, "Movimientos", cols, mov, {"Fecha": "dd/mm/yyyy", "Cantidad": "#,##0", "Valor": '#,##0.00'},
+                                {"Mes": 14, "Fuente": 22, "Sección": 12, "Elemento": 36, "Código": 14, "Artículo / texto SAP": 56, "Centro de costo": 14,
+                                 "Nombre centro de costo": 26, "Documento SAP": 16, "Fecha": 12, "Cantidad": 10, "Valor": 16})
+    rc = info["fila_total"] + 2
+    ref = f"Movimientos!L2:L{len(mov) + 1}"
+    ce = col(info["col_ejec_total"])
+    ws.cell(row=rc, column=1, value="Control · suma de «Movimientos»").font = Font(italic=True)
+    ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = L.FORMATO_DINERO
+    ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)").font = Font(italic=True)
+    ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = L.FORMATO_DINERO
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        c.to_excel(w, sheet_name="Presupuesto vs ejecutado", index=False)
-        det.to_excel(w, sheet_name="Detalle SISPO", index=False)
-        otros[cols].to_excel(w, sheet_name="SAP sin detalle SISPO", index=False)
+    wb.save(buf)
     return buf.getvalue()

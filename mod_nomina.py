@@ -386,6 +386,48 @@ def _ejecucion_dotacion(leer, empresa: str, anio: int):
     return (pd.concat(partes, ignore_index=True) if partes else vacio), errores
 
 
+def _datos_dotacion(leer, pp_all: pd.DataFrame, empresa: str, anio: int):
+    """Todo lo que necesita el archivo de ejecución de UNA compañía y año: presupuesto, ejecución del SISPO, SAP, ejecución mensual de SAP,
+    equivalencias y meses con ejecución. Es el mismo cálculo de la pantalla."""
+    ppto = pp_all[(pp_all["empresa"] == empresa) & (pp_all["anio"] == anio)]
+    ejec, _ = _ejecucion_dotacion(leer, empresa, anio)
+    pool = leer("SELECT * FROM ejecucion WHERE empresa=? AND anio=?", (empresa, anio))
+    sap_mes = D.sap_por_mes(pool, empresa, anio)
+    meses_ej = sorted(set(int(m) for m in ejec["mes"].unique()) | set(int(m) for m in sap_mes))
+    gu = leer("SELECT codigo, elemento FROM dot_map WHERE empresa=?", (empresa,))
+    elementos = sorted(ppto.loc[ppto["seccion"].isin(D.SECCIONES_COMPARADAS), "elemento"].unique())
+    eq = D.equivalencias(ejec, elementos, dict(zip(gu["codigo"], gu["elemento"])))
+    return dict(ppto=ppto, ejec=ejec, pool=pool, sap_mes=sap_mes, meses_ej=meses_ej, eq=eq)
+
+
+def _descarga_dotacion(leer, pp_all: pd.DataFrame, empresa_pag: str, anio: int, per):
+    """Descarga del archivo de ejecución: compañía y mes se eligen aquí (por defecto, los de la página). Un mes = solo ese mes;
+    «Acumulado» = todos los meses con ejecución del año."""
+    empresas = sorted(pp_all["empresa"].unique())
+    c1, c2, c3 = st.columns([1, 1.4, 2], vertical_alignment="bottom")
+    emp = c1.selectbox("Compañía del informe", empresas, index=empresas.index(empresa_pag) if empresa_pag in empresas else 0, key="dot_emp_informe")
+    if not (pp_all["empresa"] == emp).any() or not ((pp_all["empresa"] == emp) & (pp_all["anio"] == anio)).any():
+        st.warning(f"{emp} no tiene presupuesto de dotación para {anio}.")
+        return
+    d = _datos_dotacion(leer, pp_all, emp, anio)
+    meses_ej = d["meses_ej"]
+    if not meses_ej:
+        st.warning(f"No hay ejecución de {emp} en {anio}: el archivo saldría vacío.")
+        return
+    opciones = [0, *meses_ej]
+    por_defecto = opciones.index(per.mes) if (per.solo and per.mes in meses_ej and emp == empresa_pag) else 0
+    sel = c2.selectbox("Mes del informe", opciones, index=por_defecto, key=f"dot_mes_informe_{emp}",
+                       format_func=lambda m: f"Acumulado a {MESES_L[meses_ej[-1] - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
+                       help="Un mes = solo ese mes. Acumulado = todos los meses con ejecución del año.")
+    meses = meses_ej if sel == 0 else [sel]
+    txt = f"{MESES[meses[0] - 1]}–{MESES[meses[-1] - 1]}" if len(meses) > 1 else MESES[meses[0] - 1]
+    sap_f = D.sap_filas(d["pool"], emp, anio)
+    c3.download_button(f"Descargar ejecución de dotación · {emp} (Excel)",
+                       lambda: D.libro_ejecucion(d["ppto"], d["ejec"], d["eq"], sap_f, d["sap_mes"], meses, f"Dotación y EPP's · {emp} {anio}"),
+                       file_name=f"ejecucion_dotacion_{emp}_{anio}_{txt.replace(' ', '').replace('–', '-')}.xlsx", icon=":material/download:",
+                       key=f"dot_desc_{emp}")
+
+
 def _dotacion(ctx):
     leer = ctx.leer
     ctx.con.crear_tablas(D.TABLAS)
@@ -512,10 +554,9 @@ def _dotacion(ctx):
                 estilo_grafico(fig2, 300)
                 st.plotly_chart(fig2, width="stretch", key="dot_graf_mes")
             with st.container(key="card_dot_desc"):
-                titulo_tarjeta("Archivo de ejecución", "Excel con tres hojas: presupuesto vs ejecutado por elemento, detalle del SISPO con su elemento, y las líneas de SAP que el SISPO no detalla.")
-                sap_f = D.sap_filas(pool, empresa, anio)
-                st.download_button("Descargar ejecución de dotación (Excel)", lambda: D.libro_ejecucion(t, ejec, eq, sap_f, meses),
-                                   file_name=f"ejecucion_dotacion_{empresa}_{anio}_{txt_per.replace(' ', '').replace('–', '-')}.xlsx", key="dot_desc")
+                titulo_tarjeta("Archivo de ejecución", "Excel con dos hojas: Resumen (presupuesto y ejecución mes a mes, por grupo y elemento) y Movimientos "
+                               "(todo lo que compone la ejecución). Elige la compañía y el mes del archivo.")
+                _descarga_dotacion(leer, pp_all, empresa, anio, per)
     for pestana, sec, nombre in ((td_, D.DOTACION, "Dotación"), (te, D.EPPS, "EPP's")):
         with pestana:
             if pestana.open:

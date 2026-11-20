@@ -1722,100 +1722,150 @@ def es_contenedor(sub_rubro: pd.Series) -> pd.Series:
 
 
 
+FORMATO_DINERO = '_-* #,##0_-;\\-* #,##0_-;_-* "-"??_-;_-@_-'
+
+
+def hoja_resumen_mensual(ws, filas: list, meses_txt: list, rotulo: str, fila_enc: int = 4, etiqueta_filas: str = "") -> dict:
+    """Hoja «Resumen» con el formato del archivo de ejecución de Mantenimiento: a la izquierda el presupuesto (`rotulo`) mes a mes con su
+    TOTAL y, cinco columnas más a la derecha, la EJECUCION mes a mes con su TOTAL; una fila por concepto y una fila TOTALES al final.
+    `filas`: lista de dict(nombre, p=[valor por mes], e=[valor por mes], nivel=0|1). Una fila de nivel 0 seguida de filas de nivel 1 es un
+    grupo: su valor es la SUMA de sus filas hijas (fórmula) y los TOTALES suman solo las de nivel 0. Los totales son fórmulas.
+    Devuelve dict(fila_total, col_ejec_total, primera_fila, ultima_fila) para quien quiera agregar controles debajo."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter as col
+    n = len(meses_txt)
+    azul = PatternFill("solid", fgColor="002060")
+    c_p0, c_pt = 2, 2 + n
+    c_e0 = c_pt + 6
+    c_et = c_e0 + n
+    for c0, ct, titulo in ((c_p0, c_pt, rotulo), (c_e0, c_et, "EJECUCION")):
+        ws.merge_cells(start_row=fila_enc, start_column=c0, end_row=fila_enc, end_column=ct)
+        celda = ws.cell(row=fila_enc, column=c0, value=titulo)
+        celda.fill, celda.font, celda.alignment = azul, Font(bold=True, color="FFFFFF"), Alignment(horizontal="center")
+        for j, m in enumerate(meses_txt):
+            ws.cell(row=fila_enc + 1, column=c0 + j, value=m).font = Font(bold=True)
+            ws.cell(row=fila_enc + 1, column=c0 + j).alignment = Alignment(horizontal="center")
+        ws.cell(row=fila_enc + 1, column=ct, value="TOTAL").font = Font(bold=True)
+        ws.cell(row=fila_enc + 1, column=ct).alignment = Alignment(horizontal="center")
+    if etiqueta_filas:
+        ws.cell(row=fila_enc + 1, column=1, value=etiqueta_filas).font = Font(bold=True)
+    fila0 = fila_enc + 2
+    pos = {}                                                     # índice de la fila de `filas` -> número de fila en la hoja
+    for i in range(len(filas)):
+        pos[i] = fila0 + i
+    for i, f in enumerate(filas):
+        r = pos[i]
+        nivel = int(f.get("nivel", 0))
+        hijos = []
+        if nivel == 0:
+            j = i + 1
+            while j < len(filas) and int(filas[j].get("nivel", 0)) == 1:
+                hijos.append(pos[j])
+                j += 1
+        c = ws.cell(row=r, column=1, value=f["nombre"])
+        c.font = Font(bold=(nivel == 0 and bool(hijos)))
+        c.alignment = Alignment(indent=1 if nivel == 1 else 0)
+        for j in range(n):
+            for c0, clave in ((c_p0, "p"), (c_e0, "e")):
+                if hijos:
+                    ws.cell(row=r, column=c0 + j, value=f"=+SUM({col(c0 + j)}{hijos[0]}:{col(c0 + j)}{hijos[-1]})").font = Font(bold=True)
+                else:
+                    ws.cell(row=r, column=c0 + j, value=float(f[clave][j] or 0.0))
+        for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
+            ws.cell(row=r, column=ct, value=f"=+SUM({col(c0)}{r}:{col(ct - 1)}{r})").font = Font(bold=bool(hijos))
+    rt = fila0 + len(filas)
+    ws.cell(row=rt, column=1, value="TOTALES").font = Font(bold=True)
+    nivel0 = [pos[i] for i, f in enumerate(filas) if int(f.get("nivel", 0)) == 0]
+    for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
+        for c in range(c0, ct + 1):
+            if not nivel0:
+                v = 0
+            elif nivel0 == list(range(nivel0[0], nivel0[0] + len(nivel0))):
+                v = f"=+SUM({col(c)}{nivel0[0]}:{col(c)}{nivel0[-1]})"
+            else:
+                v = "=+SUM(" + ",".join(f"{col(c)}{x}" for x in nivel0) + ")"
+            ws.cell(row=rt, column=c, value=v).font = Font(bold=True)
+    for r in range(fila0, rt + 1):
+        for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
+            ws.cell(row=r, column=c).number_format = FORMATO_DINERO
+    ws.column_dimensions["A"].width = 38
+    for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
+        ws.column_dimensions[col(c)].width = 16
+    ws.freeze_panes = f"B{fila0}"
+    return dict(fila_total=rt, col_ejec_total=c_et, primera_fila=fila0, ultima_fila=rt - 1)
+
+
+def escribir_hoja_movimientos(wb, nombre: str, columnas: list, filas: list, formatos: dict | None = None, anchos: dict | None = None):
+    """Hoja de movimientos: encabezado en negrita, filtros, fila congelada y formatos por columna (`formatos`: nombre -> formato de número)."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter as col
+    hoja = wb.create_sheet(nombre)
+    hoja.append(columnas)
+    for fila in filas:
+        hoja.append([None if (isinstance(v, pd.Timestamp) and pd.isna(v)) else (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v) for v in fila])
+    for j, c in enumerate(columnas, start=1):
+        hoja.cell(row=1, column=j).font = Font(bold=True)
+        fmt = (formatos or {}).get(c)
+        if fmt:
+            for r in range(2, len(filas) + 2):
+                hoja.cell(row=r, column=j).number_format = fmt
+        hoja.column_dimensions[col(j)].width = (anchos or {}).get(c, 14)
+    hoja.freeze_panes = "A2"
+    hoja.auto_filter.ref = hoja.dimensions
+    return hoja
+
+
 def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
                      detalle_meses: bool = False, num_cuenta: dict | None = None, sin_hoja: tuple = ()) -> bytes:
-    """Excel de soporte: `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) del MISMO rubro,
-    compañía y año. Hoja «Presupuesto»: el presupuesto muestra TODOS los meses del escenario y la ejecución es la ACUMULADA
-    desde el primer mes del escenario hasta `mes` (los meses posteriores quedan en cero). Hojas de cada sub-rubro: solo los
-    movimientos de SAP del mes `mes`. Los totales son fórmulas, como en el archivo original.
-    `num_cuenta` (opcional): número de cuenta de SAP por cuenta de SISPO, para las filas de detalle de SISPO cuyo genérico ya no está en `ejec`.
-    Con `detalle_meses=True` las hojas de cada sub-rubro traen los movimientos de todos los meses hasta `mes` (con la columna «Mes»), en vez de solo los de `mes`.
-    `sin_hoja`: sub-rubros que no llevan hoja de movimientos (siguen sumando en «Presupuesto», así los totales no cambian)."""
+    """Excel de ejecución de Mantenimiento de UNA compañía, con dos hojas:
+    - «Resumen»: presupuesto (`rotulo`) de todos los meses del escenario y EJECUCION mes a mes hasta `mes`, por sub-rubro. Los totales son fórmulas.
+    - «Movimientos»: TODOS los movimientos que componen esa ejecución (de todos los sub-rubros y de los meses hasta `mes`), con su sub-rubro y mes;
+      las salidas de inventario traen el detalle del SISPO (placa, concepto, código de artículo, cantidad y bodega) y la columna «Fuente».
+    Debajo de los TOTALES del resumen hay un control: lo que suman los movimientos y su diferencia con la ejecución.
+    `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) son del MISMO rubro, compañía y año.
+    `num_cuenta`: número de cuenta de SAP por cuenta de SISPO. `detalle_meses` y `sin_hoja` se conservan por compatibilidad: ya no cambian el resultado."""
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter as col
 
     m0, m1 = cfg["meses"]
     meses = list(range(m0, m1 + 1))
-    n = len(meses)
-    acumulada = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= mes)]          # hoja Presupuesto
-    ejec = acumulada if detalle_meses else ejec[ejec["mes"] == mes]       # hojas de detalle: el mes elegido (o todos hasta él)
+    acumulada = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= mes)]
     nombres, orden, p, e = serie_subrubros(ppto, acumulada, cfg)
     num_cuenta = {**numeros_cuenta(acumulada), **(num_cuenta or {})}
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Presupuesto"
-    dinero = '_-* #,##0_-;\\-* #,##0_-;_-* "-"??_-;_-@_-'
-    azul = PatternFill("solid", fgColor="002060")
-    c_p0, c_pt = 2, 2 + n                                    # presupuesto: meses y total
-    c_e0 = c_pt + 6                                          # ejecución: deja 5 columnas libres, como el original
-    c_et = c_e0 + n
-    for c0, ct, titulo in ((c_p0, c_pt, rotulo), (c_e0, c_et, "EJECUCION")):
-        ws.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=ct)
-        celda = ws.cell(row=4, column=c0, value=titulo)
-        celda.fill, celda.font, celda.alignment = azul, Font(bold=True, color="FFFFFF"), Alignment(horizontal="center")
-        for j, m in enumerate(meses):
-            ws.cell(row=5, column=c0 + j, value=MESES_MAYUS[m - 1]).font = Font(bold=True)
-            ws.cell(row=5, column=c0 + j).alignment = Alignment(horizontal="center")
-        ws.cell(row=5, column=ct, value="TOTAL").font = Font(bold=True)
-        ws.cell(row=5, column=ct).alignment = Alignment(horizontal="center")
-    fila0 = 6
-    for i, k in enumerate(orden):
-        r = fila0 + i
-        ws.cell(row=r, column=1, value=nombres[k])
-        for j, m in enumerate(meses):
-            ws.cell(row=r, column=c_p0 + j, value=float(p.get((k, m), 0.0)))
-            ws.cell(row=r, column=c_e0 + j, value=float(e.get((k, m), 0.0)) if m <= mes else 0.0)
-        for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
-            ws.cell(row=r, column=ct, value=f"=+SUM({col(c0)}{r}:{col(ct - 1)}{r})")
-    rt = fila0 + len(orden)
-    ws.cell(row=rt, column=1, value="TOTALES").font = Font(bold=True)
-    for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
-        for c in range(c0, ct + 1):
-            ws.cell(row=rt, column=c, value=f"=+SUM({col(c)}{fila0}:{col(c)}{rt - 1})" if orden else 0).font = Font(bold=True)
-    for r in range(fila0, rt + 1):
-        for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
-            ws.cell(row=r, column=c).number_format = dinero
-    ws.column_dimensions["A"].width = 34
-    for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
-        ws.column_dimensions[col(c)].width = 16
-    ws.freeze_panes = "B6"
+    ws.title = "Resumen"
+    filas = [dict(nombre=nombres[k], p=[float(p.get((k, m), 0.0)) for m in meses],
+                  e=[float(e.get((k, m), 0.0)) if m <= mes else 0.0 for m in meses]) for k in orden]
+    info = hoja_resumen_mensual(ws, filas, [MESES_MAYUS[m - 1] for m in meses], rotulo)
 
-    usados = {"presupuesto"}
-    omitir = {norm_texto(x) for x in sin_hoja}
-    for k in orden:                                          # una hoja por sub-rubro CON movimientos
-        if k in omitir:
-            continue
-        mv = ejec[ejec["sub_rubro"].fillna("").astype(str).map(norm_texto) == k]
-        if mv.empty:
-            continue
-        mv = mv.assign(_t=mv["tercero"].fillna("").astype(str).map(norm_texto)).sort_values(["_t", "fecha", "documento"], kind="stable")
-        if detalle_meses:                                    # todos los meses hasta el elegido: ordenados por mes y con su columna «Mes»
-            mv = mv.assign(_t=mv["tercero"].fillna("").astype(str).map(norm_texto)).sort_values(["mes", "_t", "fecha", "documento"], kind="stable")
-        t = filas_sap(mv, num_cuenta)
-        columnas = list(t.columns)
-        if detalle_meses:
-            t = t.assign(**{"Mes": [f"{MESES_MAYUS[int(m) - 1].capitalize()} {int(a)}" for m, a in zip(mv["mes"], mv["anio"] if "anio" in mv else [cfg["anio"]] * len(mv))]})
-            columnas = columnas + ["Mes"]
-        hoja = wb.create_sheet(_nombre_hoja(nombres[k], usados))
-        hoja.append(columnas)
-        for fila in t.itertuples(index=False):
-            hoja.append([None if (isinstance(v, pd.Timestamp) and pd.isna(v)) else (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v)
-                         for v in fila])
-        for j, c in enumerate(columnas, start=1):
-            hoja.cell(row=1, column=j).font = Font(bold=True)
-            if c in SAP_FECHAS:
-                for r in range(2, len(t) + 2):
-                    hoja.cell(row=r, column=j).number_format = "mm-dd-yy"
-            elif c == "Valor/mon.inf.":
-                for r in range(2, len(t) + 2):
-                    hoja.cell(row=r, column=j).number_format = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
-            hoja.column_dimensions[col(j)].width = {"TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34,
-                                                    "Valor/mon.inf.": 16, "Denom.clase de coste": 26,
-                                                    "Denominación del objeto": 24, "Concepto de mantenimiento": 28, "Bodega": 22}.get(c, 14)
-        hoja.freeze_panes = "A2"
-        hoja.auto_filter.ref = hoja.dimensions
+    clave = acumulada["sub_rubro"].fillna("").astype(str).map(norm_texto)
+    mv = acumulada.assign(_k=clave, _t=acumulada["tercero"].fillna("").astype(str).map(norm_texto) if "tercero" in acumulada else "")
+    mv = mv.assign(_o=mv["_k"].map({k: i for i, k in enumerate(orden)}).fillna(len(orden)))
+    mv = mv.sort_values(["_o", "mes", "_t", "fecha", "documento"], kind="stable")
+    t = filas_sap(mv, num_cuenta) if len(mv) else pd.DataFrame(columns=SAP_COLUMNAS)
+    anios = mv["anio"] if "anio" in mv else pd.Series([cfg["anio"]] * len(mv), index=mv.index)
+    t = t.reset_index(drop=True)
+    t.insert(0, "Mes", [f"{MESES_MAYUS[int(m) - 1].capitalize()} {int(a)}" for m, a in zip(mv["mes"], anios)])
+    t.insert(0, "Sub-rubro", [nombres.get(k, "") for k in mv["_k"]])
+    columnas = list(t.columns)
+    formatos = {c: "mm-dd-yy" for c in columnas if c in SAP_FECHAS}
+    formatos["Valor/mon.inf."] = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
+    anchos = {"Sub-rubro": 30, "Mes": 16, "TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34, "Valor/mon.inf.": 16,
+              "Denom.clase de coste": 26, "Denominación del objeto": 24, "Concepto de mantenimiento": 28, "Bodega": 22}
+    escribir_hoja_movimientos(wb, "Movimientos", columnas, list(t.itertuples(index=False, name=None)), formatos, anchos)
+
+    rc = info["fila_total"] + 2                              # control: los movimientos deben sumar la ejecución del resumen
+    if "Valor/mon.inf." in columnas:
+        letra = col(columnas.index("Valor/mon.inf.") + 1)
+        ref = f"Movimientos!{letra}2:{letra}{len(t) + 1}"
+        ce = col(info["col_ejec_total"])
+        ws.cell(row=rc, column=1, value="Control · suma de «Movimientos»").font = Font(italic=True)
+        ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = FORMATO_DINERO
+        ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)").font = Font(italic=True)
+        ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = FORMATO_DINERO
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
