@@ -202,12 +202,13 @@ def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo
 
 def libro_ejecucion(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sap: pd.DataFrame, sap_mes: dict, meses: list[int],
                     titulo: str = "", rotulo: str = "PRESUPUESTO") -> bytes:
-    """Excel de la ejecución de dotación con dos hojas, como el de Mantenimiento:
-    - «Resumen»: presupuesto (`rotulo`) de todos los meses del libro y EJECUCION mes a mes (solo los `meses` pedidos), por grupo (Dotación,
-      EPP's) y, debajo de cada grupo, por elemento. «Otros (sin clasificar)» va dentro de Dotación. Totales con fórmulas.
-    - «Movimientos»: todo lo que compone esa ejecución: las salidas del SISPO (con su elemento) y las líneas de SAP que el SISPO no detalla.
-      Si SAP y SISPO difieren en la «Salida de inventario», la diferencia aparece como una fila «Ajuste» para que los movimientos sumen la ejecución.
-    Debajo de los TOTALES hay un control: lo que suman los movimientos y su diferencia con la ejecución."""
+    """Excel de la ejecución de dotación con tres hojas:
+    - «Resumen»: presupuesto (`rotulo`) de todos los meses del libro y EJECUCION mes a mes (solo los `meses` pedidos), una fila por grupo
+      (Dotación y EPP's), sin detalle por elemento. «Otros (sin clasificar)» va dentro de Dotación. Totales con fórmulas.
+    - «Dotación» y «EPPs»: los movimientos que componen la ejecución de cada grupo: las salidas del SISPO (con su elemento) y, en Dotación,
+      las líneas de SAP que el SISPO no detalla. Si SAP y SISPO difieren en la «Salida de inventario», la diferencia aparece como una fila
+      «Ajuste» para que los movimientos sumen la ejecución.
+    Debajo de los TOTALES hay un control: lo que suman las dos hojas de movimientos y su diferencia con la ejecución."""
     from io import BytesIO
     from openpyxl import Workbook
     from openpyxl.styles import Font
@@ -230,15 +231,14 @@ def libro_ejecucion(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame,
             ev = [float(e_mes.get((sec, el, m), 0.0)) if m in meses else 0.0 for m in meses_col]
             if any(abs(v) >= 0.005 for v in pv + ev):
                 hijos.append(dict(nombre=el, p=pv, e=ev, nivel=1, _o=(el == OTROS, -sum(ev), -sum(pv), el)))
-        hijos.sort(key=lambda f: f["_o"])
-        filas.append(dict(nombre=nombre, p=[0.0] * len(meses_col), e=[0.0] * len(meses_col), nivel=0))
-        filas.extend(hijos)
+        filas.append(dict(nombre=nombre, p=[sum(h["p"][i] for h in hijos) for i in range(len(meses_col))],
+                          e=[sum(h["e"][i] for h in hijos) for i in range(len(meses_col))], nivel=0))   # una fila por grupo: Dotación y EPP's
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Resumen"
     ws.cell(row=1, column=1, value=titulo or "Dotación y EPP's: presupuesto vs ejecución").font = Font(bold=True, size=13)
-    ws.cell(row=2, column=1, value="Ejecución: " + ", ".join(MESES_NOMBRE[m - 1].capitalize() for m in meses)).font = Font(italic=True)
+    ws.cell(row=2, column=1, value="Ejecución: " + ", ".join(MESES_NOMBRE[m - 1].capitalize() for m in meses)).font = Font(italic=False)
     info = L.hoja_resumen_mensual(ws, filas, [MESES_NOMBRE[m - 1] for m in meses_col], rotulo, fila_enc=4)
 
     sis = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
@@ -263,15 +263,20 @@ def libro_ejecucion(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame,
         if abs(total_m - suma_m) >= 0.005:
             mov.append([MESES_NOMBRE[m - 1].capitalize(), "Ajuste SAP vs SISPO", DOTACION, OTROS, None,
                         "Diferencia entre la «Salida de inventario» de SAP y el SISPO de DOTACIÓN PERSONAL", None, None, None, None, None, round(total_m - suma_m, 2)])
-    L.escribir_hoja_movimientos(wb, "Movimientos", cols, mov, {"Fecha": "dd/mm/yyyy", "Cantidad": "#,##0", "Valor": '#,##0.00'},
-                                {"Mes": 14, "Fuente": 22, "Sección": 12, "Elemento": 36, "Código": 14, "Artículo / texto SAP": 56, "Centro de costo": 14,
-                                 "Nombre centro de costo": 26, "Documento SAP": 16, "Fecha": 12, "Cantidad": 10, "Valor": 16})
+    cols.remove("Sección")                                        # el nombre de la hoja ya dice la sección
+    anchos = {"Mes": 14, "Fuente": 22, "Elemento": 36, "Código": 14, "Artículo / texto SAP": 56, "Centro de costo": 14,
+              "Nombre centro de costo": 26, "Documento SAP": 16, "Fecha": 12, "Cantidad": 10, "Valor": 16}
+    refs = []
+    for sec, hoja in ((DOTACION, "Dotación"), (EPPS, "EPPs")):    # los movimientos, separados: Dotación por un lado y solo EPP's por otro
+        filas_h = [x[:2] + x[3:] for x in mov if x[2] == sec]
+        L.escribir_hoja_movimientos(wb, hoja, cols, filas_h, {"Fecha": "dd/mm/yyyy", "Cantidad": "#,##0", "Valor": '#,##0.00'}, anchos)
+        refs.append(f"'{hoja}'!{col(len(cols))}2:{col(len(cols))}{max(len(filas_h) + 1, 2)}")
     rc = info["fila_total"] + 2
-    ref = f"Movimientos!L2:L{len(mov) + 1}"
+    ref = ",".join(refs)
     ce = col(info["col_ejec_total"])
-    ws.cell(row=rc, column=1, value="Control · suma de «Movimientos»").font = Font(italic=True)
+    ws.cell(row=rc, column=1, value="Control · suma de las hojas de movimientos")
     ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = L.FORMATO_DINERO
-    ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)").font = Font(italic=True)
+    ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)")
     ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = L.FORMATO_DINERO
     buf = BytesIO()
     wb.save(buf)

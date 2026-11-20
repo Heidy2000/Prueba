@@ -554,8 +554,8 @@ def _dotacion(ctx):
                 estilo_grafico(fig2, 300)
                 st.plotly_chart(fig2, width="stretch", key="dot_graf_mes")
             with st.container(key="card_dot_desc"):
-                titulo_tarjeta("Archivo de ejecución", "Excel con dos hojas: Resumen (presupuesto y ejecución mes a mes, por grupo y elemento) y Movimientos "
-                               "(todo lo que compone la ejecución). Elige la compañía y el mes del archivo.")
+                titulo_tarjeta("Archivo de ejecución", "Excel con Resumen (presupuesto y ejecución mes a mes de Dotación y EPP's) y una hoja de movimientos "
+                               "para Dotación y otra solo para EPPs. Elige la compañía y el mes del archivo.")
                 _descarga_dotacion(leer, pp_all, empresa, anio, per)
     for pestana, sec, nombre in ((td_, D.DOTACION, "Dotación"), (te, D.EPPS, "EPP's")):
         with pestana:
