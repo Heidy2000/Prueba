@@ -374,141 +374,6 @@ def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bo
                            icon=":material/download:", key=f"mt_dl_{clave}")
 
 
-COLUMNAS_DETALLE = {
-    "Esencial": ["Fecha de documento", "Fuente", "Nº docum.refer.", "Placa", "Concepto de gasto", "TEXTO", "Centro de coste",
-                 "Denominación del objeto", "Valor/mon.inf."],
-    "Campos de SAP": ["Nº docum.r", "Denom.clase de coste", "Fecha de documento", "Nº docum.refer.", "Valor/mon.inf.",
-                      "Texto de cabecera de documento", "Cta.contrapartida", "Denominacion cuenta contrapartida", "Centro de coste", "Anulado",
-                      "De período", "Denom.cuenta contrapartida", "TEXTO", "Denominación del objeto"],
-    "Clasificación y SISPO": ["Fecha de documento", "Nº docum.refer.", "Fuente", "Placa", "Concepto de gasto", "Clasificado por",
-                              "Concepto de mantenimiento", "Código artículo", "Cantidad", "Bodega", "TEXTO", "Valor/mon.inf."],
-}
-AYUDA_DETALLE = {
-    "Nº docum.r": "Número de cuenta contable de SAP", "Nº docum.refer.": "Documento de referencia (en SISPO, «Kardex n»)",
-    "Valor/mon.inf.": "Costo del movimiento con el signo de SAP; la suma de esta columna es la ejecución",
-    "Fuente": "SISPO = salida de inventario detallada; SAP = movimiento contable", "Placa": "Placa final (identificada o corregida)",
-    "Concepto de gasto": "Concepto del presupuesto en el que quedó clasificado el movimiento",
-    "Concepto de mantenimiento": "Concepto original que trae el SISPO", "Clasificado por": "Regla o persona que asignó el concepto"}
-
-
-def _detalle_flota(S, mov: pd.DataFrame, ejecutado_vista: float, filtrado: bool):
-    """Detalle de los movimientos que componen la ejecución de Flota: uno por renglón, con los campos originales de SAP y el detalle de
-    SISPO (kardex, artículo, cantidad, bodega), más la placa y el concepto de gasto en que quedó cada uno. Es la fuente del consolidado:
-    el total y el resumen por concepto se calculan sobre estos mismos movimientos (sin duplicar ni reclasificar nada). Respeta el alcance
-    del perfil (`mov` ya viene filtrado por gerencia, placa, concepto y estado) y se puede refinar con filtros propios."""
-    with st.container(key="mt_card_detalle"):
-        titulo_tarjeta("Detalle de movimientos de la ejecución",
-                       f"{S.escenario} · ejecutado {S.hasta} · cada renglón es un movimiento (SISPO o SAP); los consolidados salen de aquí")
-        if mov.empty:
-            st.caption("No hay movimientos con los filtros elegidos.")
-            return
-        mov = mov.reset_index(drop=True)
-        clave_memo = ("mt_raw", int(S.cfg["anio"]), tuple(S.sel))
-        crudo = st.session_state.get(clave_memo)
-        if crudo is None:
-            crudo = S.ctx.leer("SELECT id, raw FROM ejecucion WHERE anio=?" + (" AND empresa IN (" + ",".join("?" * len(S.sel)) + ")" if S.sel else ""),
-                               (int(S.cfg["anio"]), *S.sel)).drop_duplicates("id")
-            st.session_state[clave_memo] = crudo
-        con_raw = mov.drop(columns=["raw"], errors="ignore").merge(crudo, on="id", how="left") if "id" in mov else mov.assign(raw="")
-        t = L.filas_sap(con_raw, L.numeros_cuenta(crudo))
-        assert len(t) == len(mov), "el detalle no puede cambiar el número de movimientos"
-        t["Compañía"] = mov["empresa"].to_numpy()
-        t["Placa"] = mov["placa"].fillna("").to_numpy()                      # la placa FINAL (la de SISPO solo orienta)
-        t["Concepto de gasto"] = mov["concepto"].fillna("").to_numpy()
-        t["Clasificado por"] = mov["origen"].fillna("").to_numpy() if "origen" in mov else ""
-        t["Mes"] = pd.to_numeric(mov["mes"], errors="coerce").to_numpy()
-        if "Fuente" not in t:
-            t["Fuente"] = "SAP"
-        n_dup = int(mov["llave"].duplicated().sum()) if "llave" in mov else 0
-        if n_dup:
-            st.error(f"{n_dup} movimientos aparecen repetidos en el detalle: revisa la carga antes de usar estas cifras.", icon=":material/error:")
-
-        # ---- filtros propios del detalle
-        f1, f2, f3, f4 = st.columns([1.1, 1.5, 1.3, 1.6], vertical_alignment="bottom")
-        fuente = f1.segmented_control("Fuente", ["Todas", "SISPO", "SAP"], default="Todas", key="mt_det_fuente") or "Todas"
-        conceptos = sorted(set(t["Concepto de gasto"]) - {""})
-        placas = sorted(set(t["Placa"]) - {""})
-        centros = sorted(set(t["Centro de coste"].astype(str)) - {""})
-        _limpiar_multi("mt_det_concepto", conceptos)
-        _limpiar_multi("mt_det_placa", placas)
-        _limpiar_multi("mt_det_centro", centros)
-        sel_c = f2.multiselect("Concepto de gasto", conceptos, placeholder="Todos", key="mt_det_concepto")
-        sel_p = f3.multiselect("Placa", placas, placeholder="Todas", key="mt_det_placa")
-        sel_cc = f4.multiselect("Centro de coste", centros, placeholder="Todos", key="mt_det_centro")
-        g1, g2 = st.columns([2, 2], vertical_alignment="bottom")
-        buscar = g1.text_input("Buscar", placeholder="Documento, texto, artículo, proveedor, objeto…", key="mt_det_buscar")
-        preset = g2.segmented_control("Columnas", [*COLUMNAS_DETALLE, "Todas"], default="Esencial", key="mt_det_cols",
-                                      help="Elige qué campos ver. En la tabla también puedes ocultar o mostrar columnas desde su menú.") or "Esencial"
-        v = t
-        if fuente != "Todas":
-            v = v[v["Fuente"] == fuente]
-        if sel_c:
-            v = v[v["Concepto de gasto"].isin(sel_c)]
-        if sel_p:
-            v = v[v["Placa"].isin(sel_p)]
-        if sel_cc:
-            v = v[v["Centro de coste"].astype(str).isin(sel_cc)]
-        if buscar:
-            v = v[v.drop(columns=["Valor/mon.inf."]).astype(str).apply(lambda c: c.str.contains(buscar, case=False, regex=False)).any(axis=1)]
-        total, n = float(v["Valor/mon.inf."].sum()), len(v)
-
-        # ---- indicadores (todo calculado desde los movimientos mostrados)
-        sispo_v = float(v.loc[v["Fuente"] == "SISPO", "Valor/mon.inf."].sum())
-        hay_f = bool(fuente != "Todas" or sel_c or sel_p or sel_cc or buscar)
-        if not hay_f and not filtrado:
-            dif = total - ejecutado_vista
-            cuadra = abs(dif) < 1
-            ctrl = dict(label="Cuadre con la ejecución", valor=f'<span style="color:{E.VERDE if cuadra else E.ROJO}">{"Cuadra" if cuadra else E.pesos(dif)}</span>',
-                        sub="La suma del detalle = ejecutado de arriba" if cuadra else "Diferencia contra el ejecutado de arriba",
-                        icono="check" if cuadra else "alert", color=E.VERDE if cuadra else E.ROJO, fondo=E.VERDE_SUAVE if cuadra else E.ROJO_SUAVE)
-        else:
-            ctrl = dict(label="% del detalle total", valor=E.pct_txt(total / t["Valor/mon.inf."].sum()) if t["Valor/mon.inf."].sum() else "—",
-                        sub="Respecto de todos los movimientos de Flota", icono="trend", color=E.AZUL, fondo=E.AZUL_SUAVE)
-        st.html(E.kpis([
-            dict(label="Valor de los movimientos", valor=E.millones(total), sub=E.pesos(total), icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
-            dict(label="Movimientos", valor=f"{n:,}".replace(",", "."), sub=f"{int((v['Fuente'] == 'SISPO').sum()):,} de SISPO".replace(",", "."),
-                 icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
-            dict(label="Detallado por SISPO", valor=E.pct_txt(sispo_v / total) if total else "—", sub=f"{E.millones(sispo_v)} con kardex",
-                 icono="check", color=E.AZUL, fondo=E.AZUL_SUAVE),
-            ctrl]))
-
-        # ---- consolidado por concepto (calculado desde el detalle)
-        por_c = (v.assign(_c=v["Concepto de gasto"].replace("", "(sin concepto)")).groupby("_c")
-                 .agg(valor=("Valor/mon.inf.", "sum"), movimientos=("Valor/mon.inf.", "size"), sispo=("Fuente", lambda x: int((x == "SISPO").sum())))
-                 .reset_index().sort_values("valor", ascending=False))
-        if len(por_c):
-            _participacion(list(zip(por_c["_c"], por_c["valor"])), "Participación de cada concepto en estos movimientos")
-        tab_res, tab_mov = st.tabs(["Consolidado por concepto", f"Movimientos ({n:,})".replace(",", ".")])
-        with tab_res:
-            por_c["% del total"] = por_c["valor"] / total if total else 0.0
-            st.dataframe(por_c.rename(columns={"_c": "Concepto de gasto", "valor": "Valor", "movimientos": "Movimientos", "sispo": "De SISPO"}),
-                         hide_index=True, width="stretch", height=min(40 + 35 * len(por_c), 420), column_config={
-                "Valor": st.column_config.NumberColumn("Valor", format="accounting"),
-                "% del total": st.column_config.ProgressColumn("% del total", format="percent", min_value=0.0, max_value=1.0)})
-            st.caption("Este consolidado se calcula con los movimientos de la pestaña «Movimientos»; filtra allí para ver el detalle de un concepto.")
-        with tab_mov:
-            cols = [c for c in (list(t.columns) if preset == "Todas" else COLUMNAS_DETALLE[preset]) if c in v.columns]
-            if preset == "Todas":
-                cols = ["Compañía", "Mes", "Fuente", "Placa", "Concepto de gasto", "Clasificado por"] + [c for c in cols if c not in (
-                    "Compañía", "Mes", "Fuente", "Placa", "Concepto de gasto", "Clasificado por")]
-            elif len(S.sel) > 1:
-                cols = ["Compañía"] + cols
-            vista = v[cols].sort_values("Fecha de documento" if "Fecha de documento" in cols else cols[0], ascending=False, kind="stable")
-            cfg = {c: st.column_config.TextColumn(c, help=AYUDA_DETALLE.get(c)) for c in cols}
-            for c in cols:
-                if c in L.SAP_FECHAS:
-                    cfg[c] = st.column_config.DateColumn(c, format="DD/MM/YYYY", help=AYUDA_DETALLE.get(c))
-            if "Valor/mon.inf." in cols:
-                cfg["Valor/mon.inf."] = st.column_config.NumberColumn("Valor/mon.inf.", format="accounting", help=AYUDA_DETALLE["Valor/mon.inf."])
-            if "Cantidad" in cols:
-                cfg["Cantidad"] = st.column_config.NumberColumn("Cantidad", format="%g")
-            if "TEXTO" in cols:
-                cfg["TEXTO"] = st.column_config.TextColumn("TEXTO", width="large")
-            st.dataframe(vista, hide_index=True, width="stretch", height=min(40 + 35 * max(len(vista), 1), 480), column_config=cfg)
-            st.caption("Valores con el signo de SAP. Los renglones «SISPO» son salidas de inventario con su kardex; los «SAP», movimientos contables. "
-                       "El menú de la tabla permite ordenar, buscar, ocultar columnas y descargar lo que ves.")
-
-
 def _auditoria(S, m: pd.DataFrame, clave: str, archivo: str):
     """Tabla plana de los movimientos de la pestaña (con los mismos filtros que las cifras), para auditar y descargar."""
     if not S.es_admin:                                       # el detalle de movimientos es solo del administrador
@@ -1693,10 +1558,6 @@ def _tab_flota(S):
         dp, de = tot["presupuesto"] - esperado["presupuesto"], tot["ejecutado"] - esperado["ejecutado"]
         if abs(dp) >= 1 or abs(de) >= 1:
             st.error(f"Los indicadores no coinciden con Placas + Generales: presupuesto {E.pesos(dp)}, ejecutado {E.pesos(de)}.")
-    base_det = m[m["concepto"].isin(set(t["concepto"]))] if est_f else m
-    if len(g_gen):
-        base_det = pd.concat([base_det, mg[mg["concepto"].isin(set(g_gen["concepto"]))]], ignore_index=True)
-    _detalle_flota(S, base_det, float(tot["ejecutado"]), filtrado=bool(conc_f or est_f or S.placa))
     with st.container(key="mt_card_tipo_veh"):
         titulo_tarjeta("Por tipo de vehículo", f"{S.escenario} · ejecutado {S.hasta}. Cada tipo se abre en sus placas. Barra: relleno = ejecutado, marca = presupuesto.")
         filas_t = []
@@ -1718,15 +1579,6 @@ def _tab_flota(S):
                                              sub=_categoria_placa(S, n)) for n in top], "Placa", total=False))
         else:
             st.caption("Aún no hay presupuesto ni ejecución por tipo de vehículo.")
-    with st.container(key="mt_card_graf_placas"):
-        titulo_tarjeta("Conceptos de gasto que más pesan", "Presupuesto, ejecutado, saldo y participación en una sola línea" + (" · cada concepto se abre por compañía" if S.multi else ""))
-        fc = _filas_visual(t[["concepto", "presupuesto", "ejecutado"]],
-                           por_empresa={e: S.vistas_emp[e]["por_concepto"] for e in S.sel} if S.multi else None)
-        if fc:
-            st.html(E.tabla_visual(fc, "Concepto de gasto"))
-            _participacion([(f["nombre"], f["ejecutado"]) for f in fc], "Participación de cada concepto en el gasto ejecutado")
-        else:
-            st.caption("Sin presupuesto ni ejecución por concepto para los filtros elegidos.")
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
 
 
