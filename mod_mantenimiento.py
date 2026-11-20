@@ -2419,6 +2419,61 @@ def _sispo_periodos(S, maestro: pd.DataFrame):
 
 
 # ================================================================== rubro completo: Mantenimiento y Contenedores
+def _detallar_genericos(S, ejec: pd.DataFrame, empresa: str) -> pd.DataFrame:
+    """Solo para el archivo de ejecución: los genéricos «Salida de inventario…» de SAP que todavía siguen en `ejec` (porque SISPO no se
+    aplicó en Mantenimiento, o se aplicó solo a una parte de los centros de costo) se cambian por el detalle del SISPO GUARDADO en
+    Administración, línea por línea. No exige que el SISPO esté aplicado ni clasificado: una referencia sin concepto sale como
+    «PENDIENTE DE CLASIFICACIÓN» y una sin placa, como «SIN PLACA IDENTIFICADA»; el archivo trae el detalle de todos modos.
+    Un centro de costo solo se reemplaza si SISPO y SAP suman lo mismo (diferencia de redondeo de hasta $1, que se lleva a la línea de
+    mayor valor): así el total nunca cambia. Lo que no cuadra o no tiene SISPO guardado queda como SAP, y se avisa aparte."""
+    import sispo_fuente
+    if "llave" not in ejec:
+        ejec = ejec.assign(llave=L.llave_movimiento(ejec.assign(empresa=empresa)))
+    es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+    gen = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)]
+    if gen.empty:
+        return ejec
+    anio, maestro = int(S.cfg["anio"]), None
+    for m in sorted(pd.to_numeric(gen["mes"], errors="coerce").dropna().astype(int).unique()):
+        per = anio * 100 + int(m)
+        up = sispo_fuente.abrir(S.ctx.leer, empresa, per)
+        if up is None:
+            continue
+        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS)
+        if lin.empty:
+            continue
+        p = lin["fecha"].dt.strftime("%Y%m").fillna("")
+        if "cierre" in lin:
+            p = lin["cierre"].where(lin["cierre"].str.fullmatch(r"\d{6}"), p)
+        lin = lin[p == str(per)].copy()
+        es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+        lin = lin[~("Kardex " + lin["id_kardex"].astype(str)).isin(set(ejec.loc[es_sp, "documento"].astype(str)))]   # nada se cuenta dos veces
+        rep = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)
+                   & (pd.to_numeric(ejec["mes"], errors="coerce") == m)].copy()
+        rep = rep.assign(empresa=empresa, cuenta=L.cuenta_sap(rep))
+        rep = rep[rep["cuenta"].notna()]
+        if lin.empty or rep.empty:
+            continue
+        if "gerencia" not in rep:
+            rep["gerencia"] = ""
+        kl = pd.Series(list(zip(lin["cuenta"], lin["cc_codigo"].fillna("").astype(str).str.strip().str.upper())), index=lin.index)
+        kr = pd.Series(list(zip(rep["cuenta"], rep["cc"].fillna("").astype(str).str.strip().str.upper())), index=rep.index)
+        v = pd.Series([-L.centavos(x) for x in lin["costo_con_iva"]], index=lin.index, dtype="int64")
+        sap_c = pd.Series([L.centavos(x) for x in pd.to_numeric(rep["valor"], errors="coerce").fillna(0.0)], index=rep.index).groupby(kr).sum()
+        for k, objetivo in sap_c.items():
+            idx = kl.index[kl == k]
+            d = int(objetivo) - int(v[idx].sum()) if len(idx) else 0
+            if d and L.cuadra_c(d):
+                v[v[idx].abs().idxmax()] += d
+        if maestro is None:
+            maestro = S.ctx.leer("SELECT codigo, articulo, concepto, fecha, categoria FROM mtto_sispo_ref")
+        lin = L.sispo_cruzar_cuentas(L.sispo_placas(lin, S.registro_placas), maestro, _catalogos_cuentas(S))
+        lin = lin.assign(empresa=empresa, periodo=per, cuenta_nombre=lin["cuenta"], valor_sap=v / 100,
+                         fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"))
+        ejec = L.sispo_superponer(ejec, lin, rep, empresa, parcial=True)
+    return ejec
+
+
 def _rubro(S, empresa: str, detalle_flota: bool = False):
     """Presupuesto y ejecución (sin raw) de todos los sub-rubros del rubro de la flota para UNA compañía: es la fuente común de
     la pestaña Mantenimiento, de Contenedores y del soporte de ejecución. Respeta la gerencia de quien consulta y excluye los
@@ -2443,6 +2498,8 @@ def _rubro(S, empresa: str, detalle_flota: bool = False):
                 ejec = L.sispo_superponer(ejec, *fuente, empresa, parcial=True)
         else:                                           # cuentas reclasificadas con SISPO (Maquinaria, Reparaciones locativas…): detalle en vez del genérico
             ejec = L.sispo_superponer(ejec, *S.sispo_otras, empresa)
+    if detalle_flota and len(ejec):                      # lo que SISPO aún no reemplazó: se detalla con el SISPO guardado, aunque no esté clasificado
+        ejec = _detallar_genericos(S, ejec, empresa)
     if not S.ver_todo:                                       # quien no ve todo, solo lo suyo
         ppto = ppto[asignacion.columna(ppto, S.asig) == S.ctx.usuario] if len(ppto) else ppto
         ejec = _con_gerencia(ejec, S.asig)
@@ -2635,7 +2692,7 @@ def _descarga_soporte(S0):
                                 f"{S.hasta_mes:02d}_{e}_Archivo_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
                                 key=f"mt_soporte_{e}", disabled=vacio,
                                 help="Hoja «Resumen»: presupuesto de todos los meses y ejecución mes a mes, por sub-rubro. "
-                                     "Hoja «Movimientos»: todos los movimientos que componen esa ejecución (con el detalle de las salidas de inventario de Flota).")
+                                     "Hoja «Movimientos»: todos los movimientos que componen esa ejecución, con las salidas de inventario detalladas por SISPO (aunque no estén clasificadas).")
 
 
 def _tab_mantenimiento(S):
