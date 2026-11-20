@@ -2165,13 +2165,123 @@ def _cargar_mantenimiento_operaciones(ctx):
         operaciones.admin_revision_tecnica(ctx)
 
 
+def _ejecuciones(ctx):
+    """Vista central (solo lectura) de las ejecuciones que ya están cargadas y procesadas: SAP por rubro y mes, y el estado de cada periodo
+    (SISPO guardado, lo aplicado en Mantenimiento y en Operaciones). Todo sale de las tablas existentes con consultas agregadas; no carga
+    ni recalcula nada, así que no puede diferir de lo que muestran los módulos."""
+    leer = ctx.leer
+    mod_mantenimiento._asegurar_tablas(ctx)
+    operaciones._asegurar_tablas(ctx)
+    anios = leer("SELECT DISTINCT anio FROM ejecucion WHERE anio IS NOT NULL ORDER BY anio DESC")["anio"].astype(int).tolist()
+    if not anios:
+        st.info("Aún no hay ejecución cargada. Se carga en «Presupuesto» → «Ejecución SAP».", icon=":material/info:")
+        return
+    c1, c2 = st.columns([1, 3], vertical_alignment="bottom")
+    anio = c1.selectbox("Año", anios, key="ej_anio")
+    emp_sel = c2.segmented_control("Compañía", ["Todas", *EMPRESAS], default="Todas", key="ej_empresa",
+                                   format_func=lambda x: x if x == "Todas" else f"{x} · {EMPRESAS[x]}") or "Todas"
+    empresas = list(EMPRESAS) if emp_sel == "Todas" else [emp_sel]
+    ph = ",".join("?" * len(empresas))
+    sap = leer(f"SELECT empresa, mes, codigo, rubro, COUNT(*) AS lineas, SUM(valor) AS valor FROM ejecucion "
+               f"WHERE anio=? AND empresa IN ({ph}) GROUP BY empresa, mes, codigo, rubro", (anio, *empresas))
+    if sap.empty:
+        st.info(f"No hay ejecución de SAP de {emp_sel} en {anio}.", icon=":material/info:")
+        return
+    sap["mes"] = pd.to_numeric(sap["mes"], errors="coerce").fillna(0).astype(int)
+    ult = int(sap.loc[sap["valor"].abs() > 0, "mes"].max()) if (sap["valor"].abs() > 0).any() else int(sap["mes"].max())
+    lo, hi = anio * 100, anio * 100 + 99
+    try:
+        archivos = sispo_fuente.listar(leer)
+    except Exception:
+        archivos = pd.DataFrame(columns=["empresa", "periodo", "archivo", "usuario", "fecha", "tamano"])
+    archivos = archivos[archivos["empresa"].isin(empresas) & archivos["periodo"].between(lo, hi)]
+    mt = leer(f"SELECT empresa, periodo, SUM(n_lineas) AS lineas, SUM(valor_sispo) AS valor, MAX(estado) AS estado FROM mtto_sispo_periodo "
+              f"WHERE periodo BETWEEN ? AND ? AND empresa IN ({ph}) GROUP BY empresa, periodo", (lo, hi, *empresas))
+    op = leer(f"SELECT p.empresa, p.periodo, p.n_lineas AS lineas, COALESCE(v.valor, 0) AS valor FROM oper_sispo_periodo p LEFT JOIN "
+              f"(SELECT empresa, periodo, SUM(valor) AS valor FROM oper_sispo WHERE hoja <> ? GROUP BY empresa, periodo) v "
+              f"ON v.empresa = p.empresa AND v.periodo = p.periodo WHERE p.periodo BETWEEN ? AND ? AND p.empresa IN ({ph})",
+              (sispo_oper.HOJA_PAPELERIA, lo, hi, *empresas))
+
+    st.html(E.kpis([
+        dict(label="Líneas de SAP cargadas", valor=f"{int(sap['lineas'].sum()):,}".replace(",", "."), sub=f"{emp_sel} · {anio}", icono="receipt",
+             color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="Ejecución SAP (neta)", valor=E.millones(sap["valor"].sum()), sub="Todos los rubros cargados", icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="Último mes con ejecución", valor=MESES_L[ult - 1].capitalize() if 1 <= ult <= 12 else "—", sub=f"{sap['mes'].nunique()} meses con datos",
+             icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE),
+        dict(label="SISPO guardados", valor=str(len(archivos)), sub="Archivos del año (compañía × mes)", icono="check", color=E.AZUL, fondo=E.AZUL_SUAVE)]))
+
+    with st.container(key="card_ej_rubro"):
+        titulo_tarjeta("Ejecución de SAP por rubro y mes", f"{emp_sel} · {anio} · valores netos; el detalle de cada rubro está en su módulo")
+        cod, rub = sap["codigo"].fillna("").astype(str).str.strip(), sap["rubro"].fillna("").astype(str).str.strip()
+        sap["Rubro"] = [r if (not c or r.startswith(c)) else f"{c} · {r}".strip(" ·") for c, r in zip(cod, rub)]
+        piv = sap.pivot_table(index="Rubro", columns="mes", values="valor", aggfunc="sum", fill_value=0.0)
+        piv.columns = [MESES_L[int(m) - 1].capitalize() if 1 <= int(m) <= 12 else f"Mes {int(m)}" for m in piv.columns]
+        piv["Total"] = piv.sum(axis=1)
+        piv = piv.sort_values("Total", ascending=False)
+        piv.loc["TOTAL"] = piv.sum()
+        seg = E.segmentos_top([(r, v) for r, v in piv["Total"].drop("TOTAL").items()])
+        if seg:
+            st.markdown("**Participación de cada rubro en la ejecución**")
+            st.html(E.barra_segmentada(seg))
+        st.dataframe(piv.reset_index(), hide_index=True, width="stretch", height=min(40 + 35 * len(piv), 460),
+                     column_config={c: st.column_config.NumberColumn(c, format="accounting") for c in piv.columns})
+
+    with st.container(key="card_ej_estado"):
+        titulo_tarjeta("Estado de cada periodo", "Qué se cargó y qué se aplicó por compañía y mes. Si falta algo, se carga en «Mantenimiento y Operaciones» → «SISPO del mes».")
+        filas = []
+        for e in empresas:
+            for m in sorted(set(sap.loc[sap["empresa"] == e, "mes"])):
+                per = anio * 100 + int(m)
+                s_ = sap[(sap["empresa"] == e) & (sap["mes"] == m)]
+                a = archivos[(archivos["empresa"] == e) & (archivos["periodo"] == per)]
+                x = mt[(mt["empresa"] == e) & (mt["periodo"] == per)]
+                o = op[(op["empresa"] == e) & (op["periodo"] == per)]
+                falta = [n for n, ok in (("SISPO guardado", len(a)), ("Mantenimiento", len(x)), ("Operaciones", len(o))) if not ok]
+                filas.append({"Compañía": e, "Mes": MESES_L[int(m) - 1].capitalize() if 1 <= int(m) <= 12 else f"Mes {int(m)}",
+                              "SAP · líneas": int(s_["lineas"].sum()), "SAP · $": float(s_["valor"].sum()),
+                              "SISPO guardado": (str(a["archivo"].iloc[0]) if len(a) else "—"),
+                              "Mantenimiento · líneas": int(x["lineas"].sum()) if len(x) else 0,
+                              "Mantenimiento · $ SISPO": float(x["valor"].sum()) if len(x) else 0.0,
+                              "Operaciones · líneas": int(o["lineas"].sum()) if len(o) else 0,
+                              "Operaciones · $ (pesos)": float(o["valor"].sum()) if len(o) else 0.0,
+                              "Estado": "Completo" if not falta else "Falta: " + ", ".join(falta)})
+        t = pd.DataFrame(filas)
+        if t.empty:
+            st.caption("No hay periodos para mostrar.")
+        else:
+            nc = st.column_config.NumberColumn
+            st.dataframe(t, hide_index=True, width="stretch", height=min(40 + 35 * len(t), 420), column_config={
+                "SAP · líneas": nc(format="localized"), "SAP · $": nc(format="accounting"),
+                "Mantenimiento · líneas": nc(format="localized"), "Mantenimiento · $ SISPO": nc(format="accounting"),
+                "Operaciones · líneas": nc(format="localized"), "Operaciones · $ (pesos)": nc(format="accounting"),
+                "Estado": st.column_config.TextColumn("Estado", width="medium")})
+            pend = t[t["Estado"] != "Completo"]
+            if len(pend):
+                st.warning(f"{len(pend)} de {len(t)} periodos tienen algo pendiente. Un SISPO guardado alimenta Mantenimiento y Operaciones; "
+                           "falta «aplicarlo» cuando la columna de líneas está en 0.", icon=":material/rule:")
+            st.caption("«Mantenimiento · $ SISPO» y «Operaciones · $» son lo que cada módulo guardó del SISPO (Operaciones, solo Consumibles, Herramientas y Bolsas). "
+                       "La ejecución final de cada módulo se ve en su página.")
+
+    with st.container(key="card_ej_cargas"):
+        titulo_tarjeta("Últimas cargas de ejecución", "Del historial de cargas (SAP y SISPO)")
+        h = leer("SELECT fecha AS Fecha, usuario AS Usuario, tipo AS Tipo, archivo AS Archivo, detalle AS Detalle FROM cargas "
+                 "WHERE tipo IN ('Ejecución', 'SISPO', 'Reclasificación SISPO') ORDER BY rowid DESC LIMIT 15")
+        if h.empty:
+            st.caption("Aún no hay cargas registradas.")
+        else:
+            st.dataframe(h, hide_index=True, width="stretch", height=min(40 + 35 * len(h), 420))
+
+
 def mostrar(ctx):
     con, leer, usuario, registrar_carga = ctx.con, ctx.leer, ctx.usuario, ctx.registrar_carga
     anio = (leer("SELECT MAX(anio) a FROM presupuesto")["a"][0] or datetime.now().year)
     st.html(E.encabezado("Administración", "Carga de archivos, asignación por gerencia, historial y respaldo", []))
-    t1, t2, t6, t8, t3, t9, t10, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
+    t1, t11, t2, t6, t8, t3, t9, t10, t5, t4 = st.tabs(["Presupuesto", "Ejecuciones", "Flujo de caja", "Estados financieros", "Cartera",
                                               "Combustible", "Mantenimiento y Operaciones", "Corte y poda", "Nómina",
                                               "Historial y respaldo"], on_change="rerun", key="adm_tabs")
+    with t11:
+        if t11.open:   # solo se calcula la pestaña abierta
+            _ejecuciones(ctx)
     with t6:
         if t6.open:   # solo se calcula la pestaña abierta
             _empresa_adm(ctx)

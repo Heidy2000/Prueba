@@ -1298,54 +1298,6 @@ def _X_anchos(ws, anchos):
 
 
 # ---------------------------------------------------------------------------------------------------------------- resumen
-def _X_matriz(ws, fila, meses, filas, fmt, titulo_col, n_corte):
-    """Tabla por mes: para cada mes, Presupuesto · Ejecutado · % de cumplimiento, y al final el total al corte.
-    `filas` = [(etiqueta, [presupuesto por mes], [ejecutado por mes o None después del corte])]. Última fila: Total."""
-    n = len(meses)
-    c = ws.cell(fila, 1, titulo_col)
-    ws.merge_cells(start_row=fila, start_column=1, end_row=fila + 1, end_column=1)
-    c.font, c.fill, c.border = _X_f(True, 10, _X_BLANCO), _X_fill(_X_AZUL), _X_BORDE
-    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for j, m in enumerate(meses + ["Total al corte"]):
-        col = 2 + 3 * j
-        ws.merge_cells(start_row=fila, start_column=col, end_row=fila, end_column=col + 2)
-        h = ws.cell(fila, col, m)
-        h.font, h.alignment = _X_f(True, 10, _X_BLANCO), Alignment(horizontal="center", vertical="center")
-        for k, t in enumerate(("Presupuesto", "Ejecutado", "% cumplimiento")):
-            x = ws.cell(fila + 1, col + k, t)
-            x.font, x.alignment = _X_f(True, 9, _X_BLANCO), Alignment(horizontal="center", vertical="center", wrap_text=True)
-        for k in range(3):
-            for rr in (fila, fila + 1):
-                cc = ws.cell(rr, col + k)
-                cc.fill, cc.border = _X_fill(_X_NAVY if j == n else _X_AZUL), _X_BORDE
-        for k in range(3):
-            if ws.column_dimensions[get_column_letter(col + k)].width in (None, 13.0) or col + k > 12:
-                ws.column_dimensions[get_column_letter(col + k)].width = max(ws.column_dimensions[get_column_letter(col + k)].width or 0, 16)
-    ws.row_dimensions[fila + 1].height = 28
-    fila += 2
-
-    def pct(p, e):
-        return None if e is None or not p or p <= 0 else e / p
-
-    def escribir(etq, pl, el, estilo):
-        nonlocal fila
-        vals = [etq]
-        for j in range(n):
-            vals += [pl[j], el[j], pct(pl[j], el[j])]
-        pt = sum(pl[:n_corte])
-        et = sum(v for v in el[:n_corte] if v is not None)
-        vals += [pt, et, pct(pt, et)]
-        fm = [None] + [fmt, fmt, _X_F_PCT] * (n + 1)
-        fila = _X_escribir(ws, fila, vals, fm, estilo)
-
-    for etq, pl, el in filas:
-        escribir(etq, pl, el, None)
-    tp = [sum(f[1][j] for f in filas) for j in range(n)]
-    te = [None if all(f[2][j] is None for f in filas) else sum(f[2][j] or 0.0 for f in filas) for j in range(n)]
-    escribir("Total", tp, te, "tot")
-    return fila + 1
-
-
 def _X_hoja_resumen(wb, meta, r, secciones=None):
     ws = wb.active
     ws.title = "1 Resumen"
@@ -1432,11 +1384,6 @@ def _X_hoja_detalle(wb, meta, s):
         fila = _X_escribir(ws, fila, ["Total", it["cantidad"].sum(), it["presupuesto_esc"].sum(), pt, _X_num(it["ejecutado"].sum() / pt) if pt > 0 else None,
                                     it["ejecutado"].sum(), it["variacion"].sum(), None], fi, "tot")
     fila += 1
-
-    # --- por ítem y por mes
-    im = s["items_mes"]
-    fila = _X_seccion(ws, fila, f"Presupuesto mensual, ejecución mensual y % de cumplimiento por ítem · {u}", ancho)
-    fila = _X_matriz(ws, fila, im["meses"], im["filas"], fv, "Ítem", im["n_corte"])
 
     # --- movimientos con subtotal por mes y total
     mv = s["movs"]
