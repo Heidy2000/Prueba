@@ -41,6 +41,63 @@ def estilo_grafico(fig, alto=320):
     return fig
 
 
+def grafico_distribucion(etiquetas, valores, alto=300, max_partes=7):
+    """Dona con la distribución del costo ejecutado (millones de pesos). Agrupa lo menor en «Otros»; ignora valores <= 0.
+    Devuelve False (sin dibujar) si no hay nada que repartir."""
+    import plotly.graph_objects as go
+    d = pd.DataFrame({"e": [str(x) for x in etiquetas], "v": pd.to_numeric(pd.Series(list(valores)), errors="coerce").fillna(0.0)})
+    d = d[d["v"] > 0].groupby("e", as_index=False)["v"].sum().sort_values("v", ascending=False)
+    if d.empty:
+        return False
+    if len(d) > max_partes:
+        d = pd.concat([d.head(max_partes - 1), pd.DataFrame({"e": ["Otros"], "v": [d["v"].iloc[max_partes - 1:].sum()]})], ignore_index=True)
+    fig = go.Figure(go.Pie(labels=[x[:40] for x in d["e"]], values=d["v"] / 1e6, hole=.55, sort=False, textinfo="percent",
+                           hovertemplate="%{label}: %{value:,.1f} M (%{percent})<extra></extra>"))
+    fig.update_layout(legend=dict(orientation="v", y=.5, x=1.02), showlegend=True)
+    st.plotly_chart(estilo_grafico(fig, alto), width="stretch", config={"displayModeBar": False})
+    return True
+
+
+def texto_periodo(m0: int, hasta_mes: int, anio: int) -> str:
+    """«octubre 2026», «septiembre–octubre 2026» o «a octubre 2026» (si el período empieza en enero)."""
+    if m0 == hasta_mes:
+        return f"{MESES_L[hasta_mes - 1]} {anio}"
+    return f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {anio}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {anio}"
+
+
+COLOR_EMPRESA = {"ALDC": "#1f5fc4", "ALSM": "#e8892c"}     # los mismos de Combustible: ALDC azul, ALSM naranja
+COLOR_PPTO_LINEA = "#0f2a4a"
+
+
+def figura_ppto_ejec_empresas(x, ppto, ejec_por_empresa: dict, *, horizontal=False, sufijo=" M", modo_ppto="linea", nombre_ppto="Presupuesto"):
+    """Presupuesto vs ejecutado cuando se ven varias compañías: la EJECUCIÓN va en barras apiladas, una porción por compañía (cada una con su
+    color), y el PRESUPUESTO (total) como línea con puntos (`modo_ppto="linea"`, para series de tiempo) o como una marca sobre la barra
+    (`"marca"`, para categorías). Así se ve a la vez cuánto pesa cada compañía y cuánto falta o sobra frente al presupuesto.
+    `ejec_por_empresa`: {compañía: valores}; los valores ya vienen en las unidades del gráfico (p. ej. millones)."""
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    for i, (emp, y) in enumerate(ejec_por_empresa.items()):
+        color = COLOR_EMPRESA.get(emp, ["#2e9e5b", "#8a5cc4", "#9aa7b8"][i % 3])
+        ejes = dict(y=list(x), x=list(y), orientation="h") if horizontal else dict(x=list(x), y=list(y))
+        fig.add_bar(name=f"Ejecutado {emp}", marker_color=color, marker_line_width=0,
+                    hovertemplate="%{x:,.1f}" + sufijo + f"<extra>Ejecutado {emp}</extra>" if horizontal else "%{y:,.1f}" + sufijo + f"<extra>Ejecutado {emp}</extra>",
+                    **ejes)
+    marca = dict(color=COLOR_PPTO_LINEA, width=3)
+    if modo_ppto == "linea":
+        extra = dict(x=list(x), y=list(ppto), mode="lines+markers", line=dict(color=COLOR_PPTO_LINEA, width=2.5), marker=dict(size=6))
+    elif horizontal:
+        extra = dict(y=list(x), x=list(ppto), mode="markers", marker=dict(symbol="line-ns", size=20, line=marca))
+    else:
+        extra = dict(x=list(x), y=list(ppto), mode="markers", marker=dict(symbol="line-ew", size=26, line=marca))
+    fig.add_scatter(name=nombre_ppto, hovertemplate=("%{x:,.1f}" if horizontal else "%{y:,.1f}") + sufijo + f"<extra>{nombre_ppto}</extra>", **extra)
+    fig.update_layout(barmode="stack", bargap=.3, legend=dict(orientation="h", y=1.12, x=0))
+    if horizontal:
+        fig.update_layout(xaxis=dict(tickformat=",.0f", ticksuffix=sufijo), yaxis=dict(type="category"))
+    else:
+        fig.update_layout(yaxis=dict(tickformat=",.0f", ticksuffix=sufijo, rangemode="tozero"))
+    return fig
+
+
 def titulo_tarjeta(t, s=""):
     st.html(f'<p class="nf-card-t">{t}</p>' + (f'<p class="nf-card-s">{s}</p>' if s else ""))
 

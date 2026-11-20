@@ -109,16 +109,121 @@ def buscador_placas(placas: list[str]):
     return buscar
 
 
-def asignar_placas(ej: pd.DataFrame, placas: list[str]) -> pd.DataFrame:
-    """Agrega las columnas placa y placa_estado a los movimientos, según la columna texto."""
+METODO_TEXTO = "PLACA EXTRAÍDA DEL TEXTO"
+METODO_INTERNO = "IDENTIFICADA POR NÚMERO INTERNO"
+METODO_PENDIENTE = "PENDIENTE DE IDENTIFICACIÓN"
+METODO_MANUAL = "ASIGNADA MANUALMENTE"
+ESTADO_POR_INTERNO = "Identificada por N° interno"
+
+# Un número del texto solo se considera N° interno si ADEMÁS está en el maestro. Con marcador (INTERNO, INT, N°, NRO, MOVIL, UNIDAD,
+# EQUIPO, VEHICULO) vale en cualquier parte del texto; suelto solo vale en los últimos VENTANA_INTERNO caracteres y si no parece
+# factura, cantidad, medida, porcentaje o fecha.
+VENTANA_INTERNO = 25
+_RE_MARCADOR = re.compile(r"(?<![A-Z0-9])(?:(?:N[°º]\s*INTERNO|NRO\.?\s*INTERNO|NUM(?:ERO)?\.?\s*INTERNO|INTERNO|INT|N[°º]|NRO|NUM|"
+                          r"MOVIL|UNIDAD|EQUIPO|VEHICULO|VEH)(?![A-Z])[\s:#.\-]*)+([A-Z0-9]{1,8})(?![A-Z0-9])")
+_RE_SUELTO = re.compile(r"(?<![A-Z0-9/.,\-])([A-Z0-9]{2,8})(?![A-Z0-9/.,%\-])")
+_ANTES_NO_INTERNO = re.compile(r"(?:FACT(?:URA)?|FV|FE|FC|OC|OP|OT|DOC(?:UMENTO)?|PEDIDO|REMISION|COT(?:IZACION)?|NIT|CC|PO|REF)\.?\s*[:#\-]?\s*$")
+_DESPUES_NO_INTERNO = re.compile(r"^\s*(?:UND|UNDS|UNID|UNIDADES|U|KG|KGS|GL|GLN|LT|LTS|MT|MTS|M|CM|MM|X|PZ|PZAS|HRS|H|DIAS)\b")
+
+
+def norm_interno(x) -> str:
+    """N° interno comparable: mayúsculas, sin espacios ni símbolos, y sin el «.0» ni los ceros a la izquierda de los numéricos
+    (' 0105 ', '105.0' y '105' son el mismo número). Vacío si no hay dato."""
+    t = _como_texto(x).strip()
+    t = re.sub(r"^(\d+)\.0+$", r"\1", t)
+    t = re.sub(r"[^A-Z0-9]", "", sin_tildes(t).upper())
+    return t.lstrip("0") if t.isdigit() else t
+
+
+def internos_maestro(registro: pd.DataFrame | None) -> dict[str, set[str]]:
+    """N° interno normalizado -> conjunto de placas que el maestro le asigna. Es la ÚNICA fuente de la relación interno-placa."""
+    out: dict[str, set[str]] = {}
+    if registro is None or registro.empty or "numero_interno" not in registro:
+        return out
+    for p, i in zip(registro["placa"].map(norm_placa), registro["numero_interno"].map(norm_interno)):
+        if p and i:
+            out.setdefault(i, set()).add(p)
+    return out
+
+
+def inconsistencias_maestro(registro: pd.DataFrame | None) -> pd.DataFrame:
+    """Filas del maestro que no permiten identificar con certeza: un N° interno con varias placas, o una placa con varios N° internos."""
+    cols = ["problema", "numero_interno", "placa", "detalle"]
+    if registro is None or registro.empty or "numero_interno" not in registro:
+        return pd.DataFrame(columns=cols)
+    r = pd.DataFrame({"placa": registro["placa"].map(norm_placa), "numero_interno": registro["numero_interno"].map(norm_interno)})
+    r = r[(r["placa"] != "") & (r["numero_interno"] != "")].drop_duplicates()
+    filas = []
+    for i, g in r.groupby("numero_interno"):
+        if g["placa"].nunique() > 1:
+            filas.append(("N° interno con varias placas", i, ", ".join(sorted(g["placa"])), "No se asigna placa por este N° interno."))
+    for p, g in r.groupby("placa"):
+        if g["numero_interno"].nunique() > 1:
+            filas.append(("Placa con varios N° internos", ", ".join(sorted(g["numero_interno"])), p, "Revisar el maestro."))
+    return pd.DataFrame(filas, columns=cols)
+
+
+def internos_en_texto(texto, internos: dict) -> list[tuple[str, bool]]:
+    """N° internos del maestro que aparecen en el texto: [(N° interno, con_marcador)]. Nunca se toma un número que no esté en el
+    maestro. Si aparecen varios distintos (con marcador o sueltos), el llamador los trata como ambiguos."""
+    t = norm_texto(texto)
+    if not t or not internos:
+        return []
+    con = {norm_interno(m.group(1)) for m in _RE_MARCADOR.finditer(t)} & set(internos)
+    sueltos = set()
+    for m in _RE_SUELTO.finditer(t, max(0, len(t) - VENTANA_INTERNO)):
+        v = norm_interno(m.group(1))
+        if v in internos and not _ANTES_NO_INTERNO.search(t[:m.start()]) and not _DESPUES_NO_INTERNO.match(t[m.end():]):
+            sueltos.add(v)
+    return [(i, True) for i in sorted(con)] + [(i, False) for i in sorted(sueltos - con)]
+
+
+def identificar_vehiculo(texto, buscar, internos: dict) -> dict:
+    """Identifica el vehículo de UN movimiento: 1) placa del texto (lógica de siempre); 2) N° interno del texto contra el maestro.
+    Devuelve placa, placa_estado, placa_metodo, numero_interno_texto y placa_validacion. Nunca inventa una placa."""
+    placa, estado = buscar(texto)
+    hallados = internos_en_texto(texto, internos)
+    ids = [i for i, _ in hallados]
+    nota = "" if not hallados else ("" if all(c for _, c in hallados) else " (número suelto al final del texto)")
+    r = dict(placa=placa, placa_estado=estado, placa_metodo=METODO_TEXTO, numero_interno_texto=", ".join(ids), placa_validacion="")
+    if placa != SIN_PLACA:                              # hay placa en el texto: se conserva y se valida contra el N° interno
+        if len(ids) == 1:
+            ps = internos[ids[0]]
+            if len(ps) > 1:
+                r["placa_validacion"] = f"N° interno {ids[0]} tiene varias placas en el maestro; no se pudo validar"
+            elif placa in ps:
+                r["placa_validacion"] = "Coincide con el N° interno" + nota
+            else:
+                r["placa_validacion"] = f"NO COINCIDE: el N° interno {ids[0]} es de {next(iter(ps))}; se conservó la placa del texto" + nota
+        elif len(ids) > 1:
+            r["placa_validacion"] = "Varios N° internos en el texto; no se pudo validar"
+        return r
+    r["placa_metodo"] = METODO_PENDIENTE
+    if len(ids) == 1:
+        ps = internos[ids[0]]
+        if len(ps) == 1:
+            r.update(placa=next(iter(ps)), placa_estado=ESTADO_POR_INTERNO, placa_metodo=METODO_INTERNO,
+                     placa_validacion="Placa tomada del maestro por el N° interno" + nota)
+        else:
+            r["placa_validacion"] = f"INCONSISTENCIA: el N° interno {ids[0]} tiene varias placas en el maestro ({', '.join(sorted(ps))}); no se asignó"
+    elif len(ids) > 1:
+        r["placa_validacion"] = "Varios N° internos distintos en el texto; no se asignó placa"
+    return r
+
+
+def asignar_placas(ej: pd.DataFrame, placas: list[str], registro: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Agrega placa, placa_estado, placa_metodo, numero_interno_texto y placa_validacion a los movimientos, según la columna texto.
+    Con `registro` (el maestro: placa y numero_interno) además identifica por N° interno cuando el texto no trae placa."""
     ej = ej.copy()
+    nuevas = ["placa", "placa_estado", "placa_metodo", "numero_interno_texto", "placa_validacion"]
     if ej.empty:
-        return ej.assign(placa=pd.Series(dtype=str), placa_estado=pd.Series(dtype=str))
+        return ej.assign(**{c: pd.Series(dtype=str) for c in nuevas})
     buscar = buscador_placas(placas)
+    internos = internos_maestro(registro)
     textos = ej["texto"].fillna("").astype(str)          # el texto vacío de SAP puede venir como NaN/None
-    cache = {t: buscar(t) for t in textos.unique()}
-    ej["placa"] = textos.map(lambda t: cache[t][0])
-    ej["placa_estado"] = textos.map(lambda t: cache[t][1])
+    cache = {t: identificar_vehiculo(t, buscar, internos) for t in textos.unique()}
+    for c in nuevas:
+        ej[c] = textos.map(lambda t: cache[t][c])
     return ej
 
 
@@ -264,13 +369,34 @@ def ts_periodo(ts_mensual: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return t[cols]
 
 
+PATRON_TS_SAP = {CONCEPTO_SOAT: re.compile(r"SOAT|SEGURO OBLIGATORIO"),
+                 CONCEPTO_TECNO: re.compile(r"TECNOMEC|TECNO MEC|REVISION TECNICO|REV TECNICO")}
+
+
+def concepto_ts_sap(ej: pd.DataFrame) -> pd.Series:
+    """Concepto de Tecnomecánica/SOAT que SAP asigna al movimiento en su columna «BASE GASTOS EXPLOTACIO» (que la base guarda como
+    `sub_rubro`; `sub_rubro_sap` conserva el nombre original si el movimiento se pasó a otro sub-rubro). Es la fuente de verdad de estos
+    dos conceptos: '' si SAP no lo marca como SOAT ni Tecnomecánica."""
+    if ej.empty:
+        return pd.Series("", index=ej.index, dtype=object)
+    col = "sub_rubro_sap" if "sub_rubro_sap" in ej else ("sub_rubro" if "sub_rubro" in ej else None)
+    if col is None:
+        return pd.Series("", index=ej.index, dtype=object)
+    cache = {}
+    for s in ej[col].fillna("").astype(str).unique():
+        n = norm_texto(s)
+        cache[s] = next((c for c, p in PATRON_TS_SAP.items() if p.search(n)), "")
+    return ej[col].fillna("").astype(str).map(cache)
+
+
 def candidatos_ts(ej: pd.DataFrame) -> pd.Series:
-    """Movimientos cuyo texto o nombre de cuenta habla de SOAT o tecnomecánica (para traerlos aunque estén en otro sub-rubro)."""
+    """Movimientos que entran a Tecnomecánica/SOAT aunque estén en otro sub-rubro: los que SAP marca así en «BASE GASTOS EXPLOTACIO»
+    y, además, los que solo por su texto o nombre de cuenta hablan de SOAT o tecnomecánica."""
     if ej.empty:
         return pd.Series(False, index=ej.index)
     base = ej["texto"].fillna("").astype(str) + " " + (ej["cuenta_nombre"].fillna("").astype(str) if "cuenta_nombre" in ej else "")
     cache = {t: bool(PATRON_TS.search(norm_texto(t))) for t in base.unique()}
-    return base.map(cache)
+    return base.map(cache) | (concepto_ts_sap(ej) != "")
 
 
 def catalogo_conceptos(ppto: pd.DataFrame) -> list[str]:
@@ -406,6 +532,8 @@ def aplicar_placas_manuales(ej: pd.DataFrame, manual: pd.DataFrame | None) -> pd
     La firma de aprendizaje se calcula siempre con la placa detectada, nunca con la corregida."""
     ej = ej.copy()
     ej["placa_detectada"] = ej["placa"]
+    if "placa_metodo" in ej:                              # «detectada en el texto» es solo la del texto: la sacada del N° interno no cuenta
+        ej.loc[ej["placa_metodo"] == METODO_INTERNO, "placa_detectada"] = SIN_PLACA
     if ej.empty or manual is None or manual.empty or "placa" not in manual:
         return ej
     m = manual[manual["llave"].fillna("").ne("") & manual["placa"].fillna("").ne("")]
@@ -416,6 +544,8 @@ def aplicar_placas_manuales(ej: pd.DataFrame, manual: pd.DataFrame | None) -> pd
     hay = nueva.notna()
     ej.loc[hay, "placa"] = nueva[hay]
     ej.loc[hay, "placa_estado"] = "Asignada a mano"
+    if "placa_metodo" in ej:
+        ej.loc[hay, "placa_metodo"] = METODO_MANUAL
     return ej
 
 
@@ -490,7 +620,60 @@ def clasificar(ej: pd.DataFrame, reglas: pd.DataFrame, manual: pd.DataFrame | No
             res.append(cache[(t, v)])
     for i, c in enumerate(["concepto", "concepto_sugerido", "regla", "confianza", "tipo_clasif", "origen"]):
         ej[c] = [r[i] for r in res]
+    # SOAT y Tecnomecánica: manda la columna «BASE GASTOS EXPLOTACIO» de SAP (solo lo reclasificado a mano la supera)
+    ts = concepto_ts_sap(ej)
+    pone = (ts != "") & (ej["origen"] != "Manual") & ts.map(ok)
+    if pone.any():
+        ej.loc[pone, "concepto"] = ts[pone]
+        ej.loc[pone, "concepto_sugerido"] = ""
+        ej.loc[pone, "regla"] = None
+        ej.loc[pone, "confianza"] = "Alta"
+        ej.loc[pone, "tipo_clasif"] = "BASE GASTOS EXPLOTACIO (SAP)"
+        ej.loc[pone, "origen"] = "SAP"
     return ej
+
+
+def conciliar_ts(pool: pd.DataFrame, vigentes: pd.DataFrame, excluidos: pd.DataFrame, reemplazados: set, m0: int, hasta: int):
+    """Control de Tecnomecánica y SOAT contra SAP, por compañía y concepto. `pool` = movimientos de SAP con su llave (antes de clasificar);
+    `vigentes` = movimientos ya clasificados que alimentan la pantalla y el Excel. La diferencia (ejecución − SAP) se descompone en
+    sus causas; lo que no explican las causas queda en «sin explicar» y debe ser $0. Nada se ajusta para forzar la coincidencia.
+    Devuelve (resumen, detalle): `detalle` lista los movimientos de SAP que explican la diferencia o que merecen revisión."""
+    p = pool[(pool["mes"] >= m0) & (pool["mes"] <= hasta)] if len(pool) else pool
+    p = p.assign(concepto_sap=concepto_ts_sap(p)) if len(p) else p.assign(concepto_sap=pd.Series(dtype=str))
+    p = p[p["concepto_sap"] != ""]
+    k_vig, k_exc = set(vigentes["llave"]), set(excluidos["llave"]) if len(excluidos) else set()
+    concepto_de = dict(zip(vigentes["llave"], vigentes["concepto"]))
+    emps = sorted(set(pool["empresa"]) | set(vigentes["empresa"])) if len(pool) or len(vigentes) else []
+    filas, det = [], []
+    for emp in emps:
+        for c in CONCEPTOS_TS:
+            g = p[(p["empresa"] == emp) & (p["concepto_sap"] == c)]
+            ej = vigentes[(vigentes["empresa"] == emp) & (vigentes["concepto"] == c)]
+            sap_t, ej_t = float(g["valor"].sum()), float(ej["valor"].sum())
+            perdidos = g[~g["llave"].isin(k_vig | k_exc | reemplazados)]
+            excl = g[g["llave"].isin(k_exc)]
+            reemp = g[g["llave"].isin(reemplazados) & ~g["llave"].isin(k_vig)]
+            a_otro = g[g["llave"].isin(k_vig) & (g["llave"].map(concepto_de) != c)]
+            extra = ej[~ej["llave"].isin(set(g["llave"]))]
+            dups = int(ej["llave"].duplicated().sum())
+            dif = ej_t - sap_t
+            causas = (-float(perdidos["valor"].sum()) - float(excl["valor"].sum()) - float(reemp["valor"].sum())
+                      - float(a_otro["valor"].sum()) + float(extra["valor"].sum()))
+            filas.append({"empresa": emp, "concepto": c, "movimientos_sap": len(g), "total_sap": sap_t, "movimientos_ejecucion": len(ej),
+                          "total_ejecucion": ej_t, "diferencia": dif, "perdidos": len(perdidos), "excluidos_a_mano": len(excl),
+                          "reemplazados_sispo": len(reemp), "reclasificados_a_otro_concepto": len(a_otro),
+                          "no_marcados_en_sap": len(extra), "duplicados": dups,
+                          "pendientes": int((g["llave"].map(concepto_de) == PENDIENTE).sum()),
+                          "sin_correspondencia_sispo": int((~g["llave"].isin(reemplazados)).sum()), "sin_explicar": round(dif - causas, 2)})
+            for motivo, x in (("No llegó a la ejecución", perdidos), ("Excluido a mano", excl), ("Reemplazado por SISPO", reemp),
+                              ("Reclasificado a otro concepto", a_otro)):
+                if len(x):
+                    det.append(x.assign(motivo=motivo, concepto_ts=c))
+            if len(extra):
+                det.append(extra.assign(motivo="Clasificado aquí por texto o a mano; SAP no lo marca así", concepto_ts=c))
+    resumen = pd.DataFrame(filas)
+    detalle = pd.concat(det, ignore_index=True) if det else pd.DataFrame()
+    return resumen, detalle
 
 
 # ================================================================== indicadores
@@ -807,7 +990,8 @@ MESES_ABR = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct
 _ID = ["Compañía", "Grupo", "Placa", "N° interno", "Tipo de vehículo", "Concepto", "Descripción original (presupuesto)"]
 _RES = ["Presupuesto", "Ejecutado", "Saldo", "% ejecución", "Estado"]
 _MOV = ["Fecha", "Documento", "Proveedor", "Texto original del movimiento", "Valor movimiento", "Cuenta", "Centro de coste",
-        "Sub-rubro SAP", "Clasificado por", "Placa detectada en el texto", "ID del movimiento"]
+        "Sub-rubro SAP", "Clasificado por", "Placa detectada en el texto", "N° interno identificado", "Método de identificación",
+        "Validación placa / N° interno", "ID del movimiento"]
 
 
 def _filas_resumen(df: pd.DataFrame, empresa: str, grupo: pd.Series | str) -> pd.DataFrame:
@@ -825,6 +1009,8 @@ def _filas_resumen(df: pd.DataFrame, empresa: str, grupo: pd.Series | str) -> pd
 
 
 def _filas_movimiento(mv: pd.DataFrame, grupo: pd.Series | str, placa: pd.Series) -> pd.DataFrame:
+    if isinstance(grupo, str) and grupo == "Generales":     # los generales no son de un vehículo: no tienen método de identificación
+        mv = mv.assign(numero_interno_texto="", placa_metodo="", placa_validacion="")
     return pd.DataFrame({
         "Compañía": mv["empresa"].to_numpy(), "Grupo": grupo if isinstance(grupo, str) else grupo.to_numpy(),
         "Placa": placa.to_numpy(), "Concepto": mv["concepto"].to_numpy(),
@@ -835,6 +1021,9 @@ def _filas_movimiento(mv: pd.DataFrame, grupo: pd.Series | str, placa: pd.Series
         "Centro de coste": mv["cc_nombre"].to_numpy() if "cc_nombre" in mv else "",
         "Sub-rubro SAP": mv["sub_rubro_sap"].to_numpy() if "sub_rubro_sap" in mv else "",
         "Clasificado por": mv["origen"].to_numpy(), "Placa detectada en el texto": mv["placa_detectada"].to_numpy(),
+        "N° interno identificado": mv["numero_interno_texto"].to_numpy() if "numero_interno_texto" in mv else "",
+        "Método de identificación": mv["placa_metodo"].to_numpy() if "placa_metodo" in mv else "",
+        "Validación placa / N° interno": mv["placa_validacion"].to_numpy() if "placa_validacion" in mv else "",
         "ID del movimiento": mv["llave"].to_numpy()})
 
 
@@ -1486,14 +1675,19 @@ def serie_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict):
     return nombres, orden, p, e
 
 
+def desde_mes(cfg: dict) -> int:
+    """Primer mes de la ejecución que se consulta: el mes elegido si se pidió un solo mes (`cfg["desde"]`) o el inicio del escenario."""
+    return int(cfg.get("desde", cfg["meses"][0]))
+
+
 def tabla_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: int) -> pd.DataFrame:
     """Resumen por sub-rubro: presupuesto del escenario completo, ejecutado hasta el corte, saldo, % y estado."""
     nombres, orden, p, e = serie_subrubros(ppto, ejec, cfg)
-    m0, _ = cfg["meses"]
+    m0 = desde_mes(cfg)
     ej = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= hasta_mes)]
     n = ej.assign(_k=ej["sub_rubro"].fillna("").astype(str).map(norm_texto)).groupby("_k").size()
     filas = [dict(sub_rubro=nombres[k], presupuesto=float(p[k].sum()) if k in p.index.get_level_values(0) else 0.0,
-                  ejecutado=float(e[k][e[k].index <= hasta_mes].sum()) if k in e.index.get_level_values(0) else 0.0,
+                  ejecutado=float(e[k][(e[k].index >= m0) & (e[k].index <= hasta_mes)].sum()) if k in e.index.get_level_values(0) else 0.0,
                   movimientos=int(n.get(k, 0))) for k in orden]
     t = pd.DataFrame(filas, columns=["sub_rubro", "presupuesto", "ejecutado", "movimientos"])
     return con_metricas(t.assign(concepto=t["sub_rubro"]))[["sub_rubro", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]]
@@ -1504,10 +1698,12 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: 
     _, _, p, e = serie_subrubros(ppto, ejec, cfg)
     k = norm_texto(sub_rubro)
     m0, m1 = cfg["meses"]
+    d0 = desde_mes(cfg)
     filas = []
     for m in range(m0, m1 + 1):
-        filas.append(dict(mes=m, presupuesto=float(p.get((k, m), 0.0)), ejecutado=float(e.get((k, m), 0.0)) if m <= hasta_mes else 0.0,
-                          movimientos=1 if m <= hasta_mes else 0))
+        en = d0 <= m <= hasta_mes
+        filas.append(dict(mes=m, presupuesto=float(p.get((k, m), 0.0)), ejecutado=float(e.get((k, m), 0.0)) if en else 0.0,
+                          movimientos=1 if en else 0))
     t = pd.DataFrame(filas)
     t.loc[len(t)] = dict(mes=0, presupuesto=t["presupuesto"].sum(), ejecutado=t["ejecutado"].sum(), movimientos=int(t["movimientos"].sum()))
     t["saldo"] = t["presupuesto"] - t["ejecutado"]
@@ -1515,96 +1711,161 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: 
     return t[["mes", "presupuesto", "ejecutado", "saldo", "pct"]]
 
 
-def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
-                     detalle_meses: bool = False, num_cuenta: dict | None = None) -> bytes:
-    """Excel de soporte: `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) del MISMO rubro,
-    compañía y año. Hoja «Presupuesto»: el presupuesto muestra TODOS los meses del escenario y la ejecución es la ACUMULADA
-    desde el primer mes del escenario hasta `mes` (los meses posteriores quedan en cero). Hojas de cada sub-rubro: solo los
-    movimientos de SAP del mes `mes`. Los totales son fórmulas, como en el archivo original.
-    `num_cuenta` (opcional): número de cuenta de SAP por cuenta de SISPO, para las filas de detalle de SISPO cuyo genérico ya no está en `ejec`.
-    Con `detalle_meses=True` las hojas de cada sub-rubro traen los movimientos de todos los meses hasta `mes` (con la columna «Mes»), en vez de solo los de `mes`."""
-    from openpyxl import Workbook
+# Sub-rubros que el soporte de ejecución resume en la hoja «Presupuesto» pero para los que no abre hoja de movimientos.
+SUBRUBROS_SIN_HOJA_SOPORTE = ("Inventarios",)
+EMPRESAS_SIN_CONTENEDORES = ("ALSM",)                     # la ejecución de Mantenimiento de SM no tiene Contenedores (ALDC sí)
+
+
+def es_contenedor(sub_rubro: pd.Series) -> pd.Series:
+    """True donde el sub-rubro es de Contenedores."""
+    return sub_rubro.fillna("").astype(str).map(norm_texto).str.contains("CONTENEDOR")
+
+
+
+FORMATO_DINERO = '_-* #,##0_-;\\-* #,##0_-;_-* "-"??_-;_-@_-'
+
+
+def hoja_resumen_mensual(ws, filas: list, meses_txt: list, rotulo: str, fila_enc: int = 4, etiqueta_filas: str = "") -> dict:
+    """Hoja «Resumen» con el formato del archivo de ejecución de Mantenimiento: a la izquierda el presupuesto (`rotulo`) mes a mes con su
+    TOTAL y, cinco columnas más a la derecha, la EJECUCION mes a mes con su TOTAL; una fila por concepto y una fila TOTALES al final.
+    `filas`: lista de dict(nombre, p=[valor por mes], e=[valor por mes], nivel=0|1). Una fila de nivel 0 seguida de filas de nivel 1 es un
+    grupo: su valor es la SUMA de sus filas hijas (fórmula) y los TOTALES suman solo las de nivel 0. Los totales son fórmulas.
+    Devuelve dict(fila_total, col_ejec_total, primera_fila, ultima_fila) para quien quiera agregar controles debajo."""
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter as col
+    n = len(meses_txt)
+    azul = PatternFill("solid", fgColor="002060")
+    c_p0, c_pt = 2, 2 + n
+    c_e0 = c_pt + 6
+    c_et = c_e0 + n
+    for c0, ct, titulo in ((c_p0, c_pt, rotulo), (c_e0, c_et, "EJECUCION")):
+        ws.merge_cells(start_row=fila_enc, start_column=c0, end_row=fila_enc, end_column=ct)
+        celda = ws.cell(row=fila_enc, column=c0, value=titulo)
+        celda.fill, celda.font, celda.alignment = azul, Font(bold=True, color="FFFFFF"), Alignment(horizontal="center")
+        for j, m in enumerate(meses_txt):
+            ws.cell(row=fila_enc + 1, column=c0 + j, value=m).font = Font(bold=True)
+            ws.cell(row=fila_enc + 1, column=c0 + j).alignment = Alignment(horizontal="center")
+        ws.cell(row=fila_enc + 1, column=ct, value="TOTAL").font = Font(bold=True)
+        ws.cell(row=fila_enc + 1, column=ct).alignment = Alignment(horizontal="center")
+    if etiqueta_filas:
+        ws.cell(row=fila_enc + 1, column=1, value=etiqueta_filas).font = Font(bold=True)
+    fila0 = fila_enc + 2
+    pos = {}                                                     # índice de la fila de `filas` -> número de fila en la hoja
+    for i in range(len(filas)):
+        pos[i] = fila0 + i
+    for i, f in enumerate(filas):
+        r = pos[i]
+        nivel = int(f.get("nivel", 0))
+        hijos = []
+        if nivel == 0:
+            j = i + 1
+            while j < len(filas) and int(filas[j].get("nivel", 0)) == 1:
+                hijos.append(pos[j])
+                j += 1
+        c = ws.cell(row=r, column=1, value=f["nombre"])
+        c.font = Font(bold=(nivel == 0 and bool(hijos)))
+        c.alignment = Alignment(indent=1 if nivel == 1 else 0)
+        for j in range(n):
+            for c0, clave in ((c_p0, "p"), (c_e0, "e")):
+                if hijos:
+                    ws.cell(row=r, column=c0 + j, value=f"=+SUM({col(c0 + j)}{hijos[0]}:{col(c0 + j)}{hijos[-1]})").font = Font(bold=True)
+                else:
+                    ws.cell(row=r, column=c0 + j, value=float(f[clave][j] or 0.0))
+        for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
+            ws.cell(row=r, column=ct, value=f"=+SUM({col(c0)}{r}:{col(ct - 1)}{r})").font = Font(bold=bool(hijos))
+    rt = fila0 + len(filas)
+    ws.cell(row=rt, column=1, value="TOTALES").font = Font(bold=True)
+    nivel0 = [pos[i] for i, f in enumerate(filas) if int(f.get("nivel", 0)) == 0]
+    for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
+        for c in range(c0, ct + 1):
+            if not nivel0:
+                v = 0
+            elif nivel0 == list(range(nivel0[0], nivel0[0] + len(nivel0))):
+                v = f"=+SUM({col(c)}{nivel0[0]}:{col(c)}{nivel0[-1]})"
+            else:
+                v = "=+SUM(" + ",".join(f"{col(c)}{x}" for x in nivel0) + ")"
+            ws.cell(row=rt, column=c, value=v).font = Font(bold=True)
+    for r in range(fila0, rt + 1):
+        for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
+            ws.cell(row=r, column=c).number_format = FORMATO_DINERO
+    ws.column_dimensions["A"].width = 38
+    for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
+        ws.column_dimensions[col(c)].width = 16
+    ws.freeze_panes = f"B{fila0}"
+    return dict(fila_total=rt, col_ejec_total=c_et, primera_fila=fila0, ultima_fila=rt - 1)
+
+
+def escribir_hoja_movimientos(wb, nombre: str, columnas: list, filas: list, formatos: dict | None = None, anchos: dict | None = None):
+    """Hoja de movimientos: encabezado en negrita, filtros, fila congelada y formatos por columna (`formatos`: nombre -> formato de número)."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter as col
+    hoja = wb.create_sheet(nombre)
+    hoja.append(columnas)
+    for fila in filas:
+        hoja.append([None if (isinstance(v, pd.Timestamp) and pd.isna(v)) else (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v) for v in fila])
+    for j, c in enumerate(columnas, start=1):
+        hoja.cell(row=1, column=j).font = Font(bold=True)
+        fmt = (formatos or {}).get(c)
+        if fmt:
+            for r in range(2, len(filas) + 2):
+                hoja.cell(row=r, column=j).number_format = fmt
+        hoja.column_dimensions[col(j)].width = (anchos or {}).get(c, 14)
+    hoja.freeze_panes = "A2"
+    hoja.auto_filter.ref = hoja.dimensions
+    return hoja
+
+
+def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
+                     detalle_meses: bool = False, num_cuenta: dict | None = None, sin_hoja: tuple = ()) -> bytes:
+    """Excel de ejecución de Mantenimiento de UNA compañía, con dos hojas:
+    - «Resumen»: presupuesto (`rotulo`) de todos los meses del escenario y EJECUCION mes a mes hasta `mes`, por sub-rubro. Los totales son fórmulas.
+    - «Movimientos»: TODOS los movimientos que componen esa ejecución (de todos los sub-rubros y de los meses hasta `mes`), con su sub-rubro y mes;
+      las salidas de inventario traen el detalle del SISPO (placa, concepto, código de artículo, cantidad y bodega) y la columna «Fuente».
+    Debajo de los TOTALES del resumen hay un control: lo que suman los movimientos y su diferencia con la ejecución.
+    `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) son del MISMO rubro, compañía y año.
+    `num_cuenta`: número de cuenta de SAP por cuenta de SISPO. `detalle_meses` y `sin_hoja` se conservan por compatibilidad: ya no cambian el resultado."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter as col
 
     m0, m1 = cfg["meses"]
     meses = list(range(m0, m1 + 1))
-    n = len(meses)
-    acumulada = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= mes)]          # hoja Presupuesto
-    ejec = acumulada if detalle_meses else ejec[ejec["mes"] == mes]       # hojas de detalle: el mes elegido (o todos hasta él)
+    acumulada = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= mes)]
     nombres, orden, p, e = serie_subrubros(ppto, acumulada, cfg)
     num_cuenta = {**numeros_cuenta(acumulada), **(num_cuenta or {})}
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Presupuesto"
-    dinero = '_-* #,##0_-;\\-* #,##0_-;_-* "-"??_-;_-@_-'
-    azul = PatternFill("solid", fgColor="002060")
-    c_p0, c_pt = 2, 2 + n                                    # presupuesto: meses y total
-    c_e0 = c_pt + 6                                          # ejecución: deja 5 columnas libres, como el original
-    c_et = c_e0 + n
-    for c0, ct, titulo in ((c_p0, c_pt, rotulo), (c_e0, c_et, "EJECUCION")):
-        ws.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=ct)
-        celda = ws.cell(row=4, column=c0, value=titulo)
-        celda.fill, celda.font, celda.alignment = azul, Font(bold=True, color="FFFFFF"), Alignment(horizontal="center")
-        for j, m in enumerate(meses):
-            ws.cell(row=5, column=c0 + j, value=MESES_MAYUS[m - 1]).font = Font(bold=True)
-            ws.cell(row=5, column=c0 + j).alignment = Alignment(horizontal="center")
-        ws.cell(row=5, column=ct, value="TOTAL").font = Font(bold=True)
-        ws.cell(row=5, column=ct).alignment = Alignment(horizontal="center")
-    fila0 = 6
-    for i, k in enumerate(orden):
-        r = fila0 + i
-        ws.cell(row=r, column=1, value=nombres[k])
-        for j, m in enumerate(meses):
-            ws.cell(row=r, column=c_p0 + j, value=float(p.get((k, m), 0.0)))
-            ws.cell(row=r, column=c_e0 + j, value=float(e.get((k, m), 0.0)) if m <= mes else 0.0)
-        for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
-            ws.cell(row=r, column=ct, value=f"=+SUM({col(c0)}{r}:{col(ct - 1)}{r})")
-    rt = fila0 + len(orden)
-    ws.cell(row=rt, column=1, value="TOTALES").font = Font(bold=True)
-    for c0, ct in ((c_p0, c_pt), (c_e0, c_et)):
-        for c in range(c0, ct + 1):
-            ws.cell(row=rt, column=c, value=f"=+SUM({col(c)}{fila0}:{col(c)}{rt - 1})" if orden else 0).font = Font(bold=True)
-    for r in range(fila0, rt + 1):
-        for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
-            ws.cell(row=r, column=c).number_format = dinero
-    ws.column_dimensions["A"].width = 34
-    for c in list(range(c_p0, c_pt + 1)) + list(range(c_e0, c_et + 1)):
-        ws.column_dimensions[col(c)].width = 16
-    ws.freeze_panes = "B6"
+    ws.title = "Resumen"
+    filas = [dict(nombre=nombres[k], p=[float(p.get((k, m), 0.0)) for m in meses],
+                  e=[float(e.get((k, m), 0.0)) if m <= mes else 0.0 for m in meses]) for k in orden]
+    info = hoja_resumen_mensual(ws, filas, [MESES_MAYUS[m - 1] for m in meses], rotulo)
 
-    usados = {"presupuesto"}
-    for k in orden:                                          # una hoja por sub-rubro CON movimientos
-        mv = ejec[ejec["sub_rubro"].fillna("").astype(str).map(norm_texto) == k]
-        if mv.empty:
-            continue
-        mv = mv.assign(_t=mv["tercero"].fillna("").astype(str).map(norm_texto)).sort_values(["_t", "fecha", "documento"], kind="stable")
-        if detalle_meses:                                    # todos los meses hasta el elegido: ordenados por mes y con su columna «Mes»
-            mv = mv.assign(_t=mv["tercero"].fillna("").astype(str).map(norm_texto)).sort_values(["mes", "_t", "fecha", "documento"], kind="stable")
-        t = filas_sap(mv, num_cuenta)
-        columnas = list(t.columns)
-        if detalle_meses:
-            t = t.assign(**{"Mes": [f"{MESES_MAYUS[int(m) - 1].capitalize()} {int(a)}" for m, a in zip(mv["mes"], mv["anio"] if "anio" in mv else [cfg["anio"]] * len(mv))]})
-            columnas = columnas + ["Mes"]
-        hoja = wb.create_sheet(_nombre_hoja(nombres[k], usados))
-        hoja.append(columnas)
-        for fila in t.itertuples(index=False):
-            hoja.append([None if (isinstance(v, pd.Timestamp) and pd.isna(v)) else (v.to_pydatetime() if isinstance(v, pd.Timestamp) else v)
-                         for v in fila])
-        for j, c in enumerate(columnas, start=1):
-            hoja.cell(row=1, column=j).font = Font(bold=True)
-            if c in SAP_FECHAS:
-                for r in range(2, len(t) + 2):
-                    hoja.cell(row=r, column=j).number_format = "mm-dd-yy"
-            elif c == "Valor/mon.inf.":
-                for r in range(2, len(t) + 2):
-                    hoja.cell(row=r, column=j).number_format = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
-            hoja.column_dimensions[col(j)].width = {"TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34,
-                                                    "Valor/mon.inf.": 16, "Denom.clase de coste": 26,
-                                                    "Denominación del objeto": 24, "Concepto de mantenimiento": 28, "Bodega": 22}.get(c, 14)
-        hoja.freeze_panes = "A2"
-        hoja.auto_filter.ref = hoja.dimensions
+    clave = acumulada["sub_rubro"].fillna("").astype(str).map(norm_texto)
+    mv = acumulada.assign(_k=clave, _t=acumulada["tercero"].fillna("").astype(str).map(norm_texto) if "tercero" in acumulada else "")
+    mv = mv.assign(_o=mv["_k"].map({k: i for i, k in enumerate(orden)}).fillna(len(orden)))
+    mv = mv.sort_values(["_o", "mes", "_t", "fecha", "documento"], kind="stable")
+    t = filas_sap(mv, num_cuenta) if len(mv) else pd.DataFrame(columns=SAP_COLUMNAS)
+    anios = mv["anio"] if "anio" in mv else pd.Series([cfg["anio"]] * len(mv), index=mv.index)
+    t = t.reset_index(drop=True)
+    t.insert(0, "Mes", [f"{MESES_MAYUS[int(m) - 1].capitalize()} {int(a)}" for m, a in zip(mv["mes"], anios)])
+    t.insert(0, "Sub-rubro", [nombres.get(k, "") for k in mv["_k"]])
+    columnas = list(t.columns)
+    formatos = {c: "mm-dd-yy" for c in columnas if c in SAP_FECHAS}
+    formatos["Valor/mon.inf."] = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
+    anchos = {"Sub-rubro": 30, "Mes": 16, "TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34, "Valor/mon.inf.": 16,
+              "Denom.clase de coste": 26, "Denominación del objeto": 24, "Concepto de mantenimiento": 28, "Bodega": 22}
+    escribir_hoja_movimientos(wb, "Movimientos", columnas, list(t.itertuples(index=False, name=None)), formatos, anchos)
+
+    rc = info["fila_total"] + 2                              # control: los movimientos deben sumar la ejecución del resumen
+    if "Valor/mon.inf." in columnas:
+        letra = col(columnas.index("Valor/mon.inf.") + 1)
+        ref = f"Movimientos!{letra}2:{letra}{len(t) + 1}"
+        ce = col(info["col_ejec_total"])
+        ws.cell(row=rc, column=1, value="Control · suma de «Movimientos»").font = Font(italic=True)
+        ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = FORMATO_DINERO
+        ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)").font = Font(italic=True)
+        ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = FORMATO_DINERO
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1661,6 +1922,14 @@ def _num_co(x) -> float:
 def _cod_articulo(x) -> str:
     t = _como_texto(x).strip()
     return t[:-2] if re.fullmatch(r"\d+\.0", t) else t
+
+
+TOLERANCIA_CENTAVOS = 100        # SAP redondea al peso y SISPO trae decimales: una diferencia de hasta $1 (100 centavos) es redondeo, no un error
+
+
+def cuadra_c(diferencia_c) -> bool:
+    """True si la diferencia entre SAP y SISPO, en centavos, cabe en la tolerancia de redondeo (hasta $1). Única regla para todos los cruces."""
+    return abs(int(diferencia_c)) <= TOLERANCIA_CENTAVOS
 
 
 def centavos(x) -> int:
@@ -1804,16 +2073,26 @@ def sispo_placas(lineas: pd.DataFrame, registro: pd.DataFrame) -> pd.DataFrame:
 
 
 def sispo_maestro_leer(archivo) -> tuple[pd.DataFrame, dict]:
-    """Base maestra: Codigo Articulo, Articulo y CONCEPTO ASIGNADO. Una referencia con dos conceptos distintos es un error (no se
-    adivina); las filas sin código o sin concepto se informan y no se cargan."""
+    """Base maestra de referencias. Formato vigente: Bodega, Articulo (código), Texto (descripción), Clasificación (categoría) y
+    ELEMENTO (detalle); el concepto de la referencia es el ELEMENTO y la categoría queda aparte (la columna PTO no se usa).
+    También se lee el formato anterior (Codigo Articulo, Articulo, CONCEPTO ASIGNADO). Una referencia con dos conceptos distintos
+    es un error (no se adivina); las filas sin código o sin concepto se informan y no se cargan."""
     d = pd.read_excel(archivo, dtype=object)
     claves = {_canon(c): c for c in d.columns}
-    faltan = [k for k in ("CODIGOARTICULO", "CONCEPTOASIGNADO") if k not in claves]
-    if faltan:
-        raise ValueError("A la base maestra le faltan columnas: «Codigo Articulo» y/o «CONCEPTO ASIGNADO».")
-    m = pd.DataFrame({"codigo": d[claves["CODIGOARTICULO"]].map(_cod_articulo),
-                      "articulo": d[claves["ARTICULO"]].map(lambda x: " ".join(_como_texto(x).split())) if "ARTICULO" in claves else "",
-                      "concepto": d[claves["CONCEPTOASIGNADO"]].map(lambda x: " ".join(_como_texto(x).split()))})
+    cat = next((claves[k] for k in ("CLASIFICACION", "CLASIFIACION") if k in claves), None)   # el libro trae «Clasifiación»
+    if "ELEMENTO" in claves and "CODIGOARTICULO" not in claves:
+        c_cod, c_art, c_con = claves.get("ARTICULO"), claves.get("TEXTO"), claves["ELEMENTO"]
+    else:
+        c_cod, c_art, c_con = claves.get("CODIGOARTICULO"), claves.get("ARTICULO"), claves.get("CONCEPTOASIGNADO")
+    if c_cod is None or c_con is None:
+        raise ValueError("A la base maestra le faltan columnas: «Articulo» (código) y «ELEMENTO» "
+                         "(o, en el formato anterior, «Codigo Articulo» y «CONCEPTO ASIGNADO»).")
+    limpio = lambda x: " ".join(_como_texto(x).split())
+    m = pd.DataFrame({"codigo": d[c_cod].map(_cod_articulo),
+                      "articulo": d[c_art].map(limpio) if c_art else "",
+                      "concepto": d[c_con].map(limpio),
+                      "categoria": d[cat].map(limpio) if cat else "",
+                      "bodega": d[claves["BODEGA"]].map(limpio) if "BODEGA" in claves else ""})
     sin = m[(m["codigo"] == "") | (m["concepto"] == "")]
     m = m.drop(sin.index)
     distintos = m.groupby("codigo")["concepto"].nunique()
@@ -1872,6 +2151,12 @@ CLASE_STAF_OTROS = "OTROS"
 OBJETO_STAF_OTROS = "Staf Mantenimiento"
 
 
+def es_objeto_staf_mtto(objeto: pd.Series) -> pd.Series:
+    """True donde la «Denominación del objeto» es exactamente «Staf Mantenimiento» (sin importar mayúsculas, tildes, espacios ni signos).
+    Es la ÚNICA definición de esa exclusión: la usan Mantenimiento (que las suma a Flota) y Operaciones (que las deja fuera)."""
+    return objeto.fillna("").map(_canon).eq(_canon(OBJETO_STAF_OTROS))
+
+
 def es_staf_otros(df: pd.DataFrame) -> pd.Series:
     """Movimientos de SAP cuya «Denom.clase de coste» es OTROS (`cuenta_nombre`, o `sub_rubro_sap` si ahí no viene) y cuya
     «Denominación del objeto» (`cc_nombre`) es «Staf Mantenimiento». El presupuesto de flota no los trae en su sub-rubro, pero son
@@ -1883,9 +2168,9 @@ def es_staf_otros(df: pd.DataFrame) -> pd.Series:
     clase = df["cuenta_nombre"] if "cuenta_nombre" in df else vacio
     clase_sap = df["sub_rubro_sap"] if "sub_rubro_sap" in df else vacio
     obj = df["cc_nombre"] if "cc_nombre" in df else vacio
-    k_otros, k_obj = _canon(CLASE_STAF_OTROS), _canon(OBJETO_STAF_OTROS)
+    k_otros = _canon(CLASE_STAF_OTROS)
     es_clase = clase.map(_canon).eq(k_otros) | (clase.map(_canon).eq("") & clase_sap.map(_canon).eq(k_otros))
-    return (es_clase & obj.map(_canon).eq(k_obj)).astype(bool)
+    return (es_clase & es_objeto_staf_mtto(obj)).astype(bool)
 
 
 def ids_staf_otros_raw(crudo: pd.DataFrame) -> set:
@@ -1944,13 +2229,36 @@ def sispo_sap_generico(pool: pd.DataFrame, empresa: str, periodo: int, cuenta: s
     return pool[es].copy()
 
 
+def valor_sap_ajustado(lin: pd.DataFrame, sap: pd.DataFrame) -> pd.Series:
+    """Valor con el que cada línea de SISPO entra a la ejecución (signo de SAP). El total, y el de cada centro de costo, queda IGUAL al de
+    SAP: la diferencia de redondeo (hasta `TOLERANCIA_CENTAVOS`; SAP en pesos enteros, SISPO con decimales) se suma a la línea de mayor valor
+    del centro de costo y, si aún queda un resto, a la de mayor valor de toda la cuenta. El costo original de SISPO no se toca."""
+    v = pd.Series([-centavos(x) for x in pd.to_numeric(lin["costo_con_iva"], errors="coerce").fillna(0.0)], index=lin.index, dtype="int64")
+    if lin.empty or sap.empty:
+        return v / 100
+    kl = lin["cc_codigo"].fillna("").astype(str).str.strip().str.upper()
+    kr = sap["cc"].fillna("").astype(str).str.strip().str.upper() if "cc" in sap else pd.Series("", index=sap.index)
+    sap_cc = pd.Series([centavos(x) for x in pd.to_numeric(sap["valor"], errors="coerce").fillna(0.0)], index=sap.index).groupby(kr).sum()
+    for cc, objetivo in sap_cc.items():
+        idx = kl.index[kl == cc]
+        if len(idx):
+            d = int(objetivo) - int(v[idx].sum())
+            if d and cuadra_c(d):
+                v[v[idx].abs().idxmax()] += d
+    resto = int(sap_cc.sum()) - int(v.sum())
+    if resto and cuadra_c(resto):
+        v[v.abs().idxmax()] += resto
+    return v / 100
+
+
 def sispo_conciliar(lineas: pd.DataFrame, sap: pd.DataFrame) -> dict:
-    """Conciliación EXACTA en centavos, solo por VALOR. SAP carga el costo en positivo y SISPO lo trae negativo (salida): el total de
-    SAP debe ser igual a −SISPO y lo distribuido por concepto debe sumar lo mismo. No se compara por centro de coste."""
+    """Conciliación por VALOR, con tolerancia de redondeo de hasta $1 (`cuadra_c`). SAP carga el costo en positivo y SISPO lo trae negativo
+    (salida): el total de SAP debe ser igual a −SISPO y lo distribuido por concepto debe sumar exactamente lo mismo que SISPO. No se compara
+    por centro de coste."""
     sap_c = [centavos(v) for v in pd.to_numeric(sap["valor"], errors="coerce").fillna(0.0)] if len(sap) else []
     t_sispo, t_sap = int(lineas["centavos"].sum()) if len(lineas) else 0, int(sum(sap_c))
     dist = lineas.groupby("concepto")["centavos"].sum() if len(lineas) else pd.Series(dtype="int64")
-    cuadra_total = len(sap) > 0 and t_sap + t_sispo == 0 and (int(dist.sum()) if len(dist) else 0) == t_sispo
+    cuadra_total = len(sap) > 0 and cuadra_c(t_sap + t_sispo) and (int(dist.sum()) if len(dist) else 0) == t_sispo
     return dict(sap_c=t_sap, sispo_c=t_sispo, distribuido_c=int(dist.sum()) if len(dist) else 0, diferencia_c=t_sap + t_sispo,
                 n_sap=len(sap), n_sispo=len(lineas),
                 cuadra=cuadra_total)
@@ -2055,6 +2363,7 @@ def sispo_cuadre_destinos(lin: pd.DataFrame, rep: pd.DataFrame) -> pd.DataFrame:
     sis = pd.Series(-lin["centavos"].to_numpy(), index=pd.MultiIndex.from_frame(d[["codigo", "sub_rubro"]])).groupby(level=[0, 1]).sum()
     t = pd.concat([sap.rename("sap_c"), sis.rename("sispo_c")], axis=1).fillna(0).astype("int64")
     t["diferencia_c"] = t["sap_c"] - t["sispo_c"]
+    t["cuadra"] = t["diferencia_c"].map(cuadra_c)
     return t.reset_index()
 
 
@@ -2120,7 +2429,7 @@ def _sispo_cc_conciliados(lin: pd.DataFrame, rep: pd.DataFrame, presentes: set) 
     kr = pd.Series(list(zip(cr, rep["cc"].fillna("").astype(str).str.strip().str.upper())), index=rep.index)
     sis = pd.Series([centavos(v) for v in pd.to_numeric(lin["valor_sap"], errors="coerce").fillna(0.0)], index=lin.index).groupby(kl).sum()
     sap = pd.Series([centavos(v) for v in pd.to_numeric(rep["valor"], errors="coerce").fillna(0.0)], index=rep.index).groupby(kr).sum()
-    buenas = {k for k in sap.index if k in sis.index and int(sap[k]) == int(sis[k])}
+    buenas = {k for k in sap.index if k in sis.index and cuadra_c(int(sap[k]) - int(sis[k]))}
     return lin[kl.isin(buenas)], rep[kr.isin(buenas)]
 
 

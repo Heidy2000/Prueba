@@ -2,19 +2,22 @@
 SISPO para el módulo Operaciones (lógica pura, sin Streamlit ni base de datos, para poder probarla sola)
 =========================================================================================================
 Filtros previos (se aplican a los datos ORIGINALES del SISPO, antes de clasificar, agrupar o consolidar; el archivo nunca se modifica):
-  1. Centro de costo (código) en DB010500 Staf Operaciones, DB010504 Barrido Manual, DB010515 Proyecto Aguas de Bogotá,
-     DB010501 Recolección Domiciliaria, DB010509 Planeación.
+  1. Cuenta OTROS: entra de cualquier centro de costo (regla general: OTROS del SISPO -> Operaciones). Papelería, en cambio, solo de
+     (ALDC) DB010500 Staf Operaciones, DB010504 Barrido Manual, DB010515 Proyecto Aguas de Bogotá, DB010501 Recolección
+     Domiciliaria, DB010509 Planeación; (ALSM) DB020511 Poda, DB020508 Corte de césped, DB021011 Operaciones Circasia,
+     DB021111 Operaciones Quimbaya. Cada compañía solo con sus centros (`CENTROS_POR_EMPRESA`).
   2. Grupo [5] - INSUMOS o [7] - HERRAMIENTAS, salvo las referencias que CRUZAN con un ítem del presupuesto (por la columna «Concepto» del
      SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos). Toda la cuenta
      OTROS de esos centros también entra, de cualquier grupo: SAP la carga completa en 3.1. Lo que no es grupo 5/7 ni cruza va a Herramientas
      (donde SAP carga el genérico) con la observación de `observacion()`.
-  3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Otros).
-  4. Se excluye «Staf Mantenimiento» aunque pase lo anterior (por nombre, también con coincidencias parciales).
+  3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Bolsas).
+  4. Se excluye únicamente la «Denominación del objeto» exactamente «Staf Mantenimiento» (`L.es_objeto_staf_mtto`); esas líneas las trata
+     Mantenimiento, que las suma a Flota y Equipo de transporte.
 Reglas por hoja, sobre lo que pasó los filtros:
 - Papelería    <- cuenta ÚTILES, PAPELERÍA Y OTROS. Solo salidas (cantidad negativa). Se compara en CANTIDADES: costo cero.
 - Consumibles  <- Grupo [5] - INSUMOS y cuenta OTROS, salvo los dos códigos de bolsas. Solo salidas (costo negativo).
 - Herramientas <- Grupo [7] - HERRAMIENTAS y cuenta OTROS. Solo salidas (costo negativo).
-- Otros        <- exclusivamente los códigos 5064610001 y 5064610002. Solo salidas (costo negativo).
+- Bolsas       <- exclusivamente los códigos 5064610001 y 5064610002. Solo salidas (costo negativo).
 Una línea cae en UNA sola hoja. Lo que no cumple ninguna regla no se muestra en Operaciones.
 
 Relación con SAP: SAP carga todas las salidas de inventario de la cuenta OTROS como UN genérico («Salida de inventario <mes>») en
@@ -27,14 +30,16 @@ import pandas as pd
 
 import logica_m as L
 
-HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", "Consumibles", "Herramientas", "Otros"
+HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", "Consumibles", "Herramientas", "Bolsas"   # HOJA_OTROS = las dos bolsas
 HOJAS_PESOS = (HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS)       # se comparan en pesos; Papelería, en cantidades
 CUENTA_PAPELERIA = "ÚTILES, PAPELERÍA Y OTROS"                       # «Nombre Cta» completo; el archivo lo trae recortado a 20 caracteres
 CUENTA_OTROS = "OTROS"
-CENTROS_AUTORIZADOS = {"DB010500": "STAF OPERACIONES", "DB010504": "BARRIDO MANUAL", "DB010515": "PROYECTO AGUAS DE BOGOTÁ",
-                       "DB010501": "RECOLECCIÓN DOMICILIARIA", "DB010509": "PLANEACIÓN"}
+CENTROS_POR_EMPRESA = {
+    "ALDC": {"DB010500": "STAF OPERACIONES", "DB010504": "BARRIDO MANUAL", "DB010515": "PROYECTO AGUAS DE BOGOTÁ",
+             "DB010501": "RECOLECCIÓN DOMICILIARIA", "DB010509": "PLANEACIÓN"},
+    "ALSM": {"DB020511": "PODA", "DB020508": "CORTE DE CÉSPED", "DB021011": "OPERACIONES CIRCASIA", "DB021111": "OPERACIONES QUIMBAYA"}}
+CENTROS_AUTORIZADOS = {c: n for d in CENTROS_POR_EMPRESA.values() for c, n in d.items()}   # unión: solo cuando se desconoce la compañía (archivo sin cargar)
 GRUPOS_AUTORIZADOS = ("5INSUMOS", "7HERRAMIENTAS")                   # «[5] - INSUMOS» / «[7] - HERRAMIENTAS» en forma canónica
-PATRON_EXCLUIDO = r"STAFF?MANT"                                       # «Staf Mantenimiento» (también recortado o con una f de más)
 CODIGOS_OTROS = ("5064610001", "5064610002")        # BOLSA CESTA 66x76 y BOLSA DESARENE 40x49
 GRUPO_INSUMOS, GRUPO_HERRAMIENTAS = GRUPOS_AUTORIZADOS
 SIN_HOJA = "Sin hoja asignada"
@@ -53,7 +58,7 @@ MAPEO_INICIAL = {
     # presupuestados en Herramientas
     "5064710001": "Cepíllos", "52850010053": "Rastrillos", "5043910033": "Espatulas 4\"",
     "7015019003": "Pala No. 4", "7015019007": "Palin", "7015019013": "Canastillas", "7015019046": "Desmoñador",
-    # Otros (las dos bolsas)
+    # Bolsas (las dos bolsas)
     "5064610001": "Cesta", "5064610002": "Desarene",
     # tomadas de la columna «Concepto» del SISPO de septiembre y de la lista de ítems
     "1801012631": "Aro 20 aluminio", "1941011215": "Toalla de retazo (kilo)", "5064710002": "Cabos cepillo", "52748010135": "Cepíllos",
@@ -94,10 +99,15 @@ def _mascaras(d: pd.DataFrame) -> dict:
     else:
         salida = pd.Series(True, index=d.index)
     es_otros = d["cuenta"].map(L.clase20) == L.clase20(CUENTA_OTROS)       # SAP carga TODA la cuenta OTROS del centro en 3.1: sin filtro de grupo
-    return {"salida": salida, "centro": _codigo_cc(d["cc_codigo"]).isin(CENTROS_AUTORIZADOS),
+    cod = _codigo_cc(d["cc_codigo"])
+    if "empresa" in d:                                  # líneas guardadas: cada compañía con sus centros (los DB01… son de ALDC; los DB02…, de ALSM)
+        centro_ok = pd.Series([c in CENTROS_POR_EMPRESA.get(str(e), CENTROS_AUTORIZADOS) for c, e in zip(cod, d["empresa"])], index=d.index)
+    else:
+        centro_ok = cod.isin(CENTROS_AUTORIZADOS)
+    return {"salida": salida, "centro": centro_ok | es_otros,
             "grupo": d["grupo"].map(L._canon).isin(GRUPOS_AUTORIZADOS) | cruza | es_otros,
             "cuenta": d["cuenta"].map(L.clase20).isin(cuentas),
-            "staf_mtto": ~d["cc_nombre"].map(L._canon).str.contains(PATRON_EXCLUIDO, regex=True)}
+            "staf_mtto": ~L.es_objeto_staf_mtto(d["cc_nombre"])}
 
 
 def items_presupuestados(ppto: pd.DataFrame) -> set:
@@ -126,7 +136,7 @@ def depurar(d: pd.DataFrame) -> tuple[pd.DataFrame, list]:
     """Filtros previos sobre el SISPO original, en este orden. Devuelve (líneas que pasan todos, embudo [(paso, filas que quedan)])."""
     m = _mascaras(d)
     embudo, ok = [("Filas del archivo", len(d))], pd.Series(True, index=d.index)
-    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (5 códigos)"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto o cuenta OTROS)"),
+    for clave, etiqueta in (("salida", "Solo salidas (Tipo Movimiento = Salida)"), ("centro", "Centro de costo autorizado (ALDC 5 códigos, ALSM 4) o cuenta OTROS"), ("grupo", "Grupo 5 INSUMOS o 7 HERRAMIENTAS (o ítem del presupuesto o cuenta OTROS)"),
                             ("cuenta", "Cuenta ÚTILES, PAPELERÍA Y OTROS u OTROS"), ("staf_mtto", "Sin Staf Mantenimiento")):
         ok &= m[clave]
         embudo.append((etiqueta, int(ok.sum())))
@@ -146,7 +156,7 @@ def filtrar_guardado(lin: pd.DataFrame, mapa: dict, presup: set | None) -> pd.Da
 def clasificar(d: pd.DataFrame, mapa: dict | None = None, presup: set | None = None) -> tuple[pd.DataFrame, int]:
     """Agrega `hoja` (vacía si la línea no es de Operaciones). Primero se depura el archivo original (`depurar`) y solo sobre lo que pasa se
     aplican las reglas de cada hoja. Devuelve (líneas, solapes): los solapes son líneas que cumplirían más de una regla; se asignan a una sola
-    (Otros > Consumibles > Herramientas > Papelería) y se informan."""
+    (Bolsas > Consumibles > Herramientas > Papelería) y se informan."""
     d = resolver_items(d, dict(MAPEO_INICIAL) if mapa is None else mapa, presup)
     dep, _ = depurar(d)
     cuenta, grupo = dep["cuenta"].map(L.clase20), dep["grupo"].map(L._canon)
@@ -231,7 +241,7 @@ def hojas_de_items(ppto: pd.DataFrame) -> dict:
 def hoja_por_item(lin: pd.DataFrame, mapa: dict, item_hoja: dict) -> pd.DataFrame:
     """La lista de ítems del presupuesto manda sobre el Grupo del SISPO: una referencia con equivalencia a un ítem que está presupuestado
     en Consumibles o en Herramientas va a esa hoja. Solo mueve líneas que ya están en Consumibles/Herramientas (cuenta OTROS: son las que
-    SAP carga como genérico); no toca Papelería ni Otros. Se aplica al mostrar, sin volver a cargar el SISPO."""
+    SAP carga como genérico); no toca Papelería ni Bolsas. Se aplica al mostrar, sin volver a cargar el SISPO."""
     if lin is None or lin.empty or not item_hoja:
         return lin
     item = lin["item_res"] if "item_res" in lin else lin["codigo"].map(lambda c: mapa.get(str(c), ""))
