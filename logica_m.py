@@ -1817,11 +1817,12 @@ def escribir_hoja_movimientos(wb, nombre: str, columnas: list, filas: list, form
 
 def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
                      detalle_meses: bool = False, num_cuenta: dict | None = None, sin_hoja: tuple = ()) -> bytes:
-    """Excel de ejecución de Mantenimiento de UNA compañía, con dos hojas:
+    """Excel de ejecución de Mantenimiento de UNA compañía:
     - «Resumen»: presupuesto (`rotulo`) de todos los meses del escenario y EJECUCION mes a mes hasta `mes`, por sub-rubro. Los totales son fórmulas.
-    - «Movimientos»: TODOS los movimientos que componen esa ejecución (de todos los sub-rubros y de los meses hasta `mes`), con su sub-rubro y mes;
-      las salidas de inventario traen el detalle del SISPO (placa, concepto, código de artículo, cantidad y bodega) y la columna «Fuente».
-    Debajo de los TOTALES del resumen hay un control: lo que suman los movimientos y su diferencia con la ejecución.
+    - Una hoja por sub-rubro del resumen, con o sin movimientos (Contenedores, Flota y Equipo de transporte, Reparaciones locativas…): los movimientos que componen
+      esa ejecución, con las 23 columnas de SAP; las salidas de inventario traen el detalle del SISPO (placa, concepto, código de artículo,
+      cantidad, bodega) y la columna «Fuente».
+    Debajo de los TOTALES del resumen hay un control: lo que suman las hojas de movimientos y su diferencia con la ejecución.
     `ppto` (sub_rubro, mes, valor) y `ejec` (movimientos con sub_rubro, mes, valor…) son del MISMO rubro, compañía y año.
     `num_cuenta`: número de cuenta de SAP por cuenta de SISPO. `detalle_meses` y `sin_hoja` se conservan por compatibilidad: ya no cambian el resultado."""
     from openpyxl import Workbook
@@ -1845,25 +1846,25 @@ def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int
     mv = acumulada.assign(_k=clave, _t=acumulada["tercero"].fillna("").astype(str).map(norm_texto) if "tercero" in acumulada else "")
     mv = mv.assign(_o=mv["_k"].map({k: i for i, k in enumerate(orden)}).fillna(len(orden)))
     mv = mv.sort_values(["_o", "mes", "_t", "fecha", "documento"], kind="stable")
-    t = filas_sap(mv, num_cuenta) if len(mv) else pd.DataFrame(columns=SAP_COLUMNAS)
-    anios = mv["anio"] if "anio" in mv else pd.Series([cfg["anio"]] * len(mv), index=mv.index)
-    t = t.reset_index(drop=True)
-    t.insert(0, "Mes", [f"{MESES_MAYUS[int(m) - 1].capitalize()} {int(a)}" for m, a in zip(mv["mes"], anios)])
-    t.insert(0, "Sub-rubro", [nombres.get(k, "") for k in mv["_k"]])
-    columnas = list(t.columns)
-    formatos = {c: "mm-dd-yy" for c in columnas if c in SAP_FECHAS}
-    formatos["Valor/mon.inf."] = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
-    anchos = {"Sub-rubro": 30, "Mes": 16, "TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34, "Valor/mon.inf.": 16,
+    formatos_base = {"Valor/mon.inf.": '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'}
+    anchos = {"TEXTO": 56, "Denom.cuenta contrapartida": 34, "Denominacion cuenta contrapartida": 34, "Valor/mon.inf.": 16,
               "Denom.clase de coste": 26, "Denominación del objeto": 24, "Concepto de mantenimiento": 28, "Bodega": 22}
-    escribir_hoja_movimientos(wb, "Movimientos", columnas, list(t.itertuples(index=False, name=None)), formatos, anchos)
-
-    rc = info["fila_total"] + 2                              # control: los movimientos deben sumar la ejecución del resumen
-    if "Valor/mon.inf." in columnas:
+    usados, refs = set(), []
+    por_k = {k: g for k, g in mv.groupby("_k", sort=False)}
+    for k in [*orden, *[x for x in por_k if x not in orden]]:    # una hoja por sub-rubro del resumen (aunque no tenga movimientos), en su orden
+        g = por_k.get(k, mv.iloc[0:0])
+        t = filas_sap(g, num_cuenta).reset_index(drop=True)
+        columnas = list(t.columns)
+        formatos = {**{c: "mm-dd-yy" for c in columnas if c in SAP_FECHAS}, **formatos_base}
+        hoja = _nombre_hoja(nombres.get(k) or "Sin sub-rubro", usados)
+        escribir_hoja_movimientos(wb, hoja, columnas, list(t.itertuples(index=False, name=None)), formatos, anchos)
         letra = col(columnas.index("Valor/mon.inf.") + 1)
-        ref = f"Movimientos!{letra}2:{letra}{len(t) + 1}"
+        refs.append(f"'{hoja}'!{letra}2:{letra}{max(len(t) + 1, 2)}")
+    rc = info["fila_total"] + 2                              # control: las hojas de movimientos deben sumar la ejecución del resumen
+    if refs:
         ce = col(info["col_ejec_total"])
-        ws.cell(row=rc, column=1, value="Control · suma de «Movimientos»").font = Font(italic=True)
-        ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = FORMATO_DINERO
+        ws.cell(row=rc, column=1, value="Control · suma de las hojas de movimientos").font = Font(italic=True)
+        ws.cell(row=rc, column=info["col_ejec_total"], value="=SUM(" + ",".join(refs) + ")").number_format = FORMATO_DINERO
         ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)").font = Font(italic=True)
         ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = FORMATO_DINERO
     buf = BytesIO()
