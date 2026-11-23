@@ -1,5 +1,5 @@
 """Módulo Corte y poda: ejecución de área cortada (m²) y de árboles podados contra el presupuesto, valorada con las
-dos tarifas del presupuesto (MTA y NMT) lado a lado. El presupuesto sale del libro «SERVICIOS PROYECTADOS CORTE Y PODA»
+la tarifa ($/m²) del presupuesto. El presupuesto sale del libro «SERVICIOS PROYECTADOS CORTE Y PODA»
 y la ejecución de un archivo mensual; ambos se cargan en Administración → Corte y poda."""
 import io
 import re
@@ -44,8 +44,8 @@ def _num(x):
 
 def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]]:
     """Presupuesto del libro de corte y poda: una fila por mes (año según el orden: sube al pasar de diciembre a enero).
-    Formato nuevo, columnas desde «MES»: m², $/m² MTA, $/m² NMT, árboles, poda MTA, poda NMT (el total de corte = m² × tarifa
-    lo calcula el aplicativo). Formato antiguo: m², $/m² MTA, total MTA, $/m² NMT, total NMT, árboles, poda MTA, poda NMT."""
+    Formato nuevo, columnas desde «MES»: m², $/m², árboles, poda (el total de corte = m² × tarifa lo calcula el aplicativo).
+    Formato antiguo: m², $/m², total, [2.ª tarifa y total: se ignoran], árboles, poda. Las columnas «nmt» de cp_ppto quedan vacías."""
     from openpyxl import load_workbook
     wb = load_workbook(archivo, data_only=True, read_only=True)
     ws = next((w for w in wb.worksheets if "PODA" in _norm(w.title)), wb.worksheets[0])
@@ -65,7 +65,7 @@ def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]
         cuerpo.append((m, r))
     g0 = lambda r, k: _num(r[j + k]) if j + k < len(r) else None
     # Formato del libro: el antiguo trae el total de corte (m² × tarifa) junto a cada tarifa; el nuevo solo m² y tarifas.
-    rotulos = " ".join(_norm(v) for v in filas[i0][j + 1:j + 7] if v is not None)
+    rotulos = " ".join(_norm(v) for v in filas[i0][j + 1:j + 6] if v is not None)
     antiguo = "TOTAL" in rotulos
     if not antiguo:
         for _, r in cuerpo:
@@ -78,29 +78,28 @@ def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]
             anio += 1
         previo = m
         g = lambda k: g0(r, k)
-        if antiguo:   # m², $/m² MTA, total MTA, $/m² NMT, total NMT, árboles, poda MTA, poda NMT
-            out.append(dict(anio=anio, mes=m, m2=g(1), tarifa_corte_mta=g(2), valor_corte_mta=g(3), tarifa_corte_nmt=g(4),
-                            valor_corte_nmt=g(5), arboles=g(6), valor_poda_mta=g(7), valor_poda_nmt=g(8)))
-        else:         # m², $/m² MTA, $/m² NMT, árboles, poda MTA, poda NMT: los totales de corte se calculan
-            m2_ = g(1)
-            out.append(dict(anio=anio, mes=m, m2=m2_, tarifa_corte_mta=g(2),
-                            valor_corte_mta=(m2_ * g(2) if m2_ is not None and g(2) is not None else None),
-                            tarifa_corte_nmt=g(3),
-                            valor_corte_nmt=(m2_ * g(3) if m2_ is not None and g(3) is not None else None),
-                            arboles=g(4), valor_poda_mta=g(5), valor_poda_nmt=g(6)))
+        if antiguo:   # libro anterior: m², $/m², total, (2.ª tarifa y su total, ya no se usan), árboles, poda, (poda 2.ª tarifa)
+            out.append(dict(anio=anio, mes=m, m2=g(1), tarifa_corte_mta=g(2), valor_corte_mta=g(3), arboles=g(6), valor_poda_mta=g(7)))
+        else:         # m², $/m², árboles, poda: el total de corte se calcula (m² × $/m²)
+            m2_, tar_ = g(1), g(2)
+            out.append(dict(anio=anio, mes=m, m2=m2_, tarifa_corte_mta=tar_,
+                            valor_corte_mta=(m2_ * tar_ if m2_ is not None and tar_ is not None else None),
+                            arboles=g(3), valor_poda_mta=g(4)))
     d = pd.DataFrame(out).apply(pd.to_numeric, errors="coerce")        # columnas sin datos quedan numéricas (NaN)
+    for c_ in ("tarifa_corte_nmt", "valor_corte_nmt", "valor_poda_nmt"):   # 2.ª tarifa descontinuada; el esquema de cp_ppto la conserva
+        d[c_] = float("nan")
     if d.empty:
         raise ValueError("No encontré meses debajo de la columna «MES».")
-    for esc in ("mta", "nmt"):                                           # sin tarifa no hay valor: no se inventa
+    for esc in ("mta",):                                           # sin tarifa no hay valor: no se inventa
         sin = d[f"tarifa_corte_{esc}"].isna()
         if sin.any():
             d.loc[sin, f"valor_corte_{esc}"] = None
-            avisos.append(f"{esc.upper()}: sin tarifa de corte en {int(sin.sum())} mes(es) (el total del libro se ignora).")
+            avisos.append(f"Sin tarifa de corte en {int(sin.sum())} mes(es) (el total del libro se ignora).")
         ok = d["m2"].notna() & d[f"tarifa_corte_{esc}"].notna() & d[f"valor_corte_{esc}"].notna()
         dif = (d["m2"] * d[f"tarifa_corte_{esc}"] - d[f"valor_corte_{esc}"]).abs()
         mal = ok & (dif > d[f"valor_corte_{esc}"].abs() * 0.001)
         if mal.any():
-            avisos.append(f"{esc.upper()}: m² × tarifa no coincide con el total del libro en {int(mal.sum())} mes(es).")
+            avisos.append(f"m² × tarifa no coincide con el total del libro en {int(mal.sum())} mes(es).")
     sin_arb = d["arboles"].isna() & d["valor_poda_mta"].notna()
     if sin_arb.any():
         avisos.append(f"Poda: {int(sin_arb.sum())} mes(es) tienen valor pero no cantidad de árboles "
@@ -116,11 +115,11 @@ def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame) -> pd.DataFrame:
     ejec = ejec.apply(pd.to_numeric, errors="coerce")
     t = ppto.merge(ejec.rename(columns={"m2": "m2_ej", "arboles": "arboles_ej", "valor_corte": "fact_corte", "valor_poda": "fact_poda"})
                    [["anio", "mes", "m2_ej", "arboles_ej", "fact_corte", "fact_poda"]], on=["anio", "mes"], how="left")
-    for esc in ("mta", "nmt"):
+    for esc in ("mta",):
         t[f"corte_ej_{esc}"] = t["m2_ej"] * t[f"tarifa_corte_{esc}"]
         por_arbol = t[f"valor_poda_{esc}"] / t["arboles"].where(t["arboles"] > 0)
         t[f"poda_ej_{esc}"] = t["arboles_ej"] * por_arbol
-    # Lo facturado es la ejecución real en pesos: manda sobre la valorización con tarifa en la columna MTA (vigente hoy).
+    # Lo facturado es la ejecución real en pesos: manda sobre la valorización con tarifa.
     t["corte_ej_mta"] = t["fact_corte"].where(t["fact_corte"].notna(), t["corte_ej_mta"])
     t["poda_ej_mta"] = t["fact_poda"].where(t["fact_poda"].notna(), t["poda_ej_mta"])
     return t.sort_values(["anio", "mes"]).reset_index(drop=True)
@@ -143,7 +142,7 @@ def resumen(t: pd.DataFrame) -> dict:
     m2 = t[t["m2_ej"].notna()]
     ar = t[t["arboles_ej"].notna()]
     r = dict(m2_p=m2["m2"].sum(), m2_e=m2["m2_ej"].sum(), ar_p=ar["arboles"].sum(), ar_e=ar["arboles_ej"].sum())
-    for esc in ("mta", "nmt"):
+    for esc in ("mta",):
         r[f"corte_p_{esc}"] = m2[f"valor_corte_{esc}"].sum(min_count=1)
         r[f"corte_e_{esc}"] = m2[f"corte_ej_{esc}"].sum(min_count=1)
         v = ar[ar["arboles"] > 0]
@@ -171,7 +170,9 @@ def admin_cargas(ctx):
                 else:
                     for x in avisos:
                         st.warning(x)
-                    st.dataframe(d, hide_index=True, width="stretch")
+                    st.dataframe(d.drop(columns=["tarifa_corte_nmt", "valor_corte_nmt", "valor_poda_nmt"]).rename(columns={
+                        "anio": "Año", "mes": "Mes", "m2": "m²", "tarifa_corte_mta": "$/m²", "valor_corte_mta": "Total corte",
+                        "arboles": "Árboles", "valor_poda_mta": "Poda"}), hide_index=True, width="stretch")
                     if st.button("Guardar presupuesto", type="primary", key="cp_g_ppto"):
                         for anio in d["anio"].unique():
                             con.execute("DELETE FROM cp_ppto WHERE anio=?", (int(anio),))
@@ -299,9 +300,7 @@ def mostrar(ctx):
              icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="Árboles podados", valor=_n(r["ar_e"]), sub=(f"{_fmt_pct(_pct(r['ar_e'], r['ar_p']))} de {_n(r['ar_p'])}" if r["ar_p"] else "sin meta de árboles"),
              icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE),
-        dict(label="Corte valorizado MTA", valor=E.millones(r["corte_e_mta"]), sub=f"{_fmt_pct(_pct(r['corte_e_mta'], r['corte_p_mta']))} de {E.millones(r['corte_p_mta'])}",
-             icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
-        dict(label="Corte valorizado NMT", valor=E.millones(r["corte_e_nmt"]), sub=f"{_fmt_pct(_pct(r['corte_e_nmt'], r['corte_p_nmt']))} de {E.millones(r['corte_p_nmt'])}",
+        dict(label="Corte valorizado", valor=E.millones(r["corte_e_mta"]), sub=f"{_fmt_pct(_pct(r['corte_e_mta'], r['corte_p_mta']))} de {E.millones(r['corte_p_mta'])}",
              icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE)]
     if not MOSTRAR_PODA:
         kpis = [k for k in kpis if k["label"] != "Árboles podados"]
@@ -311,33 +310,48 @@ def mostrar(ctx):
     graficos = [("Área (m²) por mes", "m2", "m2_ej")] + ([("Árboles por mes", "arboles", "arboles_ej")] if MOSTRAR_PODA else [])
     for col, (titulo, p, e) in zip(st.columns(len(graficos)), graficos):
         with col:
-            titulo_tarjeta(titulo, "Barras: m² presupuestados y ejecutados. Línea (eje derecho): precio unitario por m² (tarifa MTA)." if p == "m2" else "")
-            fmt = lambda s_: s_.map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", "."))
-            fig = go.Figure([go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO, marker_line_width=0,
-                                    text=fmt(t[p]), textposition="outside", cliponaxis=False),
-                             go.Bar(x=mes_txt, y=t[e], name="Ejecución", marker_color=COLOR_EJEC, marker_line_width=0,
-                                    text=fmt(t[e]), textposition="outside", cliponaxis=False)])
-            fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
+            titulo_tarjeta(titulo, "Arriba: precio unitario por m². Abajo: m² presupuestados y ejecutados, en millones (M); el detalle sale al pasar el cursor." if p == "m2" else "")
+            miles = lambda v: f"{v:,.0f}".replace(",", ".")
+            fmt = lambda s_: s_.map(lambda v: "" if pd.isna(v) else (f"{v / 1e6:,.2f} M".replace(".", ",") if p == "m2" else miles(v)))
+            hover = "%{x}<br>%{fullData.name}: %{y:,.0f}<extra></extra>"
             tar = t["tarifa_corte_mta"] if p == "m2" else None
-            if tar is not None and tar.notna().any():
+            con_linea = tar is not None and tar.notna().any()
+            if con_linea:      # franja superior para el precio unitario y franja inferior para las barras: nada se sobrepone
+                from plotly.subplots import make_subplots
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.28, 0.72], vertical_spacing=0.06)
+                fila_barras = 2
+            else:
+                fig, fila_barras = go.Figure(), None
+            barras = [go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO, marker_line_width=0, hovertemplate=hover,
+                             text=fmt(t[p]), textposition="outside", textfont=dict(size=10), cliponaxis=False),
+                      go.Bar(x=mes_txt, y=t[e], name="Ejecución", marker_color=COLOR_EJEC, marker_line_width=0, hovertemplate=hover,
+                             text=fmt(t[e]), textposition="outside", textfont=dict(size=10), cliponaxis=False)]
+            for br in barras:
+                fig.add_trace(br, row=fila_barras, col=1) if con_linea else fig.add_trace(br)
+            fig.update_layout(barmode="group", bargap=.25, bargroupgap=.04, legend=dict(orientation="h", y=1.1, x=0))
+            if con_linea:
                 lo, hi = float(tar.min()), float(tar.max())
-                holgura = max((hi - lo) * 0.5, hi * 0.05)
-                fig.add_trace(go.Scatter(x=mes_txt, y=tar, name="Precio unitario ($/m²)", yaxis="y2", mode="lines+markers+text",
+                holgura = max((hi - lo) * 0.3, hi * 0.04)
+                fig.add_trace(go.Scatter(x=mes_txt, y=tar, name="Precio unitario ($/m²)", mode="lines+markers+text",
                                          line=dict(color="#e8912d", width=2), marker=dict(size=6), connectgaps=False,
+                                         hovertemplate="%{x}<br>Precio unitario: %{y:,.2f} $/m²<extra></extra>",
                                          text=tar.map(lambda v: "" if pd.isna(v) else f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")),
-                                         textposition="top center", cliponaxis=False))
-                fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, range=[lo - holgura * 3, hi + holgura],
-                                              tickformat=",.0f", title=dict(text="$/m²", font=dict(size=11))))
-            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
+                                         textposition="top center", textfont=dict(size=10, color="#b86b12"), cliponaxis=False), row=1, col=1)
+                fig.update_yaxes(visible=False, range=[lo - holgura, hi + holgura * 2.5], row=1, col=1)
+                fig.update_yaxes(visible=False, rangemode="tozero", row=2, col=1)
+                fig.update_xaxes(showticklabels=False, row=1, col=1)
+                alto = 360
+            else:
+                fig.update_yaxes(visible=False, rangemode="tozero")
+                alto = 300
+            st.plotly_chart(estilo_grafico(fig, alto), width="stretch", config={"displayModeBar": False})
 
     corte = pd.DataFrame({"Mes": mes_txt, "m² presup.": t["m2"], "m² ejec.": t["m2_ej"],
                           "% m²": [_pct(a, b) for a, b in zip(t["m2_ej"], t["m2"])],
-                          "$ presup. MTA": t["valor_corte_mta"], "$ ejec. MTA": t["corte_ej_mta"],
-                          "$ presup. NMT": t["valor_corte_nmt"], "$ ejec. NMT": t["corte_ej_nmt"]})
+                          "$/m²": t["tarifa_corte_mta"], "$ presup.": t["valor_corte_mta"], "$ ejec.": t["corte_ej_mta"]})
     poda = pd.DataFrame({"Mes": mes_txt, "Árboles presup.": t["arboles"], "Árboles ejec.": t["arboles_ej"],
                          "% árboles": [_pct(a, b) for a, b in zip(t["arboles_ej"], t["arboles"])],
-                         "$ presup. MTA": t["valor_poda_mta"], "$ ejec. MTA": t["poda_ej_mta"],
-                         "$ presup. NMT": t["valor_poda_nmt"], "$ ejec. NMT": t["poda_ej_nmt"]})
+                         "$ presup.": t["valor_poda_mta"], "$ ejec.": t["poda_ej_mta"]})
     cfg_cols = {c: st.column_config.NumberColumn(format="%.0f") for c in corte.columns[1:] if c not in ("% m²",)}
     cfg_cols["% m²"] = st.column_config.NumberColumn(format="percent")
     with st.container(key="card_cp_corte"):
