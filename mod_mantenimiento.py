@@ -1491,16 +1491,7 @@ def _tab_flota(S):
         t = t[t["concepto"].isin(conc_f)]
     if est_f:
         t = t[t["estado"].isin(est_f)]
-    if vista == "Por placa":
-        with st.container(key="mt_card_placa"):
-            titulo_tarjeta("Presupuesto y ejecución por placa", f"{S.escenario} · ejecutado {S.hasta} · placa → concepto de gasto → movimiento")
-            abrir = _toggle_abrir(S, "mt_abrir_placas", "Desplegar conceptos", hondo=2)
-            _aviso_arbol(m)
-            st.html(_html_placa_concepto(S, nodos, m, abrir, False, "Placa / concepto de gasto / movimiento"))
-            st.caption("Cada placa se abre en sus conceptos de gasto y en los movimientos que los componen (fecha, documento, proveedor y "
-                       "texto original; el valor va en «Ejecutado»). Las placas sin ejecución se reúnen en «Otras placas sin ejecución». "
-                       "«SIN PLACA IDENTIFICADA» reúne lo ejecutado cuyo texto no trae una placa del listado oficial.")
-    else:
+    if vista != "Por placa":                           # la tarjeta «Presupuesto y ejecución por placa» ya no se muestra en la página
         with st.container(key="mt_card_conc"):
             titulo_tarjeta("Presupuesto y ejecución por concepto de gasto",
                            f"{S.escenario} · ejecutado {S.hasta}" + (f" · solo la placa {S.placa}" if S.placa else " · todas las placas")
@@ -1559,7 +1550,7 @@ def _tab_flota(S):
         if abs(dp) >= 1 or abs(de) >= 1:
             st.error(f"Los indicadores no coinciden con Placas + Generales: presupuesto {E.pesos(dp)}, ejecutado {E.pesos(de)}.")
     with st.container(key="mt_card_tipo_veh"):
-        titulo_tarjeta("Por tipo de vehículo", f"{S.escenario} · ejecutado {S.hasta}. Cada tipo se abre en sus placas. Barra: relleno = ejecutado, marca = presupuesto.")
+        titulo_tarjeta("Ejecución por placa y por tipo de vehículo", f"{S.escenario} · ejecutado {S.hasta}. Barra: relleno = ejecutado, marca = presupuesto. Cada tipo se abre en sus placas.")
         filas_t = []
         for c in cats:
             hijos = [dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
@@ -1570,13 +1561,14 @@ def _tab_flota(S):
                                 sub=_pl(c["placas"], "placa") if c["placas"] else ("general" if c["general"] else "")))
         filas_t = [f for f in filas_t if f["presupuesto"] != 0 or f["ejecutado"] != 0]
         if filas_t:
-            st.html(E.tabla_visual(sorted(filas_t, key=lambda f: -f["ejecutado"]), "Tipo de vehículo / placa"))
-            _participacion([(f["nombre"], f["ejecutado"]) for f in filas_t], "Participación de cada tipo de vehículo en lo ejecutado")
             top = sorted([n for c in cats for n in c["nodos"] if n["placa"] != L.SIN_PLACA and n["ejecutado"] > 0], key=lambda n: -float(n["ejecutado"]))[:10]
             if top:
                 st.markdown("**Las 10 placas con mayor ejecución**")
                 st.html(E.tabla_visual([dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
                                              sub=_categoria_placa(S, n)) for n in top], "Placa", total=False))
+            st.markdown("**Por tipo de vehículo**")
+            st.html(E.tabla_visual(sorted(filas_t, key=lambda f: -f["ejecutado"]), "Tipo de vehículo / placa"))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in filas_t], "Participación de cada tipo de vehículo en lo ejecutado")
         else:
             st.caption("Aún no hay presupuesto ni ejecución por tipo de vehículo.")
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
