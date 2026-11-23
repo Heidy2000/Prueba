@@ -44,7 +44,8 @@ def _num(x):
 
 def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]]:
     """Presupuesto del libro de corte y poda: una fila por mes (año según el orden: sube al pasar de diciembre a enero).
-    Columnas desde «MES»: m², $/m² MTA, total MTA, $/m² NMT, total NMT, árboles, poda MTA, poda NMT."""
+    Formato nuevo, columnas desde «MES»: m², $/m² MTA, $/m² NMT, árboles, poda MTA, poda NMT (el total de corte = m² × tarifa
+    lo calcula el aplicativo). Formato antiguo: m², $/m² MTA, total MTA, $/m² NMT, total NMT, árboles, poda MTA, poda NMT."""
     from openpyxl import load_workbook
     wb = load_workbook(archivo, data_only=True, read_only=True)
     ws = next((w for w in wb.worksheets if "PODA" in _norm(w.title)), wb.worksheets[0])
@@ -54,19 +55,40 @@ def leer_presupuesto(archivo, anio_inicio: int) -> tuple[pd.DataFrame, list[str]
         raise ValueError("No encontré la columna «MES» en el libro.")
     i0, j = cab
     avisos, out, anio, previo = [], [], anio_inicio, None
+    cuerpo = []                                                          # filas de meses (texto de mes en la columna MES)
     for r in filas[i0 + 1:]:
         m = _mes(r[j]) if j < len(r) else None
         if m is None or not isinstance(r[j], str):
-            if out:
+            if cuerpo:
                 break
             continue
+        cuerpo.append((m, r))
+    g0 = lambda r, k: _num(r[j + k]) if j + k < len(r) else None
+    # Formato del libro: el antiguo trae el total de corte (m² × tarifa) junto a cada tarifa; el nuevo solo m² y tarifas.
+    rotulos = " ".join(_norm(v) for v in filas[i0][j + 1:j + 7] if v is not None)
+    antiguo = "TOTAL" in rotulos
+    if not antiguo:
+        for _, r in cuerpo:
+            m2_, t_, v_ = g0(r, 1), g0(r, 2), g0(r, 3)
+            if m2_ and t_ and v_:
+                antiguo = abs(m2_ * t_ - v_) <= abs(v_) * 0.001
+                break
+    for m, r in cuerpo:
         if previo is not None and m < previo:
             anio += 1
         previo = m
-        g = lambda k: _num(r[j + k]) if j + k < len(r) else None
-        out.append(dict(anio=anio, mes=m, m2=g(1), tarifa_corte_mta=g(2), valor_corte_mta=g(3), tarifa_corte_nmt=g(4),
-                        valor_corte_nmt=g(5), arboles=g(6), valor_poda_mta=g(7), valor_poda_nmt=g(8)))
-    d = pd.DataFrame(out)
+        g = lambda k: g0(r, k)
+        if antiguo:   # m², $/m² MTA, total MTA, $/m² NMT, total NMT, árboles, poda MTA, poda NMT
+            out.append(dict(anio=anio, mes=m, m2=g(1), tarifa_corte_mta=g(2), valor_corte_mta=g(3), tarifa_corte_nmt=g(4),
+                            valor_corte_nmt=g(5), arboles=g(6), valor_poda_mta=g(7), valor_poda_nmt=g(8)))
+        else:         # m², $/m² MTA, $/m² NMT, árboles, poda MTA, poda NMT: los totales de corte se calculan
+            m2_ = g(1)
+            out.append(dict(anio=anio, mes=m, m2=m2_, tarifa_corte_mta=g(2),
+                            valor_corte_mta=(m2_ * g(2) if m2_ is not None and g(2) is not None else None),
+                            tarifa_corte_nmt=g(3),
+                            valor_corte_nmt=(m2_ * g(3) if m2_ is not None and g(3) is not None else None),
+                            arboles=g(4), valor_poda_mta=g(5), valor_poda_nmt=g(6)))
+    d = pd.DataFrame(out).apply(pd.to_numeric, errors="coerce")        # columnas sin datos quedan numéricas (NaN)
     if d.empty:
         raise ValueError("No encontré meses debajo de la columna «MES».")
     for esc in ("mta", "nmt"):                                           # sin tarifa no hay valor: no se inventa
@@ -289,13 +311,24 @@ def mostrar(ctx):
     graficos = [("Área (m²) por mes", "m2", "m2_ej")] + ([("Árboles por mes", "arboles", "arboles_ej")] if MOSTRAR_PODA else [])
     for col, (titulo, p, e) in zip(st.columns(len(graficos)), graficos):
         with col:
-            titulo_tarjeta(titulo)
+            titulo_tarjeta(titulo, "Barras: m² presupuestados y ejecutados. Línea (eje derecho): precio unitario por m² (tarifa MTA)." if p == "m2" else "")
+            fmt = lambda s_: s_.map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", "."))
             fig = go.Figure([go.Bar(x=mes_txt, y=t[p], name="Presupuesto", marker_color=COLOR_PPTO, marker_line_width=0,
-                                    text=t[p].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", ".")), textposition="outside", cliponaxis=False),
-                             go.Bar(x=mes_txt, y=t[e], name="Ejecutado", marker_color=COLOR_EJEC, marker_line_width=0,
-                                    text=t[e].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}".replace(",", ".")), textposition="outside", cliponaxis=False)])
+                                    text=fmt(t[p]), textposition="outside", cliponaxis=False),
+                             go.Bar(x=mes_txt, y=t[e], name="Ejecución", marker_color=COLOR_EJEC, marker_line_width=0,
+                                    text=fmt(t[e]), textposition="outside", cliponaxis=False)])
             fig.update_layout(barmode="group", bargap=.3, yaxis=dict(visible=False, rangemode="tozero"), legend=dict(orientation="h", y=1.12, x=0))
-            st.plotly_chart(estilo_grafico(fig, 280), width="stretch", config={"displayModeBar": False})
+            tar = t["tarifa_corte_mta"] if p == "m2" else None
+            if tar is not None and tar.notna().any():
+                lo, hi = float(tar.min()), float(tar.max())
+                holgura = max((hi - lo) * 0.5, hi * 0.05)
+                fig.add_trace(go.Scatter(x=mes_txt, y=tar, name="Precio unitario ($/m²)", yaxis="y2", mode="lines+markers+text",
+                                         line=dict(color="#e8912d", width=2), marker=dict(size=6), connectgaps=False,
+                                         text=tar.map(lambda v: "" if pd.isna(v) else f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")),
+                                         textposition="top center", cliponaxis=False))
+                fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, range=[lo - holgura * 3, hi + holgura],
+                                              tickformat=",.0f", title=dict(text="$/m²", font=dict(size=11))))
+            st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
 
     corte = pd.DataFrame({"Mes": mes_txt, "m² presup.": t["m2"], "m² ejec.": t["m2_ej"],
                           "% m²": [_pct(a, b) for a, b in zip(t["m2_ej"], t["m2"])],
