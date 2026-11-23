@@ -296,6 +296,43 @@ def _tono(est: str):
             "Dentro del presupuesto": (E.VERDE, E.VERDE_SUAVE)}.get(est, (E.AZUL, E.AZUL_SUAVE))
 
 
+def _sub_pres(S, base: str) -> str:
+    """Texto bajo el presupuesto de los indicadores: con un mes elegido aclara que es el de ese mes."""
+    return f"Presupuesto de {MESES_L[S.sel_mes - 1]} {S.cfg['anio']}" if S.sel_mes else base
+
+
+def _factor_mes(d, cfg: dict, mes: int, asig=None, usuario: str | None = None) -> float | None:
+    """Peso de `mes` en el presupuesto de la flota de UNA compañía (placas + generales). El presupuesto por placa y concepto se carga
+    para todo el escenario, no por mes; el mensual real existe solo para el sub-rubro Flota (que incluye Tecnomecánica/SOAT, ya
+    mensual). Por eso el peso es el del mes en el presupuesto mensual de Flota SIN Tecnomecánica/SOAT: así placas + generales + Tecno/SOAT
+    del mes suman exactamente el presupuesto mensual de Flota. None si no hay presupuesto mensual de Flota que lo respalde."""
+    kf = L.norm_texto(L.SUBRUBRO_FLOTA)
+    pb = d.ppto_base[d.ppto_base["sub_rubro"].fillna("").astype(str).map(L.norm_texto) == kf]
+    if usuario is not None and len(pb):
+        pb = pb[asignacion.columna(pb, asig) == usuario]
+    m0, m1 = cfg["meses"]
+    rango = range(m0, m1 + 1)
+    flota = pb.groupby("mes")["valor"].sum().reindex(rango, fill_value=0.0)
+    ts = d.ts_mes[(d.ts_mes["anio"] == cfg["anio"]) & (d.ts_mes["mes"] >= m0) & (d.ts_mes["mes"] <= m1)].groupby("mes")["valor"].sum().reindex(rango, fill_value=0.0)
+    neto = flota - ts
+    if neto.sum() > 0 and neto[mes] >= 0:
+        return float(neto[mes] / neto.sum())
+    return float(flota[mes] / flota.sum()) if flota.sum() > 0 else None
+
+
+def _ppto_del_mes(d, cfg: dict, mes: int, asig=None, usuario: str | None = None) -> tuple[pd.DataFrame, float | None]:
+    """Presupuesto de UNA compañía para un solo mes, en el formato de `ppto_all`: placas y generales = presupuesto del escenario × peso del
+    mes (`_factor_mes`); Tecnomecánica/SOAT = lo cargado para ese mes. Sin presupuesto mensual de Flota no se puede prorratear: se deja el
+    del escenario y se devuelve factor None para que la pantalla lo avise."""
+    f = _factor_mes(d, cfg, mes, asig, usuario)
+    ppto = d.ppto.copy()
+    if f is not None and len(ppto):
+        ppto["valor"] = pd.to_numeric(ppto["valor"], errors="coerce").fillna(0.0)
+        ppto["valor"] = ppto["valor"].where(~ppto["es_global"].isin([0, 1]), ppto["valor"] * f)
+    ts = L.ts_periodo(d.ts_mes, dict(cfg, meses=(mes, mes))).assign(empresa=d.empresa)
+    return pd.concat([ppto, ts], ignore_index=True), f
+
+
 def _kpis(presupuesto: float, ejecutado: float, movimientos: int, hasta: str, sub_pres="Año completo"):
     t = L.con_metricas(pd.DataFrame({"presupuesto": [presupuesto], "ejecutado": [ejecutado],
                                      "movimientos": [movimientos]})).iloc[0]
@@ -458,7 +495,7 @@ def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False, p
 
 
 def _grafico_ts_mensual(S, presupuesto_mes: pd.DataFrame, ejecucion: pd.DataFrame):
-    meses = list(range(S.m0, S.m1 + 1))
+    meses = list(range(L.desde_mes(S.cfg), S.hasta_mes + 1)) if S.sel_mes else list(range(S.m0, S.m1 + 1))   # un mes: solo ese mes
     pm = presupuesto_mes.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6
     em = (ejecucion.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6).astype(float)
     em[em.index > S.hasta_mes] = None                       # no se dibuja lo que aún no ha pasado
@@ -1360,14 +1397,10 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     pr, er = _rubro_sel(S)
     cfg = dict(S.cfg, etiqueta=str(S.escenario).split()[0])
     nombres, orden, p_, e_ = L.serie_subrubros(pr, er, cfg)
-    ppto_u, factor = S.ppto_sel, None
-    if mes:
-        kf = L.norm_texto(L.SUBRUBRO_FLOTA)
-        m0_, m1_ = cfg["meses"]
-        tot_f = sum(float(p_.get((kf, mm), 0.0)) for mm in range(m0_, m1_ + 1))
-        factor = float(p_.get((kf, mes), 0.0)) / tot_f if tot_f > 0 else 0.0
-        prorratea = ppto_u["es_global"].isin([0, 1])                                  # placas y generales; Tecno/SOAT ya son mensuales
-        ppto_u = ppto_u.assign(valor=ppto_u["valor"].where(~prorratea, ppto_u["valor"] * factor))
+    ppto_u = S.ppto_sel_anual                                                         # el del escenario completo: aquí se prorratea al `mes` pedido
+    if mes:                                                                           # placas y generales por el peso del mes; Tecno/SOAT ya son mensuales
+        usuario_ = None if S.ver_todo else S.ctx.usuario
+        ppto_u = pd.concat([_ppto_del_mes(S.datos_e[e], S.cfg, mes, S.asig, usuario_)[0] for e in S.sel], ignore_index=True)
     m = S.mov_todos[S.mov_todos["empresa"].isin(S.sel)]
     if mes:
         m = m[pd.to_numeric(m["mes"], errors="coerce") == mes]
@@ -1469,7 +1502,7 @@ def _tab_flota(S):
     t_cats = _df_categorias(cats)
     tot = t_cats.iloc[-1] if len(t_cats) else dict(presupuesto=0.0, ejecutado=0.0, movimientos=0)
     _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), int(tot["movimientos"]), S.hasta,
-          f"Escenario {S.escenario}" + (f" · placa {S.placa}" if S.placa else ""))
+          _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
     mp, mg = _movs(S, L.AMB_PLACAS), _movs(S, L.AMB_GEN)
     pend = mp[mp["concepto"] == L.PENDIENTE]
     if not pend.empty:
@@ -1610,7 +1643,7 @@ def _ts_concepto(S, concepto: str, k: str):
     con = [n for n in nodos if n["presupuesto"] > 0]
     sin = [n for n in nodos if n["presupuesto"] <= 0]
     tp, te, tm = _totales(nodos)
-    _kpis(tp, te, tm, S.hasta, f"Escenario {S.escenario}" + (f" · placa {S.placa}" if S.placa else ""))
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
 
     resumen = _resumen_grupos(nodos, lambda n: GRUPO_CON if n["presupuesto"] > 0 else GRUPO_SIN, total=True)
     orden = {GRUPO_CON: 0, GRUPO_SIN: 1, "Total": 2}
@@ -2548,11 +2581,11 @@ def _tab_mantenimiento(S):
         st.info("El rubro no tiene presupuesto ni ejecución en este escenario.")
         return
     tp, te, tm = float(t["presupuesto"].sum()), float(t["ejecutado"].sum()), int(t["movimientos"].sum())
-    _kpis(tp, te, tm, S.hasta, f"Escenario {S.escenario} · rubro completo")
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario} · rubro completo"))
     if S.placa:
         st.caption(f"El filtro de placa ({S.placa}) no cambia el rubro completo de esta pestaña; solo afecta la tabla de ámbitos de abajo.")
     with st.container(key="mt_card_rubro"):
-        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto del escenario completo · ejecutado {S.hasta}"
+        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto {'de ' + MESES_L[S.sel_mes - 1] if S.sel_mes else 'del escenario completo'} · ejecutado {S.hasta}"
                        + (" · cada sub-rubro se abre por compañía" if S.multi else "") + ". Barra: relleno = ejecutado, marca = presupuesto.")
         por_e = None
         if S.multi:
@@ -2600,7 +2633,7 @@ def _tab_contenedores(S):
     t = L.tabla_mensual(pc, ec, S.cfg, S.hasta_mes, "Contenedores")
     tot = t[t["mes"] == 0].iloc[0]
     n_mov = int(((ec["mes"] >= L.desde_mes(S.cfg)) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
-    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, f"Escenario {S.escenario}")
+    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, _sub_pres(S, f"Escenario {S.escenario}"))
     vista = t.assign(Mes=t["mes"].map(lambda m: "Total" if m == 0 else f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}"))
     with st.container(key="mt_card_cont_tabla"):
         titulo_tarjeta("Contenedores · presupuesto vs ejecutado", f"{S.escenario} · ejecutado {S.hasta}")
@@ -2949,10 +2982,10 @@ def _mostrar(ctx, tecnico: bool = False):
     ult = int(en_ventana["mes"].max()) if not en_ventana.empty else m1
     sel_mes = c_hasta.selectbox("Período", [0, *range(m0, m1 + 1)], key=f"mt_mes_{escenario}",
                                 format_func=lambda m: f"Acumulado a {MESES_L[ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
-                                help="Un mes muestra y descarga SOLO ese mes (sin acumular). «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución.")
+                                help="Un mes muestra y descarga SOLO ese mes (sin acumular): su presupuesto y su ejecución. El presupuesto por placa y concepto se carga para todo el escenario, así que se lleva al mes con el peso de ese mes en el presupuesto mensual de Flota. «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución, con el presupuesto del escenario completo.")
     hasta_mes = sel_mes or ult
-    if sel_mes:                                         # un solo mes: todo el cálculo (movimientos, tablas, gráficos, Excel) usa ese mes
-        cfg = dict(cfg, desde=sel_mes)                   # el presupuesto sigue siendo el del escenario; solo la ejecución se recorta al mes
+    if sel_mes:                                         # un solo mes: todo el cálculo (movimientos, presupuesto, tablas, gráficos, Excel) usa ese mes
+        cfg = dict(cfg, desde=sel_mes)
     if sel_mes:
         hasta = f"{MESES_L[sel_mes - 1]} {cfg['anio']}"
     elif m0 == hasta_mes:
@@ -2960,8 +2993,15 @@ def _mostrar(ctx, tecnico: bool = False):
     else:
         hasta = f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {cfg['anio']}"
 
-    ppto_emp = {e: d.ppto_all for e, d in datos_e.items()}
-    ppto_todo = pd.concat(list(ppto_emp.values()), ignore_index=True)
+    ppto_anual = {e: d.ppto_all for e, d in datos_e.items()}              # presupuesto del escenario completo (estructura y respaldo)
+    ppto_todo = pd.concat(list(ppto_anual.values()), ignore_index=True)
+    ppto_emp, sin_mensual = ppto_anual, []
+    if sel_mes:                                          # un mes: el presupuesto también es el de ese mes
+        ppto_emp = {}
+        for e, d in datos_e.items():
+            ppto_emp[e], f_ = _ppto_del_mes(d, cfg, sel_mes, asig, None if ver_todo else usuario)
+            if f_ is None and e in sel and len(d.ppto):
+                sin_mensual.append(e)
     if not (ppto_todo["es_global"] != 2).any():
         zona_encabezado.html(E.encabezado(
             "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
@@ -3032,6 +3072,7 @@ def _mostrar(ctx, tecnico: bool = False):
     vistas = vistas_emp[sel[0]] if not multi else L.calcular(
         pd.concat([ppto_emp[e] for e in sel], ignore_index=True), mov_todos[mov_todos["empresa"].isin(sel)], oficial, placa, tipos)
     ppto_sel = pd.concat([ppto_emp[e] for e in sel], ignore_index=True)
+    ppto_sel_anual = pd.concat([ppto_anual[e] for e in sel], ignore_index=True)
     ppto_val = ppto_sel[(ppto_sel["es_global"] == 1) | (ppto_sel["placa"] == placa)] if placa else ppto_sel
 
     def alcance(df):                                    # mismo recorte que hace calcular(): compañías elegidas y placa
@@ -3075,7 +3116,7 @@ def _mostrar(ctx, tecnico: bool = False):
         if r.placa and str(r.tipo or "").strip():
             tipo_ppto.setdefault(r.placa, " ".join(str(r.tipo).split()))
     S = SimpleNamespace(
-        ctx=ctx, asig=asig, sap_pool=pool_sap, sap_salidas=sap_salidas, oficial=oficial, tipos=tipos, ppto_sel=ppto_sel, lin_sispo=sispo_flota[0], sispo_flota=sispo_flota, sispo_otras=sispo_otras, registro_placas=oficial[["placa", "numero_interno"]], ver_todo=ver_todo, sel=sel, multi=multi, escenario=escenario, cfg=cfg, m0=m0, m1=m1, hasta=hasta, hasta_mes=hasta_mes,
+        ctx=ctx, asig=asig, sap_pool=pool_sap, sap_salidas=sap_salidas, oficial=oficial, tipos=tipos, ppto_sel=ppto_sel, ppto_sel_anual=ppto_sel_anual, lin_sispo=sispo_flota[0], sispo_flota=sispo_flota, sispo_otras=sispo_otras, registro_placas=oficial[["placa", "numero_interno"]], ver_todo=ver_todo, sel=sel, multi=multi, escenario=escenario, cfg=cfg, m0=m0, m1=m1, hasta=hasta, hasta_mes=hasta_mes,
         placa=placa, vistas=vistas, vistas_emp=vistas_emp, catalogo=catalogo, placas_edit=placas_edit, manual=manual,
         es_admin=es_admin, ts_scen=ts_scen, ppto_mes=ppto_mes, datos_e=datos_e, mov_pre=mov_pre, mov_todos=mov_todos,
         mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, contenedores_omitidos={}, tipo_ppto=tipo_ppto, ult=ult,
@@ -3115,6 +3156,9 @@ def _mostrar(ctx, tecnico: bool = False):
                            "pero la ejecución sale en cero hasta que se cargue en el módulo de ejecución.", icon=":material/warning:")
             st.caption("El Excel se genera con las mismas tablas de la pantalla, por eso sus totales coinciden.")
 
+    if sin_mensual:
+        st.warning(f"{', '.join(sin_mensual)}: no hay presupuesto mensual de Flota cargado, así que el presupuesto por placa y concepto no se "
+                   f"puede llevar a {MESES_L[sel_mes - 1]}: se muestra el del escenario completo.", icon=":material/warning:")
     # ------------------------------------------------------------------ pestañas
     con_cont = any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel)       # SM no tiene Contenedores: sin pestaña si solo se ve SM
     nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])

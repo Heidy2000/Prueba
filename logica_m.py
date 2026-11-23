@@ -1681,12 +1681,15 @@ def desde_mes(cfg: dict) -> int:
 
 
 def tabla_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: int) -> pd.DataFrame:
-    """Resumen por sub-rubro: presupuesto del escenario completo, ejecutado hasta el corte, saldo, % y estado."""
+    """Resumen por sub-rubro: presupuesto, ejecutado hasta el corte, saldo, % y estado. Con un solo mes (`cfg["desde"]`) el presupuesto es el
+    de ese mes; en el acumulado es el del escenario completo."""
     nombres, orden, p, e = serie_subrubros(ppto, ejec, cfg)
     m0 = desde_mes(cfg)
+    solo_mes = "desde" in cfg
+    pres = lambda k: float(p[k][(p[k].index >= m0) & (p[k].index <= hasta_mes)].sum() if solo_mes else p[k].sum())
     ej = ejec[(ejec["mes"] >= m0) & (ejec["mes"] <= hasta_mes)]
     n = ej.assign(_k=ej["sub_rubro"].fillna("").astype(str).map(norm_texto)).groupby("_k").size()
-    filas = [dict(sub_rubro=nombres[k], presupuesto=float(p[k].sum()) if k in p.index.get_level_values(0) else 0.0,
+    filas = [dict(sub_rubro=nombres[k], presupuesto=pres(k) if k in p.index.get_level_values(0) else 0.0,
                   ejecutado=float(e[k][(e[k].index >= m0) & (e[k].index <= hasta_mes)].sum()) if k in e.index.get_level_values(0) else 0.0,
                   movimientos=int(n.get(k, 0))) for k in orden]
     t = pd.DataFrame(filas, columns=["sub_rubro", "presupuesto", "ejecutado", "movimientos"])
@@ -1694,11 +1697,14 @@ def tabla_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes
 
 
 def tabla_mensual(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: int, sub_rubro: str) -> pd.DataFrame:
-    """Un sub-rubro mes a mes: presupuesto, ejecutado (hasta el corte), saldo y %. Última fila = total."""
+    """Un sub-rubro mes a mes: presupuesto, ejecutado (hasta el corte), saldo y %. Última fila = total. Con un solo mes (`cfg["desde"]`)
+    solo trae ese mes, con su presupuesto y su ejecución."""
     _, _, p, e = serie_subrubros(ppto, ejec, cfg)
     k = norm_texto(sub_rubro)
     m0, m1 = cfg["meses"]
     d0 = desde_mes(cfg)
+    if "desde" in cfg:
+        m0, m1 = d0, hasta_mes
     filas = []
     for m in range(m0, m1 + 1):
         en = d0 <= m <= hasta_mes
