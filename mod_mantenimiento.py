@@ -1877,7 +1877,7 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
     if memo and memo[0] == llave:
         return memo[1]
     d = L.sispo_leer(up)
-    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
+    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
     res = dict(info=info, periodos=L.sispo_periodos(lin), empresa_probable=L.sispo_empresa_probable(lin) if len(lin) else None, original=d)
     lin = L.sispo_placas(lin, S.registro_placas)
     lin = L.sispo_cruzar_cuentas(lin, maestro, _catalogos_cuentas(S))
@@ -2105,6 +2105,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
         ("Total de registros SISPO", f"{info['total']:,}".replace(",", ".")),
         (f"Registros de las {len(L.SISPO_CUENTAS)} cuentas", f"{info['en_cuenta']:,}".replace(",", ".")),
         ("Registros de otras cuentas (no se tocan)", (", ".join(f"{k}: {v}" for k, v in info["otras_cuentas"].items()) or "ninguno")),
+        ("Salidas del grupo [6] - ACTIVOS FIJOS (se excluyen)", f"{info['grupo_excluido']['salidas']:,} por {_pesos2(-info['grupo_excluido']['centavos'] / 100)}".replace(",", ".")),
         ("Registros con Costo Total Con IVA negativo", f"{info['negativos']:,}".replace(",", ".")),
         ("Referencias distintas (en las salidas filtradas)", f"{lin.loc[lin['codigo'] != '', 'codigo'].nunique():,}".replace(",", ".")),
         ("Referencias encontradas en la base maestra", f"{lin.loc[lin['concepto'] != L.PENDIENTE, 'codigo'].nunique():,}".replace(",", ".")),
@@ -2316,7 +2317,7 @@ def _detallar_genericos(S, ejec: pd.DataFrame, empresa: str) -> pd.DataFrame:
         up = sispo_fuente.abrir(S.ctx.leer, empresa, per)
         if up is None:
             continue
-        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS)
+        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
         if lin.empty:
             continue
         p = lin["fecha"].dt.strftime("%Y%m").fillna("")

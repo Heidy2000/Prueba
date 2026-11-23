@@ -2010,12 +2010,22 @@ def cuenta_de(x, cuentas=SISPO_CUENTAS) -> str | None:
     return next((c for c in cuentas if clase20(c) == k), None)
 
 
-def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,)) -> tuple[pd.DataFrame, dict]:
-    """Aplica los dos filtros: «Nombre Cta» entre `cuentas` y «Costo Total Con Iva» negativo. Devuelve las líneas (con el valor en
-    centavos y `cuenta` con el nombre oficial) y los conteos del resumen, también por cuenta. Cada registro cae en UNA sola cuenta
-    (la de su propio «Nombre Cta»); las cuentas del archivo que no están en `cuentas` no se tocan y se informan en `otras_cuentas`."""
+SISPO_GRUPOS_EXCLUIDOS_MTTO = ("[6] - ACTIVOS FIJOS",)     # Mantenimiento no toma del SISPO las salidas de este grupo (no son gasto)
+
+
+def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,), excluir_grupos=()) -> tuple[pd.DataFrame, dict]:
+    """Aplica los filtros: «Nombre Cta» entre `cuentas`, «Grupo» fuera de `excluir_grupos` (se compara sin tildes, espacios ni signos:
+    «[6] - ACTIVOS FIJOS» = «6 activos fijos») y «Costo Total Con Iva» negativo. Devuelve las líneas (con el valor en centavos y
+    `cuenta` con el nombre oficial) y los conteos del resumen, también por cuenta (`grupo_excluido`: salidas negativas que se dejaron
+    fuera por su grupo y su valor en centavos). Cada registro cae en UNA sola cuenta (la de su propio «Nombre Cta»); las cuentas del
+    archivo que no están en `cuentas` no se tocan y se informan en `otras_cuentas`."""
     oficial = d["cuenta"].map(lambda x: cuenta_de(x, cuentas))
     f = d[oficial.notna()].assign(cuenta=oficial[oficial.notna()])
+    excl = {_canon(g) for g in excluir_grupos}
+    fuera = f["grupo"].map(_canon).isin(excl) if excl and "grupo" in f else pd.Series(False, index=f.index)
+    grupo_excluido = dict(salidas=int(((f["costo_con_iva"] < 0) & fuera).sum()),
+                          centavos=int(f.loc[(f["costo_con_iva"] < 0) & fuera, "costo_con_iva"].map(centavos).sum()))
+    f = f[~fuera]
     sin_valor = int(f["costo_con_iva"].isna().sum())
     neg = f[f["costo_con_iva"] < 0].copy()
     neg["centavos"] = neg["costo_con_iva"].map(centavos)
@@ -2027,7 +2037,7 @@ def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,)) -> tuple[pd.DataFram
     otras = d[oficial.isna()]["cuenta"].map(lambda x: " ".join(_como_texto(x).split()) or "(sin cuenta)").value_counts()
     info = dict(total=len(d), en_cuenta=len(f), negativos=len(neg), sin_valor=sin_valor, con_mas_de_2_decimales=mas_dec,
                 positivos_en_cuenta=int((f["costo_con_iva"] > 0).sum()), repetidos=int(neg["id_kardex"].duplicated().sum()),
-                por_cuenta=por, otras_cuentas=otras.to_dict())
+                por_cuenta=por, otras_cuentas=otras.to_dict(), grupo_excluido=grupo_excluido)
     return neg.reset_index(drop=True), info
 
 
