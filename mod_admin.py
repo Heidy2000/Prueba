@@ -1209,7 +1209,7 @@ def _cargar_dotacion(ctx):
     ult_sispo = int(guardados["periodo"].max()) // 100 if not guardados.empty else None
     with st.container(key="card_adm_dot"):
         titulo_tarjeta("Dotación y EPP's · presupuesto",
-                       "Sube el libro «3.1 DOTACION Y EPPS». Reemplaza el presupuesto de esa compañía y año. "
+                       "Sube el libro «3.1 DOTACION Y EPPS». Reemplaza el presupuesto de esa compañía y año (si el libro trae más de un año, de todos ellos). "
                        "La ejecución es la de SAP (código 3.1 · «Dotación y epp´s»); el SISPO (cuenta DOTACIÓN PERSONAL) la detalla por elemento.")
         c1, c2 = st.columns([2, 1])
         f = c1.file_uploader("Presupuesto de dotación", type=["xlsx", "xlsm"], key="dot_ppto_up")
@@ -1226,13 +1226,19 @@ def _cargar_dotacion(ctx):
                 if anio_hoja and anio != anio_hoja:
                     st.warning(f"La hoja se llama «{info['hoja']}» (año {anio_hoja}) pero la vas a guardar como {anio}. "
                                "Confirma que es el año correcto: la comparación usa este año para cruzar con el SISPO.")
-                st.markdown(f"**{f.name}:** {info['elementos']} elementos · " + " · ".join(
-                    f"{k}: {E.millones(v)}" for k, v in info["por_seccion"].items()) + f" · total {E.millones(info['valor_total'])}")
+                if info["bloques"] > 1:       # el libro trae varios años: el primero es el «Año del presupuesto» y los siguientes van +1, +2…
+                    st.markdown(f"**{f.name}:** {info['elementos']} elementos · {info['bloques']} años en el libro (el primero es el año indicado arriba)")
+                    for k, sec in info["por_bloque"].items():
+                        st.markdown(f"- **{anio + k}:** " + " · ".join(f"{n}: {E.millones(v)}" for n, v in sec.items()) + f" · total {E.millones(sum(sec.values()))}")
+                else:
+                    st.markdown(f"**{f.name}:** {info['elementos']} elementos · " + " · ".join(
+                        f"{k}: {E.millones(v)}" for k, v in info["por_seccion"].items()) + f" · total {E.millones(info['valor_total'])}")
                 st.caption("«Actividades» (exámenes, capacitaciones…) se guarda pero no se compara: no pasa por el inventario del SISPO.")
                 if st.button("Cargar presupuesto de dotación", type="primary", key="dot_ppto_ok"):
-                    con.execute("DELETE FROM dot_ppto WHERE empresa=? AND anio=?", (empresa, anio))
-                    con.anexar(d.assign(empresa=empresa, anio=anio)[["empresa", "anio", "seccion", "elemento", "precio", "mes", "cantidad", "valor"]],
-                               "dot_ppto")
+                    d = d.assign(empresa=empresa, anio=anio + d["anio_rel"])
+                    for a_ in sorted(d["anio"].unique()):
+                        con.execute("DELETE FROM dot_ppto WHERE empresa=? AND anio=?", (empresa, int(a_)))
+                    con.anexar(d[["empresa", "anio", "seccion", "elemento", "precio", "mes", "cantidad", "valor"]], "dot_ppto")
                     con.commit()
                     ctx.registrar_carga(usuario, "Dotación presupuesto", f.name, f"{empresa} {anio} · {E.millones(d['valor'].sum())}")
                     st.success("Presupuesto de dotación cargado.")
