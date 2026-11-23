@@ -1947,7 +1947,7 @@ def _sispo_panel(S):
             (st.success if resultado[0] == "ok" else st.error)(resultado[1], icon=":material/check_circle:" if resultado[0] == "ok" else ":material/error:")
         st.caption("Reemplaza el movimiento genérico «Salida de inventario <mes>» de SAP por el detalle de SISPO: una línea por referencia "
                    "y placa, con el concepto de la base maestra. Se hace CUENTA POR CUENTA (" + "; ".join(L.SISPO_CUENTAS) + "): cada "
-                   "salida de SISPO solo se asigna a la cuenta de su propio «Nombre Cta» y reemplaza únicamente los genéricos de SAP "
+                   "salida de SISPO solo se asigna a la cuenta de su propio número («CUENTA») y reemplaza únicamente los genéricos de SAP "
                    "de esa misma clase de coste. Cada mes se usa el SISPO de ESE mes, cargado en Administración. Una cuenta solo "
                    "se aplica si su valor total de SISPO coincide con lo que SAP tiene como genérico (tolerancia de redondeo: hasta $1) (se compara solo por valor, "
                    "no por centro de coste); las que no cuadran quedan sin tocar y se informan.")
@@ -2079,7 +2079,11 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
             t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
             if not t["cuadra"].all():
                 v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
-    problemas = L.sispo_validar_cuentas(lin, a["original"], por)
+    problemas = L.sispo_validar_cuentas(lin, a["original"], por, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
+    for cta in L.SAP_PREVALECE.get(empresa, ()):
+        st.info(f"{cta} ({L.CODIGOS_CUENTA[cta]}) en {empresa}: no se concilia ni se reemplaza con SISPO; se conserva el desagregado de SAP "
+                f"(sus movimientos «Salida de inventario» quedan como vienen, con su centro de costo y su «Denominación del objeto»).",
+                icon=":material/info:")
     n_pend_cta = {c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()}
     reg = info["por_cuenta"].set_index("cuenta")["registros"]
 

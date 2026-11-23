@@ -1572,25 +1572,10 @@ def _vacio(v) -> bool:
     return v is None or v == "" or (isinstance(v, float) and pd.isna(v))
 
 
-def numeros_cuenta(ej: pd.DataFrame) -> dict:
-    """Número de cuenta de SAP («Nº docum.r») por cuenta de SISPO, tomado de los movimientos de SAP que sí traen su fila original."""
-    out = {}
-    clave = {sin_tildes(c).lower().replace(" ", ""): c for c in SAP_COLUMNAS}
-    for r in ej.to_dict("records"):
-        if not _vacio(r.get("sispo")) and bool(r.get("sispo")):
-            continue
-        bruto = _raw_a_dict(r.get("raw"))
-        crudo = {clave.get(sin_tildes(str(k)).lower().replace(" ", "")): v for k, v in bruto.items()}
-        num = crudo.get("Nº docum.r")
-        if _vacio(num):                                      # en el archivo de SAP la cuenta puede venir como «Referencia»
-            num = bruto.get("Referencia")
-        if _vacio(num) and str(r.get("cuenta") or "") not in ("", "SISPO"):
-            num = r.get("cuenta")
-        nom = crudo.get("Denom.clase de coste") or r.get("cuenta_nombre")
-        if _vacio(num) or _vacio(nom):
-            continue
-        out.setdefault(cuenta_de(nom) or str(nom), str(int(num)) if isinstance(num, float) and float(num).is_integer() else str(num))
-    return out
+def numeros_cuenta(ej: pd.DataFrame | None = None) -> dict:
+    """Número de cuenta de SAP («Nº docum.r») de cada cuenta de SISPO. Es fijo (`CODIGOS_CUENTA`): ya no se deduce del nombre que traen los
+    movimientos, porque un mismo nombre (OTROS, FLOTA Y EQUIPO DE TR…) corresponde a varias cuentas de SAP. `ej` se ignora."""
+    return dict(CODIGOS_CUENTA)
 
 
 def filas_sap(ej: pd.DataFrame, num_cuenta: dict | None = None) -> pd.DataFrame:
@@ -1886,16 +1871,23 @@ def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int
 SISPO_CUENTAS = ("FLOTA Y EQUIPO DE TR", "MAQUINARIA Y EQUIPO", "COMBUSTIBLES Y LUBRI", "DOTACIÓN PERSONAL",
                  "ÚTILES, PAPELERÍA Y", "OTROS", "REPARACIONES LOCATIV")   # «Nombre Cta» que se reclasifican (tal como los trae SISPO)
 SISPO_CUENTA = SISPO_CUENTAS[0]                 # la cuenta de la flota: es la que alimenta la página Flota
+# El cruce SAP ↔ SISPO se hace por el NÚMERO de cuenta, no por su nombre: SAP «Referencia» (guardada en `cuenta`) y SISPO «CUENTA».
+# Los nombres de arriba son solo la etiqueta con que se muestran. Los nombres de SAP se repiten entre cuentas («OTROS» es 5110950000,
+# 5135950000, 5315950010 y 7310959500; «FLOTA Y EQUIPO DE TR» tiene cinco), por eso el nombre no sirve de llave.
+CODIGOS_CUENTA = {"FLOTA Y EQUIPO DE TR": "7310454000", "MAQUINARIA Y EQUIPO": "7310453500", "COMBUSTIBLES Y LUBRI": "7310953500",
+                  "DOTACIÓN PERSONAL": "7310958000", "ÚTILES, PAPELERÍA Y": "7310953000", "OTROS": "7310959500",
+                  "REPARACIONES LOCATIV": "7315500060"}
+NOMBRE_DE_CODIGO = {c: n for n, c in CODIGOS_CUENTA.items()}
 SISPO_GENERICO = "SALIDA DE INVENTARIO"         # texto (normalizado) con que SAP agrupa esas salidas
 SISPO_REQUERIDAS = {                            # clave normalizada de la columna -> nombre interno
     "FECHAMOVIMIENTO": "fecha", "ARTICULO": "articulo",
     "CANTIDADSALIDA": "cantidad", "COSTOUNIDADSINIVA": "costo_unidad", "COSTOTOTALSINIVA": "costo_sin_iva",
     "COSTOTOTALCONIVA": "costo_con_iva", "CENTROCOSTO": "centro_costo", "CENTRODECOSTOS": "cc_codigo",
-    "NOMBRECTA": "cuenta", "BODEGA": "bodega"}
+    "CUENTA": "cuenta_cod", "BODEGA": "bodega"}
 # «IdKardex» y «Codigo Articulo» no son obligatorias al LEER (así la pantalla puede diagnosticar el archivo), pero sí para APLICAR. Si
 # faltan: el IdKardex se reemplaza por «FILA-n» (n = número de fila del Excel, único y estable) y la referencia queda vacía, o sea
 # PENDIENTE DE CLASIFICACIÓN. La pantalla bloquea la aplicación y `_sispo_aplicar` rechaza los identificadores «FILA-n».
-SISPO_OPCIONALES = {"CIERRE": "cierre", "EMPRESAAGENCIA": "empresa_txt", "TIPOMOVIMIENTO": "tipo_mov",
+SISPO_OPCIONALES = {"NOMBRECTA": "cuenta", "CIERRE": "cierre", "EMPRESAAGENCIA": "empresa_txt", "TIPOMOVIMIENTO": "tipo_mov",
                     "IDKARDEX": "id_kardex", "CODIGOARTICULO": "codigo", "GRUPO": "grupo", "CONCEPTO": "concepto"}
 PREFIJO_ID_SINTETICO = "FILA-"
 
@@ -1903,6 +1895,31 @@ PREFIJO_ID_SINTETICO = "FILA-"
 def _canon(x) -> str:
     """Solo letras y números en mayúsculas y sin tildes: compara nombres sin importar espacios, signos ni mayúsculas."""
     return re.sub(r"[^A-Z0-9]", "", sin_tildes(_como_texto(x)).upper())
+
+
+def cuenta_cod(x) -> str:
+    """Número de cuenta normalizado, igual venga como texto («7310454000», « 7310454000 », «7310454000.0», «7.310.454.000») o como número
+    (entero, decimal, de numpy): solo dígitos, sin «.0». Devuelve '' si no hay un número (vacío, NaN, «SISPO»…). Es la ÚNICA forma de
+    comparar cuentas entre SAP y SISPO."""
+    if x is None:
+        return ""
+    if isinstance(x, (int, float)) or type(x).__module__ == "numpy":
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return ""
+        return str(int(v)) if v == v and v not in (float("inf"), float("-inf")) and v == int(v) else ""
+    t = str(x).strip()
+    if re.fullmatch(r"\d+(\.\d+)?[eE]\+?\d+", t):                    # notación científica de Excel («7.31045E+09»)
+        t = str(int(float(t)))
+    t = re.sub(r"[.,]0+$", "", t)
+    return re.sub(r"\D", "", t)
+
+
+def cuenta_por_codigo(x, cuentas=SISPO_CUENTAS) -> str | None:
+    """Nombre oficial de la cuenta (de `cuentas`) cuyo NÚMERO es `x` (texto o número), o None si no es ninguna de ellas."""
+    n = NOMBRE_DE_CODIGO.get(cuenta_cod(x))
+    return n if n in cuentas else None
 
 
 def _num_co(x) -> float:
@@ -1948,10 +1965,10 @@ def sispo_leer(archivo) -> pd.DataFrame:
     """Lee el SISPO: busca la fila de encabezados (el archivo puede traer filas de filtro encima), valida que estén las columnas
     necesarias y devuelve los registros con nombres internos y números ya convertidos. Las filas vacías se descartan."""
     crudo = pd.read_excel(archivo, header=None, dtype=object)
-    clave_enc = {"NOMBRECTA", "COSTOTOTALCONIVA"}                 # la fila de encabezados es la que trae estas dos columnas
+    clave_enc = {"CUENTA", "COSTOTOTALCONIVA"}                    # la fila de encabezados es la que trae estas dos columnas
     fila = next((i for i in range(min(len(crudo), 30)) if clave_enc <= {_canon(c) for c in crudo.iloc[i].tolist()}), None)
     if fila is None:
-        raise ValueError("No encontré la fila de encabezados del SISPO (debe tener «Nombre Cta» y «Costo Total Con Iva»).")
+        raise ValueError("No encontré la fila de encabezados del SISPO (debe tener «CUENTA» —el número— y «Costo Total Con Iva»).")
     enc = [_canon(c) for c in crudo.iloc[fila].tolist()]
     datos = crudo.iloc[fila + 1:].reset_index(drop=True)
     mapa = {}
@@ -1972,16 +1989,25 @@ def sispo_leer(archivo) -> pd.DataFrame:
     if faltan:
         raise ValueError("Al SISPO le faltan columnas: " + ", ".join(faltan) + ".")
     d = pd.DataFrame({k: datos.iloc[:, i] for k, i in mapa.items()})
-    for c in ("cierre", "empresa_txt", "tipo_mov", "cc_nombre", "codigo", "grupo", "concepto"):
+    for c in ("cierre", "empresa_txt", "tipo_mov", "cc_nombre", "codigo", "grupo", "concepto", "cuenta"):
         if c not in d:
             d[c] = ""
+    d["cuenta_cod"] = d["cuenta_cod"].map(cuenta_cod)                         # número de cuenta, venga como texto o como número
+    vacia = d["cuenta_cod"].eq("") & d["cuenta"].isna()
     if "id_kardex" in d:
-        d = d[d["id_kardex"].notna() | d["cuenta"].notna()].copy()            # filas realmente vacías fuera
+        d = d[d["id_kardex"].notna() | ~vacia].copy()                         # filas realmente vacías fuera
     else:                                                                     # sin IdKardex: id sintético = fila del Excel
         d["id_kardex"] = [f"{PREFIJO_ID_SINTETICO}{fila + 2 + k}" for k in range(len(d))]
-        d = d[d["cuenta"].notna()].copy()                                     # sin id, una fila sin «Nombre Cta» está vacía
+        d = d[~vacia].copy()                                                  # sin id, una fila sin número ni nombre de cuenta está vacía
     for c in ("id_kardex", "centro_costo", "cc_codigo", "cc_nombre", "cuenta", "bodega", "articulo", "empresa_txt", "tipo_mov", "grupo", "concepto"):
         d[c] = d[c].map(lambda x: " ".join(_como_texto(x).split()))
+    # `cuenta` = nombre OFICIAL de la cuenta, tomado del NÚMERO («CUENTA»): un error de escritura en «Nombre Cta» ya no cambia a qué cuenta
+    # pertenece la fila. Si el número no es de las cuentas conocidas, queda el nombre del archivo con su número, para que se vea (y no
+    # coincida por casualidad con el nombre de otra cuenta).
+    oficial = d["cuenta_cod"].map(NOMBRE_DE_CODIGO.get)
+    etiqueta = d["cuenta"].where(d["cuenta_cod"].eq(""), (d["cuenta"] + " [" + d["cuenta_cod"] + "]").str.strip())
+    etiqueta = etiqueta.where(d["cuenta_cod"].ne("") | d["cuenta"].eq(""), d["cuenta"] + " (sin número)")
+    d["cuenta"] = oficial.where(oficial.notna(), etiqueta)
     d["codigo"] = d["codigo"].map(_cod_articulo)
     d["cierre"] = d["cierre"].map(lambda x: _como_texto(x).strip()[:-2] if re.fullmatch(r"\d+\.0", _como_texto(x).strip()) else _como_texto(x).strip())
     d["fecha"] = pd.to_datetime(d["fecha"], errors="coerce")
@@ -2010,16 +2036,20 @@ def cuenta_de(x, cuentas=SISPO_CUENTAS) -> str | None:
     return next((c for c in cuentas if clase20(c) == k), None)
 
 
-SISPO_GRUPOS_EXCLUIDOS_MTTO = ("[6] - ACTIVOS FIJOS",)     # Mantenimiento no toma del SISPO las salidas de este grupo (no son gasto)
+SISPO_GRUPOS_EXCLUIDOS = ("[6] - ACTIVOS FIJOS",)          # NINGÚN cruce toma del SISPO las salidas de este grupo (no son gasto)
+SISPO_GRUPOS_EXCLUIDOS_MTTO = SISPO_GRUPOS_EXCLUIDOS          # nombre anterior, se conserva por compatibilidad
+# Cuentas cuyo desagregado se queda con el de SAP: SISPO no las reemplaza porque en esa compañía SAP y SISPO no coinciden (ALSM: OTROS,
+# 7310959500). Para ellas no se usa ni el SISPO ni el «Denominación del objeto» (p. ej. «Barrido manual») como criterio de detalle.
+SAP_PREVALECE = {"ALSM": ("OTROS",)}
 
 
-def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,), excluir_grupos=()) -> tuple[pd.DataFrame, dict]:
-    """Aplica los filtros: «Nombre Cta» entre `cuentas`, «Grupo» fuera de `excluir_grupos` (se compara sin tildes, espacios ni signos:
+def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,), excluir_grupos=SISPO_GRUPOS_EXCLUIDOS) -> tuple[pd.DataFrame, dict]:
+    """Aplica los filtros: número de cuenta («CUENTA») entre los de `cuentas`, «Grupo» fuera de `excluir_grupos` (se compara sin tildes, espacios ni signos:
     «[6] - ACTIVOS FIJOS» = «6 activos fijos») y «Costo Total Con Iva» negativo. Devuelve las líneas (con el valor en centavos y
     `cuenta` con el nombre oficial) y los conteos del resumen, también por cuenta (`grupo_excluido`: salidas negativas que se dejaron
-    fuera por su grupo y su valor en centavos). Cada registro cae en UNA sola cuenta (la de su propio «Nombre Cta»); las cuentas del
+    fuera por su grupo y su valor en centavos). Cada registro cae en UNA sola cuenta (la de su propio número de cuenta, «CUENTA»); las cuentas del
     archivo que no están en `cuentas` no se tocan y se informan en `otras_cuentas`."""
-    oficial = d["cuenta"].map(lambda x: cuenta_de(x, cuentas))
+    oficial = d["cuenta_cod"].map(lambda x: cuenta_por_codigo(x, cuentas)) if "cuenta_cod" in d else d["cuenta"].map(lambda x: cuenta_de(x, cuentas))
     f = d[oficial.notna()].assign(cuenta=oficial[oficial.notna()])
     excl = {_canon(g) for g in excluir_grupos}
     fuera = f["grupo"].map(_canon).isin(excl) if excl and "grupo" in f else pd.Series(False, index=f.index)
@@ -2175,30 +2205,28 @@ def es_objeto_staf_mtto(objeto: pd.Series) -> pd.Series:
 
 
 def es_staf_otros(df: pd.DataFrame) -> pd.Series:
-    """Movimientos de SAP cuya «Denom.clase de coste» es OTROS (`cuenta_nombre`, o `sub_rubro_sap` si ahí no viene) y cuya
-    «Denominación del objeto» (`cc_nombre`) es «Staf Mantenimiento». El presupuesto de flota no los trae en su sub-rubro, pero son
-    gasto del área de mantenimiento: la pantalla Mantenimiento los suma a «Flota y Equipo de transporte». La comparación ignora
-    mayúsculas, tildes, espacios y signos. Devuelve una serie booleana alineada con `df`."""
+    """Movimientos de SAP cuya cuenta es OTROS (número 7310959500, columna `cuenta`) y cuya «Denominación del objeto» (`cc_nombre`) es «Staf
+    Mantenimiento». El presupuesto de flota no los trae en su sub-rubro, pero son gasto del área de mantenimiento: la pantalla Mantenimiento
+    los suma a «Flota y Equipo de transporte». La cuenta se reconoce por su número (el nombre OTROS lo comparten otras cuentas); el objeto
+    ignora mayúsculas, tildes, espacios y signos. Devuelve una serie booleana alineada con `df`."""
     if df is None or len(df) == 0:
         return pd.Series(False, index=getattr(df, "index", None), dtype=bool)
     vacio = pd.Series("", index=df.index)
-    clase = df["cuenta_nombre"] if "cuenta_nombre" in df else vacio
-    clase_sap = df["sub_rubro_sap"] if "sub_rubro_sap" in df else vacio
+    cuenta = df["cuenta"] if "cuenta" in df else vacio
     obj = df["cc_nombre"] if "cc_nombre" in df else vacio
-    k_otros = _canon(CLASE_STAF_OTROS)
-    es_clase = clase.map(_canon).eq(k_otros) | (clase.map(_canon).eq("") & clase_sap.map(_canon).eq(k_otros))
-    return (es_clase & es_objeto_staf_mtto(obj)).astype(bool)
+    return (cuenta.map(cuenta_cod).eq(CODIGOS_CUENTA[CLASE_STAF_OTROS]) & es_objeto_staf_mtto(obj)).astype(bool)
 
 
 def ids_staf_otros_raw(crudo: pd.DataFrame) -> set:
-    """Respaldo de `es_staf_otros` cuando las columnas de la base no traen la clase o el objeto: mira la fila original de SAP (`raw`,
-    columnas «Denom.clase de coste» y «Denominación del objeto»). `crudo` trae `id` y `raw`. Devuelve los `id` que cumplen."""
-    ids, k_cl, k_ob = set(), _canon(CLASE_STAF_OTROS), _canon(OBJETO_STAF_OTROS)
+    """Respaldo de `es_staf_otros` cuando las columnas de la base no traen la cuenta o el objeto: mira la fila original de SAP (`raw`: «Referencia»
+    o «Nº docum.r» para el número de cuenta y «Denominación del objeto»). `crudo` trae `id` y `raw`. Devuelve los `id` que cumplen."""
+    ids, k_cuenta, k_ob = set(), CODIGOS_CUENTA[CLASE_STAF_OTROS], _canon(OBJETO_STAF_OTROS)
     if crudo is None or crudo.empty:
         return ids
     for i, r in zip(crudo["id"], crudo["raw"]):
         d = {_canon(k): v for k, v in _raw_a_dict(r).items()}
-        if _canon(d.get("DENOMCLASEDECOSTE")) == k_cl and _canon(d.get("DENOMINACIONDELOBJETO")) == k_ob:
+        num = next((d[k] for k in ("REFERENCIA", "NDOCUMR", "CLASEDECOSTE") if k in d and cuenta_cod(d[k])), None)
+        if cuenta_cod(num) == k_cuenta and _canon(d.get("DENOMINACIONDELOBJETO")) == k_ob:
             ids.add(i)
     return ids
 
@@ -2218,15 +2246,13 @@ def ids_staf_otros_ejec(leer, ejec: pd.DataFrame, anio: int, empresa: str) -> se
 
 
 def cuenta_sap(pool: pd.DataFrame) -> pd.Series:
-    """Cuenta de SISPO a la que corresponde cada movimiento de SAP, por su clase de coste («Denom.clase de coste»): se lee de
-    `cuenta_nombre` y, si ahí no hay una de las cuentas, de `sub_rubro_sap`. Una fila pertenece a UNA sola cuenta (None si a
-    ninguna), así un movimiento nunca queda en dos."""
-    vacio = pd.Series("", index=pool.index)
-    cn = pool["cuenta_nombre"].fillna("") if "cuenta_nombre" in pool else vacio
-    ss = pool["sub_rubro_sap"].fillna("") if "sub_rubro_sap" in pool else vacio
-    tabla = {v: cuenta_de(v) for v in set(cn) | set(ss)}
-    a, b = cn.map(tabla), ss.map(tabla)
-    return a.where(a.notna(), b)
+    """Cuenta de SISPO a la que corresponde cada movimiento de SAP, por el NÚMERO de su cuenta (columna `cuenta`, la «Referencia» de SAP; texto
+    o número). Una fila pertenece a UNA sola cuenta (None si a ninguna), así un movimiento nunca queda en dos. Las filas que ya son de
+    SISPO («cuenta» = «SISPO») o sin número no pertenecen a ninguna."""
+    if "cuenta" not in pool:
+        return pd.Series([None] * len(pool), index=pool.index, dtype=object)
+    cod = pool["cuenta"].map(cuenta_cod)
+    return cod.map(NOMBRE_DE_CODIGO.get).astype(object)
 
 
 def sispo_sap_generico(pool: pd.DataFrame, empresa: str, periodo: int, cuenta: str = SISPO_CUENTA) -> pd.DataFrame:
@@ -2289,6 +2315,8 @@ def sispo_conciliar_cuentas(lineas: pd.DataFrame, pool: pd.DataFrame, empresa: s
     out = {}
     vacio = pool.iloc[0:0] if len(pool) else pool
     for cta in cuentas:
+        if cta in SAP_PREVALECE.get(empresa, ()):          # SAP no coincide con SISPO en esta cuenta: se queda con su propio desagregado
+            continue
         lin = lineas[lineas["cuenta"] == cta] if len(lineas) else lineas
         sap = sispo_sap_generico(pool, empresa, periodo, cta) if periodo and len(pool) else vacio
         sap = sap.assign(valor=pd.to_numeric(sap["valor"], errors="coerce").fillna(0.0)) if len(sap) else sap
@@ -2301,7 +2329,7 @@ def sispo_conciliar_cuentas(lineas: pd.DataFrame, pool: pd.DataFrame, empresa: s
     return out
 
 
-def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuenta: dict) -> list[str]:
+def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuenta: dict, excluir_grupos=SISPO_GRUPOS_EXCLUIDOS) -> list[str]:
     """Controles que cruzan cuentas; devuelve los problemas (lista vacía = todo bien):
     · ningún IdKardex en más de una línea, y por tanto en más de una cuenta (nada se cuenta dos veces);
     · ningún movimiento de SAP reemplazado por dos cuentas;
@@ -2316,7 +2344,10 @@ def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuen
             if llaves[i] & llaves[j]:
                 problemas.append(f"{len(llaves[i] & llaves[j])} movimientos de SAP serían reemplazados por dos cuentas a la vez.")
     orig = original[original["costo_con_iva"] < 0].copy()
-    orig["cuenta_of"] = orig["cuenta"].map(lambda x: cuenta_de(x, tuple(por_cuenta)))
+    if excluir_grupos:                                     # los grupos que el filtro deja fuera (p. ej. ACTIVOS FIJOS) tampoco cuentan en el original
+        orig = orig[~orig["grupo"].map(_canon).isin({_canon(g) for g in excluir_grupos})]
+    orig["cuenta_of"] = (orig["cuenta_cod"].map(lambda x: cuenta_por_codigo(x, tuple(por_cuenta))) if "cuenta_cod" in orig
+                         else orig["cuenta"].map(lambda x: cuenta_de(x, tuple(por_cuenta))))
     orig = orig[orig["cuenta_of"].notna()]
     for cta, v in por_cuenta.items():
         o = orig[orig["cuenta_of"] == cta]
@@ -2462,7 +2493,9 @@ def sispo_superponer(ejec: pd.DataFrame, lin: pd.DataFrame, rep: pd.DataFrame, e
     demás queda como estaba."""
     if ejec.empty or lin.empty or rep.empty:
         return ejec
-    lin, rep = sispo_de_cuentas(lin, rep, SISPO_CUENTAS if cuentas is None else cuentas)
+    cuentas = tuple(SISPO_CUENTAS if cuentas is None else cuentas)
+    cuentas = tuple(c for c in cuentas if c not in SAP_PREVALECE.get(empresa, ()))      # estas se quedan con el desagregado de SAP
+    lin, rep = sispo_de_cuentas(lin, rep, cuentas)
     lin, rep = lin[lin["empresa"] == empresa], rep[rep["empresa"] == empresa]
     if lin.empty or rep.empty:
         return ejec

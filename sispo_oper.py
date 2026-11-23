@@ -10,7 +10,7 @@ Filtros previos (se aplican a los datos ORIGINALES del SISPO, antes de clasifica
      SISPO o por la tabla de equivalencias): esas entran sea cual sea su grupo (ej. Aro 20 aluminio es grupo 1 Repuestos). Toda la cuenta
      OTROS de esos centros también entra, de cualquier grupo: SAP la carga completa en 3.1. Lo que no es grupo 5/7 ni cruza va a Herramientas
      (donde SAP carga el genérico) con la observación de `observacion()`.
-  3. «Nombre Cta» = ÚTILES, PAPELERÍA Y OTROS (Papelería) u OTROS (Consumibles, Herramientas y Bolsas).
+  3. Cuenta (por su NÚMERO, «CUENTA») = ÚTILES, PAPELERÍA Y OTROS 7310953000 (Papelería) u OTROS 7310959500 (Consumibles, Herramientas y Bolsas).
   4. Se excluye únicamente la «Denominación del objeto» exactamente «Staf Mantenimiento» (`L.es_objeto_staf_mtto`); esas líneas las trata
      Mantenimiento, que las suma a Flota y Equipo de transporte.
 Reglas por hoja, sobre lo que pasó los filtros:
@@ -32,7 +32,7 @@ import logica_m as L
 
 HOJA_PAPELERIA, HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS = "Papelería", "Consumibles", "Herramientas", "Bolsas"   # HOJA_OTROS = las dos bolsas
 HOJAS_PESOS = (HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS, HOJA_OTROS)       # se comparan en pesos; Papelería, en cantidades
-CUENTA_PAPELERIA = "ÚTILES, PAPELERÍA Y OTROS"                       # «Nombre Cta» completo; el archivo lo trae recortado a 20 caracteres
+CUENTA_PAPELERIA = "ÚTILES, PAPELERÍA Y OTROS"                       # etiqueta; la cuenta se reconoce por su número (7310953000)
 CUENTA_OTROS = "OTROS"
 CENTROS_POR_EMPRESA = {
     "ALDC": {"DB010500": "STAF OPERACIONES", "DB010504": "BARRIDO MANUAL", "DB010515": "PROYECTO AGUAS DE BOGOTÁ",
