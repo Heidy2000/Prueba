@@ -276,7 +276,7 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
     for p in per.itertuples():
         pn = int(p.periodo)
         sap_all = _generico_otros_sap(ejec_all, empresa, pn)
-        sis_c = L.centavos(p.total_otros)
+        sis_c, sap_c = L.centavos(p.total_otros), 0
         if sap_all.empty:
             avisos.append(f"{empresa} {pn}: se toma el SISPO; SAP todavía no trae la «Salida de inventario» de la cuenta OTROS para compararlo.")
         else:
@@ -287,6 +287,14 @@ def _solo_sispo(ejec_sap: pd.DataFrame, ejec_all: pd.DataFrame, lin: pd.DataFram
         l = lin[(lin["periodo"] == pn) & lin["hoja"].isin(OS.HOJAS_PESOS)].reset_index(drop=True)
         if l.empty:
             continue
+        if not sap_all.empty and "grupo" in l and not L.cuadra_c(sap_c - sis_c):      # excepción: si no cuadra con todo, se reintenta sin activos fijos
+            af = L.es_activo_fijo(l["grupo"])
+            act_c = int(sum(L.centavos(v) for v in pd.to_numeric(l.loc[af, "valor"], errors="coerce").fillna(0.0)))
+            if af.any() and L.cuadra_c(sap_c - (sis_c - act_c)):
+                l, sis_c = l[~af].reset_index(drop=True), sis_c - act_c
+                avisos.append(f"{empresa} {pn}: la cuenta OTROS solo cuadra con SAP sin las salidas del grupo [6] - ACTIVOS FIJOS "
+                              f"({int(af.sum())} líneas, {act_c / 100:,.2f}); se excluyeron.")
+                avisos = [a for a in avisos if not (a.startswith(f"{empresa} {pn}: se toma el SISPO, pero la cuenta OTROS difiere"))]
         item, vista = OS._vista_lin(l, items)
         ger = L.sispo_destinos(l, ejec_sap)["gerencia"]
         nuevos.append(pd.DataFrame({

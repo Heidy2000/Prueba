@@ -2073,7 +2073,7 @@ def _sispo_validar(contenido: bytes):
         sispo_oper.leer(io.BytesIO(contenido))                      # Operaciones exige además Grupo, IdKardex y Codigo Articulo
     except Exception as e:
         return None, str(e)
-    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
+    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
     return dict(d=d, info=info, periodos=L.sispo_periodos(lin), empresa=L.sispo_empresa_probable(lin) if len(lin) else None), None
 
 

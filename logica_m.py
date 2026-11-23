@@ -2036,14 +2036,23 @@ def cuenta_de(x, cuentas=SISPO_CUENTAS) -> str | None:
     return next((c for c in cuentas if clase20(c) == k), None)
 
 
-SISPO_GRUPOS_EXCLUIDOS = ("[6] - ACTIVOS FIJOS",)          # NINGÚN cruce toma del SISPO las salidas de este grupo (no son gasto)
+# Los activos fijos NO se excluyen de entrada: se cruza con todo y SOLO si una cuenta no cuadra con SAP se reintenta sin este grupo (ver
+# `sispo_conciliar_cuentas` y `_sispo_cc_conciliados`). Si así cuadra, esa cuenta se aplica sin ellos.
+SISPO_GRUPOS_EXCLUIDOS = ("[6] - ACTIVOS FIJOS",)
 SISPO_GRUPOS_EXCLUIDOS_MTTO = SISPO_GRUPOS_EXCLUIDOS          # nombre anterior, se conserva por compatibilidad
+
+
+def es_activo_fijo(grupo: pd.Series) -> pd.Series:
+    """True en las filas del grupo «[6] - ACTIVOS FIJOS» (se compara sin tildes, espacios ni signos)."""
+    return grupo.map(_canon).isin({_canon(g) for g in SISPO_GRUPOS_EXCLUIDOS})
+
+
 # Cuentas cuyo desagregado se queda con el de SAP: SISPO no las reemplaza porque en esa compañía SAP y SISPO no coinciden (ALSM: OTROS,
 # 7310959500). Para ellas no se usa ni el SISPO ni el «Denominación del objeto» (p. ej. «Barrido manual») como criterio de detalle.
 SAP_PREVALECE = {"ALSM": ("OTROS",)}
 
 
-def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,), excluir_grupos=SISPO_GRUPOS_EXCLUIDOS) -> tuple[pd.DataFrame, dict]:
+def sispo_filtrar(d: pd.DataFrame, cuentas=(SISPO_CUENTA,), excluir_grupos=()) -> tuple[pd.DataFrame, dict]:
     """Aplica los filtros: número de cuenta («CUENTA») entre los de `cuentas`, «Grupo» fuera de `excluir_grupos` (se compara sin tildes, espacios ni signos:
     «[6] - ACTIVOS FIJOS» = «6 activos fijos») y «Costo Total Con Iva» negativo. Devuelve las líneas (con el valor en centavos y
     `cuenta` con el nombre oficial) y los conteos del resumen, también por cuenta (`grupo_excluido`: salidas negativas que se dejaron
@@ -2325,11 +2334,19 @@ def sispo_conciliar_cuentas(lineas: pd.DataFrame, pool: pd.DataFrame, empresa: s
                                                                diferencia_c=int(sum(centavos(v) for v in sap["valor"])) if len(sap) else 0)
         estado = ("Sin salidas en SISPO" if not len(lin) else "Sin genérico en SAP" if not len(sap) else
                   "Cuadra" if conc["cuadra"] else "No cuadra")
-        out[cta] = dict(lin=lin, sap=sap, conc=conc, estado=estado)
+        activos = None
+        if estado == "No cuadra" and "grupo" in lin:                  # excepción: no cuadra con todo -> se reintenta sin activos fijos
+            af = es_activo_fijo(lin["grupo"])
+            if af.any() and (~af).any():
+                c2 = sispo_conciliar(lin[~af], sap)
+                if c2["cuadra"]:
+                    activos = dict(n=int(af.sum()), centavos=int(lin.loc[af, "centavos"].sum()))
+                    lin, conc, estado = lin[~af], c2, "Cuadra"
+        out[cta] = dict(lin=lin, sap=sap, conc=conc, estado=estado, activos_excluidos=activos)
     return out
 
 
-def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuenta: dict, excluir_grupos=SISPO_GRUPOS_EXCLUIDOS) -> list[str]:
+def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuenta: dict) -> list[str]:
     """Controles que cruzan cuentas; devuelve los problemas (lista vacía = todo bien):
     · ningún IdKardex en más de una línea, y por tanto en más de una cuenta (nada se cuenta dos veces);
     · ningún movimiento de SAP reemplazado por dos cuentas;
@@ -2344,13 +2361,13 @@ def sispo_validar_cuentas(lineas: pd.DataFrame, original: pd.DataFrame, por_cuen
             if llaves[i] & llaves[j]:
                 problemas.append(f"{len(llaves[i] & llaves[j])} movimientos de SAP serían reemplazados por dos cuentas a la vez.")
     orig = original[original["costo_con_iva"] < 0].copy()
-    if excluir_grupos:                                     # los grupos que el filtro deja fuera (p. ej. ACTIVOS FIJOS) tampoco cuentan en el original
-        orig = orig[~orig["grupo"].map(_canon).isin({_canon(g) for g in excluir_grupos})]
     orig["cuenta_of"] = (orig["cuenta_cod"].map(lambda x: cuenta_por_codigo(x, tuple(por_cuenta))) if "cuenta_cod" in orig
                          else orig["cuenta"].map(lambda x: cuenta_de(x, tuple(por_cuenta))))
     orig = orig[orig["cuenta_of"].notna()]
     for cta, v in por_cuenta.items():
         o = orig[orig["cuenta_of"] == cta]
+        if v.get("activos_excluidos"):                       # cuenta que solo cuadró sin activos fijos: el original se compara sin ellos
+            o = o[~es_activo_fijo(o["grupo"])]
         l = v["lin"]
         if len(o) != len(l) or sum(centavos(x) for x in o["costo_con_iva"]) != (int(l["centavos"].sum()) if len(l) else 0):
             problemas.append(f"{cta}: lo asignado ({len(l)} salidas) no coincide con el archivo original ({len(o)} salidas).")
@@ -2478,6 +2495,15 @@ def _sispo_cc_conciliados(lin: pd.DataFrame, rep: pd.DataFrame, presentes: set) 
     sis = pd.Series([centavos(v) for v in pd.to_numeric(lin["valor_sap"], errors="coerce").fillna(0.0)], index=lin.index).groupby(kl).sum()
     sap = pd.Series([centavos(v) for v in pd.to_numeric(rep["valor"], errors="coerce").fillna(0.0)], index=rep.index).groupby(kr).sum()
     buenas = {k for k in sap.index if k in sis.index and cuadra_c(int(sap[k]) - int(sis[k]))}
+    if "grupo" in lin:                                             # excepción: el centro que no cuadra con todo se reintenta sin activos fijos
+        af = es_activo_fijo(lin["grupo"])
+        if af.any():
+            sis2 = pd.Series([centavos(v) for v in pd.to_numeric(lin.loc[~af, "valor_sap"], errors="coerce").fillna(0.0)],
+                             index=lin.index[~af]).groupby(kl[~af]).sum()
+            rescate = {k for k in sap.index if k not in buenas and k in sis2.index and cuadra_c(int(sap[k]) - int(sis2[k]))}
+            buenas |= rescate
+            quitar = kl.isin(rescate) & af
+            return lin[kl.isin(buenas) & ~quitar], rep[kr.isin(buenas)]
     return lin[kl.isin(buenas)], rep[kr.isin(buenas)]
 
 
