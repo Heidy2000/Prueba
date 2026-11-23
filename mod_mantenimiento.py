@@ -1479,6 +1479,29 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
                                 rotulo_ppto=f"Presupuesto {MESES_L[mes - 1]}\n(prorrateado)" if mes else "Presupuesto")
 
 
+def _vista_mes(S, mes: int):
+    """Vista de Flota de UN mes con las mismas cifras que usa el Excel reclasificado: presupuesto del mes (el de placa y concepto se prorratea con
+    el peso del mes en el presupuesto mensual de Flota; Tecnomecánica/SOAT ya son mensuales) y solo los movimientos de ese mes. `mes` = 0:
+    la vista de la página tal cual (todo el periodo seleccionado). Devuelve (S con esas vistas, movimientos de placas)."""
+    if not mes:
+        return S, _movs(S, L.AMB_PLACAS)
+    usuario_ = None if S.ver_todo else S.ctx.usuario
+    ppto_u = pd.concat([_ppto_del_mes(S.datos_e[e], S.cfg, mes, S.asig, usuario_)[0] for e in S.sel], ignore_index=True)
+    m = S.mov_todos[S.mov_todos["empresa"].isin(S.sel)]
+    m = m[pd.to_numeric(m["mes"], errors="coerce") == mes]
+    v2 = L.calcular(ppto_u, m, S.oficial, S.placa, S.tipos)
+    S2 = SimpleNamespace(**{**vars(S), "vistas": v2})
+    S2.cfg, S2.hasta_mes, S2.hasta = dict(S.cfg, meses=(mes, S.cfg["meses"][1])), mes, f"{MESES_L[mes - 1]} {S.cfg['anio']}"
+    return S2, _movs(S2, L.AMB_PLACAS)
+
+
+def _top_desviacion(nodos: list[dict], n: int = 10) -> list[dict]:
+    """Las `n` placas con mayor diferencia (en valor absoluto) entre ejecutado y presupuesto, de mayor a menor. Se excluye «SIN PLACA
+    IDENTIFICADA» (no es un vehículo) y las placas sin presupuesto ni ejecución."""
+    c = [x for x in nodos if x["placa"] != L.SIN_PLACA and (float(x["presupuesto"]) != 0 or float(x["ejecutado"]) != 0)]
+    return sorted(c, key=lambda x: (-abs(float(x["ejecutado"]) - float(x["presupuesto"])), x["placa"]))[:n]
+
+
 def _tab_flota(S):
     """Flota y Equipo de transporte. TODOS los perfiles ven la tabla por concepto de gasto (concepto -> movimientos), los indicadores,
     los conceptos generales y el gráfico, con los datos que su perfil puede ver (cada gerencia, solo lo suyo). Solo el administrador
@@ -1558,18 +1581,6 @@ def _tab_flota(S):
                            help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
                                 ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
                                 "No trae el acumulado. Respeta los filtros de concepto, estado y placa.")
-        if S.es_admin:                                      # trae detalle de SISPO de todas las gerencias: solo administrador
-            opc_mes = [0, *range(L.desde_mes(S.cfg), S.hasta_mes + 1)]
-            mes_inf = st.selectbox("Mes del informe reclasificado", opc_mes, index=len(opc_mes) - 1, key="mt_mes_informe_recl",
-                                   format_func=lambda x: "Todos los meses (columna por mes)" if x == 0 else MESES_L[x - 1].capitalize(),
-                                   help="Un mes: solo la ejecución de ese mes y su presupuesto (el de placa y concepto se prorratea; el Resumen usa el "
-                                        "presupuesto mensual real). «Todos los meses»: el informe completo con una columna por mes.")
-            st.download_button("Descargar informe reclasificado (OTROS como concepto)", lambda: _excel_informe_reclasificado(S, mes_inf),
-                               "ejecucion_reclasificada_" + (f"{MESES_L[mes_inf - 1]}_{S.cfg['anio']}" if mes_inf else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx", icon=":material/download:",
-                               key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
-                               help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» "
-                                    "(sin presupuesto), saldo y % de avance con fórmulas, barras de avance y negativos en rojo, más las hojas "
-                                    "«Resumen», «Reclasificación» y «Pendientes por referencia». Solo cambia el Excel: la pantalla no se modifica.")
     if len(g_gen):                                      # los conceptos generales no tienen placa: se ven aparte, así nada queda fuera de la pestaña
         with st.expander(f"Conceptos generales, sin placa ({len(g_gen)})", icon=":material/category:"):
             _aviso_arbol(mg)
@@ -1583,27 +1594,35 @@ def _tab_flota(S):
         if abs(dp) >= 1 or abs(de) >= 1:
             st.error(f"Los indicadores no coinciden con Placas + Generales: presupuesto {E.pesos(dp)}, ejecutado {E.pesos(de)}.")
     with st.container(key="mt_card_tipo_veh"):
-        titulo_tarjeta("Ejecución por placa y por tipo de vehículo", f"{S.escenario} · ejecutado {S.hasta}. Barra: relleno = ejecutado, marca = presupuesto. Cada tipo se abre en sus placas.")
-        filas_t = []
-        for c in cats:
-            hijos = [dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
-                          sub=(f"N° {n['numero_interno']}" if n.get("numero_interno") else ""))
-                     for n in sorted(c["nodos"], key=lambda n: (-float(n["ejecutado"]), -float(n["presupuesto"])))
-                     if n["presupuesto"] != 0 or n["ejecutado"] != 0]
-            filas_t.append(dict(nombre=c["nombre"], presupuesto=c["presupuesto"], ejecutado=c["ejecutado"], hijos=hijos,
-                                sub=_pl(c["placas"], "placa") if c["placas"] else ("general" if c["general"] else "")))
-        filas_t = [f for f in filas_t if f["presupuesto"] != 0 or f["ejecutado"] != 0]
-        if filas_t:
-            top = sorted([n for c in cats for n in c["nodos"] if n["placa"] != L.SIN_PLACA and n["ejecutado"] > 0], key=lambda n: -float(n["ejecutado"]))[:10]
-            if top:
-                st.markdown("**Las 10 placas con mayor ejecución**")
-                st.html(E.tabla_visual([dict(nombre=n["placa"], presupuesto=float(n["presupuesto"]), ejecutado=float(n["ejecutado"]),
-                                             sub=_categoria_placa(S, n)) for n in top], "Placa", total=False))
-            st.markdown("**Por tipo de vehículo**")
-            st.html(E.tabla_visual(sorted(filas_t, key=lambda f: -f["ejecutado"]), "Tipo de vehículo / placa"))
-            _participacion([(f["nombre"], f["ejecutado"]) for f in filas_t], "Participación de cada tipo de vehículo en lo ejecutado")
+        titulo_tarjeta("Las 10 placas con mayor diferencia frente al presupuesto",
+                       "Diferencia = ejecutado − presupuesto, en valor absoluto (rojo = se pasó del presupuesto, verde = quedó por debajo). "
+                       "Cada placa se abre en los conceptos que componen su ejecución y cada concepto, en sus movimientos.")
+        opc_mes = [0, *range(L.desde_mes(S.cfg), S.hasta_mes + 1)]
+        mes_sel = st.selectbox("Mes", opc_mes, index=len(opc_mes) - 1 if len(opc_mes) > 1 else 0, key="mt_mes_informe_recl",
+                               format_func=lambda x: f"Periodo seleccionado ({S.hasta})" if x == 0 else f"{MESES_L[x - 1].capitalize()} {S.cfg['anio']}",
+                               help="Un mes: la ejecución de ese mes contra su presupuesto (el de cada placa y concepto se prorratea con el peso del mes en el "
+                                    "presupuesto mensual de Flota). La lista y el Excel de abajo usan el mismo mes y las mismas cifras.")
+        S_m, mp_m = _vista_mes(S, mes_sel)
+        nodos_m = L.arbol_placas(S_m.vistas, None, conc_f or None, est_f or None)
+        top = _top_desviacion(nodos_m)
+        if top:
+            placas_top = {x["placa"] for x in top}
+            mov_top = mp_m[mp_m["placa"].isin(placas_top)]
+            abrir = _toggle_abrir(S, "mt_abrir_top_desv", "Desplegar conceptos", hondo=2)
+            filas = [_encabezado_arbol("Placa / concepto de gasto / movimiento")] + _bloques_placa(
+                S_m, top, _agrupar(mov_top, ["placa", "concepto"]), len(mov_top) <= MAX_MOV_ARBOL, 0, abrir, False, agrupar=False)
+            tp, te, tm = _totales(top)
+            st.html(_cierre(filas, tp, te, tm))
+            st.caption(f"{_pl(len(top), 'placa')} de {len(nodos_m)}: el total es el de estas placas, no el de toda la flota. "
+                       + ("Sin presupuesto cargado para el mes: la diferencia es igual a lo ejecutado. " if not any(float(x["presupuesto"]) for x in top) else ""))
         else:
-            st.caption("Aún no hay presupuesto ni ejecución por tipo de vehículo.")
+            st.caption("Aún no hay presupuesto ni ejecución por placa en este mes.")
+        if S.es_admin:                                  # trae detalle de SISPO de todas las gerencias: solo administrador
+            st.download_button("Descargar informe reclasificado (Excel)", lambda: _excel_informe_reclasificado(S, mes_sel),
+                               "ejecucion_reclasificada_" + (f"{MESES_L[mes_sel - 1]}_{S.cfg['anio']}" if mes_sel else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx",
+                               icon=":material/download:", key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
+                               help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» (sin presupuesto), "
+                                    "saldo y % de avance con fórmulas, y las hojas «Resumen», «Reclasificación» y «Pendientes por referencia». Usa el mes elegido arriba.")
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
 
 
@@ -1877,7 +1896,7 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
     if memo and memo[0] == llave:
         return memo[1]
     d = L.sispo_leer(up)
-    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
+    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
     res = dict(info=info, periodos=L.sispo_periodos(lin), empresa_probable=L.sispo_empresa_probable(lin) if len(lin) else None, original=d)
     lin = L.sispo_placas(lin, S.registro_placas)
     lin = L.sispo_cruzar_cuentas(lin, maestro, _catalogos_cuentas(S))
@@ -2079,7 +2098,12 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
             t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
             if not t["cuadra"].all():
                 v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
-    problemas = L.sispo_validar_cuentas(lin, a["original"], por, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
+    problemas = L.sispo_validar_cuentas(lin, a["original"], por)
+    for cta, v in por.items():
+        if v.get("activos_excluidos"):
+            ae = v["activos_excluidos"]
+            st.info(f"{cta}: no cuadraba con SAP incluyendo el grupo [6] - ACTIVOS FIJOS; sin él sí. Se excluyen {ae['n']} salidas por "
+                    f"{_pesos2(-ae['centavos'] / 100)}.", icon=":material/info:")
     for cta in L.SAP_PREVALECE.get(empresa, ()):
         st.info(f"{cta} ({L.CODIGOS_CUENTA[cta]}) en {empresa}: no se concilia ni se reemplaza con SISPO; se conserva el desagregado de SAP "
                 f"(sus movimientos «Salida de inventario» quedan como vienen, con su centro de costo y su «Denominación del objeto»).",
@@ -2109,7 +2133,6 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
         ("Total de registros SISPO", f"{info['total']:,}".replace(",", ".")),
         (f"Registros de las {len(L.SISPO_CUENTAS)} cuentas", f"{info['en_cuenta']:,}".replace(",", ".")),
         ("Registros de otras cuentas (no se tocan)", (", ".join(f"{k}: {v}" for k, v in info["otras_cuentas"].items()) or "ninguno")),
-        ("Salidas del grupo [6] - ACTIVOS FIJOS (se excluyen)", f"{info['grupo_excluido']['salidas']:,} por {_pesos2(-info['grupo_excluido']['centavos'] / 100)}".replace(",", ".")),
         ("Registros con Costo Total Con IVA negativo", f"{info['negativos']:,}".replace(",", ".")),
         ("Referencias distintas (en las salidas filtradas)", f"{lin.loc[lin['codigo'] != '', 'codigo'].nunique():,}".replace(",", ".")),
         ("Referencias encontradas en la base maestra", f"{lin.loc[lin['concepto'] != L.PENDIENTE, 'codigo'].nunique():,}".replace(",", ".")),
@@ -2321,7 +2344,7 @@ def _detallar_genericos(S, ejec: pd.DataFrame, empresa: str) -> pd.DataFrame:
         up = sispo_fuente.abrir(S.ctx.leer, empresa, per)
         if up is None:
             continue
-        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS, L.SISPO_GRUPOS_EXCLUIDOS_MTTO)
+        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS)
         if lin.empty:
             continue
         p = lin["fecha"].dt.strftime("%Y%m").fillna("")
