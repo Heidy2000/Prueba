@@ -45,7 +45,14 @@ def _sispo_validar(contenido: bytes):
 def _cargar_sispo(ctx):
     """SISPO del mes: se carga y se guarda UNA vez aquí; Mantenimiento y Operaciones lo toman de lo guardado."""
     with st.container(key="card_adm_sispo"):
-        titulo_tarjeta("SISPO del mes", "Un solo archivo alimenta Mantenimiento y Operaciones. Cargar otro del mismo mes y compañía lo reemplaza.")
+        titulo_tarjeta("SISPO del mes", "Un solo archivo alimenta Mantenimiento y Operaciones, y se aplica en ambos al guardarlo. Cargar otro del mismo mes y compañía lo reemplaza.")
+        r = st.session_state.pop("_adm_sispo_aplic", None)          # resultado de la aplicación automática del último guardado
+        if r is not None:
+            st.success("SISPO guardado." + (" Aplicado en: " + "; ".join(r["ok"]) + "." if r["ok"] else ""), icon=":material/check_circle:")
+            for m in r["avisos"]:
+                st.warning(m, icon=":material/warning:")
+            for m in r["errores"]:
+                st.error(m, icon=":material/error:")
         g = sispo_fuente.listar(ctx.leer)
         if g.empty:
             st.caption("Todavía no hay SISPO guardado.")
@@ -91,7 +98,8 @@ def _cargar_sispo(ctx):
                     sispo_fuente.guardar(ctx.con, empresa, periodo, f.name, ctx.usuario, ahora().strftime("%Y-%m-%d %H:%M"), contenido)
                     ctx.registrar_carga(ctx.usuario, "SISPO", f.name, f"{empresa} {periodo} · {a['info']['total']} registros")
                     st.session_state.pop("_adm_sispo_memo", None)
-                    st.success("SISPO guardado. Mantenimiento y Operaciones lo toman de aquí.")
+                    with st.spinner("Aplicando en Mantenimiento y Operaciones…"):          # sin pasos manuales: se concilia y se aplica al guardar
+                        st.session_state["_adm_sispo_aplic"] = mod_mantenimiento.aplicar_sispo_guardado(ctx, empresa, periodo)
                     st.rerun()
         if not g.empty:
             opciones = [f"{r.empresa} · {r.periodo}" for r in g.itertuples()]

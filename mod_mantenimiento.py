@@ -460,40 +460,6 @@ def _participacion(pares: list[tuple], titulo: str):
         st.html(E.barra_segmentada(seg))
 
 
-def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False, por_empresa: dict | None = None):
-    """Presupuesto vs ejecutado por concepto (los 12 mayores). Responde: ¿dónde se concentra el gasto y qué tanto se ha usado?
-    «Pendiente» (movimientos sin concepto) se omite, salvo que la tabla de al lado también lo muestre (con_pendiente).
-    `por_empresa` ({compañía: tabla con «concepto» y «ejecutado»}): con varias compañías la ejecución se apila por compañía y el
-    presupuesto se marca sobre la barra."""
-    t = t if con_pendiente else t[t["concepto"] != L.PENDIENTE]
-    t = t.copy()
-    for c in ("presupuesto", "ejecutado"):                   # con filtros que dejan la tabla vacía las columnas llegan como texto
-        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0.0)
-    t = t.assign(_m=t[["presupuesto", "ejecutado"]].max(axis=1))
-    top = t[t["_m"] > 0].nlargest(12, "_m").iloc[::-1] if len(t) else t
-    if top.empty:
-        st.caption("Aún no hay presupuesto ni ejecución para graficar.")
-        return
-    nombres = [c[:48] for c in top["concepto"]]
-    if por_empresa and len(por_empresa) > 1:
-        ejec_e = {}
-        for emp, d in por_empresa.items():
-            v = pd.to_numeric(d.set_index("concepto")["ejecutado"], errors="coerce").groupby(level=0).sum() if len(d) else pd.Series(dtype=float)
-            ejec_e[emp] = (v.reindex(top["concepto"]).fillna(0.0).to_numpy() / 1e6)
-        fig = figura_ppto_ejec_empresas(nombres, top["presupuesto"].to_numpy() / 1e6, ejec_e, horizontal=True, modo_ppto="marca")
-        st.plotly_chart(estilo_grafico(fig, 420), width="stretch", config={"displayModeBar": False})
-        st.caption(nota + " Barra = ejecutado, una porción por compañía; la marca oscura es el presupuesto (suma de las compañías).")
-        return
-    fig = go.Figure()
-    fig.add_bar(y=nombres, x=top["presupuesto"] / 1e6, name="Presupuesto", orientation="h", marker_color="#c9d4e4",
-                hovertemplate="%{y}: %{x:,.1f} M<extra>Presupuesto</extra>")
-    fig.add_bar(y=nombres, x=top["ejecutado"] / 1e6, name="Ejecutado", orientation="h", marker_color=E.AZUL,
-                hovertemplate="%{y}: %{x:,.1f} M<extra>Ejecutado</extra>")
-    fig.update_layout(barmode="group", xaxis=dict(tickformat=",.0f", ticksuffix=" M"), yaxis=dict(type="category"))
-    st.plotly_chart(estilo_grafico(fig, 420), width="stretch", config={"displayModeBar": False})
-    st.caption(nota)
-
-
 def _grafico_ts_mensual(S, presupuesto_mes: pd.DataFrame, ejecucion: pd.DataFrame):
     meses = list(range(L.desde_mes(S.cfg), S.hasta_mes + 1)) if S.sel_mes else list(range(S.m0, S.m1 + 1))   # un mes: solo ese mes
     pm = presupuesto_mes.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6
@@ -728,14 +694,6 @@ def _bloques_placa(S, nodos, grupos: dict, embebe: bool, nivel0: int, abrir: set
                          S.emp_placa.get(n["placa"]) if S.multi else "", _pl(len(h), "concepto") if len(h) else "")
         bloques.append(_bloque(_fila(n["placa"], _celdas(n), nivel0, etiqueta), hijos, nivel0 in abrir))
     return bloques
-
-
-def _html_placa_concepto(S, nodos, mov_amb: pd.DataFrame, abrir: set, con_ppto_mes: bool, titulo: str) -> str:
-    """Árbol placa -> concepto -> movimientos."""
-    grupos = _agrupar(mov_amb, ["placa", "concepto"])
-    filas = [_encabezado_arbol(titulo)] + _bloques_placa(S, nodos, grupos, len(mov_amb) <= MAX_MOV_ARBOL, 0, abrir, con_ppto_mes)
-    tp, te, tm = _totales(nodos)
-    return _cierre(filas, tp, te, tm)
 
 
 SIN_CONCEPTO = "Sin concepto presupuestal"
@@ -2066,6 +2024,153 @@ def _huella_codigo(PO) -> str:
         return ""
 
 
+def _sispo_evaluar(S, a: dict, empresa: str, periodo, maestro: pd.DataFrame) -> dict:
+    """Todo lo que hay que saber ANTES de aplicar un SISPO, sin dibujar nada: bloqueos del archivo, conciliación por cuenta (con la
+    revisión por sub-rubro y la validación contra el archivo original), pendientes y qué cuentas se aplican o ya están aplicadas. Lo usan
+    la pantalla de Mantenimiento y la aplicación automática al guardar el SISPO en Administración: así las dos aplican lo mismo."""
+    ctx, lin, info = S.ctx, a["lin"], a["info"]
+    bloqueos, periodos = [], a["periodos"]
+    inferida = a["empresa_probable"]
+    if inferida and inferida != empresa:
+        bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
+    if len(periodos) != 1:
+        bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, periodos)) or "ninguno") + ".")
+    elif periodos[0] // 100 != int(S.cfg["anio"]):
+        bloqueos.append(f"El periodo es de {periodos[0] // 100}, pero el escenario elegido arriba es de {S.cfg['anio']}: cámbialo para procesarlo.")
+    por = L.sispo_conciliar_cuentas(lin, S.sap_salidas, empresa, periodo)
+    for v in por.values():                      # si el genérico está en varios sub-rubros, cada uno debe quedar igual que en SAP
+        if v["estado"] == "Cuadra":
+            t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
+            if not t["cuadra"].all():
+                v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
+    bloqueos += L.sispo_validar_cuentas(lin, a["original"], por)
+    faltan_col = L.sispo_sin_columnas_clave(a["original"])
+    if faltan_col["sin_id"] or faltan_col["sin_codigo"]:         # el lector las tolera (para poder diagnosticar), pero aplicar exige ambas
+        nombres = " ni ".join(n for n, f in (("«IdKardex»", faltan_col["sin_id"]), ("«Codigo Articulo»", faltan_col["sin_codigo"])) if f)
+        bloqueos.append(f"El archivo no trae {nombres}: son obligatorias para aplicar (el IdKardex identifica cada salida y la referencia "
+                        "es lo que se cruza con la base maestra). Descarga el SISPO completo e inténtalo de nuevo.")
+    if info["con_mas_de_2_decimales"]:
+        bloqueos.append(f"{info['con_mas_de_2_decimales']} valores del SISPO traen más de 2 decimales: no se redondean, revisa el archivo.")
+    if info["repetidos"]:
+        bloqueos.append(f"{info['repetidos']} IdKardex aparecen repetidos: revisa el archivo para no duplicar movimientos.")
+    huella_m = L.sispo_huella_maestro(maestro[["codigo", "concepto"]])
+    previo = ctx.leer("SELECT cuenta, huella, huella_maestro, fecha, usuario, estado FROM mtto_sispo_periodo WHERE empresa=? AND periodo=?",
+                      (empresa, int(periodo or 0)))
+    previo = {(L.cuenta_de(r.cuenta) or L.SISPO_CUENTA): r for r in previo.itertuples()}
+    por_aplicar, plan = [], []
+    for cta, v in por.items():
+        if v["estado"] != "Cuadra":
+            continue
+        h, p0 = L.sispo_huella(v["lin"]), previo.get(cta)
+        if p0 is not None and p0.huella == h and p0.huella_maestro == huella_m and p0.estado != ESTADO_APLICACION_SIN_SAP_HEREDADA:
+            plan.append((cta, "Ya aplicada con este mismo archivo y base maestra: no hay nada que cambiar", f"{p0.fecha} · {p0.usuario}"))
+        else:
+            por_aplicar.append((cta, h))
+            accion = "Aplicar" if p0 is None else (
+                "Reprocesar: la aplicación anterior fue sin conciliar con SAP; se reemplaza (no se duplica)"
+                if p0.estado == ESTADO_APLICACION_SIN_SAP_HEREDADA else "Reprocesar: reemplaza lo aplicado antes (no se duplica)")
+            plan.append((cta, accion, "" if p0 is None else f"{p0.fecha} · {p0.usuario}"))
+    return dict(por=por, bloqueos=bloqueos, n_pend_cta={c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()},
+                reg=info["por_cuenta"].set_index("cuenta")["registros"], huella_m=huella_m, por_aplicar=por_aplicar, plan=plan)
+
+
+def _sispo_ejecutar(ctx, ev: dict, empresa: str, periodo: int, archivo: str, ops: dict | None, con_mtto: bool = True) -> tuple[list, str | None]:
+    """Aplica lo evaluado: las cuentas que cuadran en Mantenimiento (si `con_mtto`) y, si hay algo que cambiar, Operaciones con el mismo archivo.
+    Devuelve (lo que se aplicó, falla de Operaciones o None). Es idempotente: reaplicar el mismo archivo no duplica."""
+    hechas = []
+    if con_mtto:
+        for cta, h in ev["por_aplicar"]:
+            v = ev["por"][cta]
+            gen = " / ".join(sorted({str(t) for t in v["sap"]["texto"]}))
+            _sispo_aplicar(ctx, empresa, periodo, cta, v["lin"], v["sap"], v["conc"], archivo, h, ev["huella_m"], gen)
+            hechas.append(cta)
+    falla_ops = None
+    if ops and ops["estado"] != "igual" and not ops["bloqueos"]:
+        try:
+            n_ops = ops["PO"].sispo_guardar(ctx, empresa, periodo, ops["a"], archivo)
+            leido = ctx.leer("SELECT n_lineas FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
+            if leido.empty:                                  # comprobación de lectura: que de verdad quedó en la base
+                falla_ops = "se ejecutó el guardado pero el periodo no aparece en la tabla de Operaciones."
+            else:
+                hechas.append(f"Operaciones ({n_ops} líneas, verificado en la base)")
+        except Exception as e:
+            falla_ops = str(e)
+    return hechas, falla_ops
+
+
+def _S_sispo(ctx, anio: int):
+    """Lo mínimo de la pantalla de Mantenimiento que necesita aplicar un SISPO (presupuesto y catálogo, placas oficiales y los genéricos de SAP
+    de las dos compañías), armado sin abrir la pantalla. None si el año no es de ningún escenario."""
+    cfg = next((dict(c, escenario=n) for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio)), None)
+    if cfg is None:
+        return None
+    asig = asignacion.mapa(ctx.leer)
+    datos_e = {e: _datos_empresa(ctx, e, cfg, asig) for e in EMPRESAS}
+    ppto_todo = pd.concat([d.ppto_all for d in datos_e.values()], ignore_index=True)
+    oficial = ctx.leer("SELECT placa, numero_interno, tipo FROM mtto_placas")
+    return SimpleNamespace(ctx=ctx, sel=list(EMPRESAS), cfg=cfg, catalogo=L.catalogo_conceptos(ppto_todo),
+                           registro_placas=oficial[["placa", "numero_interno"]], sap_salidas=_pool_salidas(datos_e, asig))
+
+
+def aplicar_sispo_guardado(ctx, empresa: str, periodo: int) -> dict:
+    """Al guardar el SISPO en Administración: lo aplica de una vez en Mantenimiento y Operaciones, sin pasar por las pantallas. Hace lo mismo que
+    el botón «Aplicar reclasificación» (mismas conciliaciones y validaciones): una cuenta que no cuadra con SAP no se toca y se informa; las
+    salidas sin concepto quedan como PENDIENTE DE CLASIFICACIÓN. Nunca lanza: devuelve {'ok': [...], 'avisos': [...], 'errores': [...]}."""
+    import operaciones as PO
+    import sispo_fuente
+    res = dict(ok=[], avisos=[], errores=[])
+    try:
+        _exigir_admin(ctx)
+        _asegurar_tablas(ctx)
+        maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
+        if maestro.empty:
+            res["errores"].append("Mantenimiento: falta la base maestra de referencias (Administración → Mantenimiento y Operaciones → Base maestra); "
+                                  "no se aplicó.")
+        up = sispo_fuente.abrir(ctx.leer, empresa, int(periodo))
+        S = _S_sispo(ctx, int(periodo) // 100)
+        if S is None:
+            res["errores"].append(f"No hay escenario presupuestal para {int(periodo) // 100}; no se aplicó.")
+        if res["errores"] or up is None:
+            return res
+        d = L.sispo_leer(up)
+        lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
+        lin = L.sispo_placas(lin, S.registro_placas)
+        lin = L.sispo_cruzar_cuentas(lin, maestro[["codigo", "articulo", "concepto"]], _catalogos_cuentas(S))
+        a = dict(info=info, periodos=L.sispo_periodos(lin), empresa_probable=L.sispo_empresa_probable(lin) if len(lin) else None, original=d,
+                 lin=lin)
+        ev = _sispo_evaluar(S, a, empresa, int(periodo), maestro)
+        if ev["bloqueos"]:
+            res["errores"] += [f"Mantenimiento y Operaciones: {b}" for b in ev["bloqueos"]]
+            return res
+        ops = None
+        try:
+            a_ops = PO.sispo_analizar(ctx, up)
+            ops = dict(PO=PO, a=a_ops, estado=PO.sispo_estado(ctx, empresa, int(periodo), a_ops), bloqueos=a_ops["bloqueos"])
+            res["errores"] += [f"Operaciones no se guardó: {b}" for b in a_ops["bloqueos"]]
+        except Exception as e:
+            res["errores"].append(f"Operaciones: no pude preparar el SISPO ({e}).")
+        hechas, falla_ops = _sispo_ejecutar(ctx, ev, empresa, int(periodo), getattr(up, "name", "SISPO"), ops)
+        res["ok"] += hechas
+        if falla_ops:
+            res["errores"].append(f"Operaciones NO se guardó: {falla_ops}")
+        for cta, v in ev["por"].items():
+            if v["estado"] in ("No cuadra", "No cuadra por sub-rubro", "Sin genérico en SAP"):
+                c = v["conc"]
+                res["avisos"].append(f"{cta}: {v['estado'].lower()} (SAP {_pesos2(c['sap_c'] / 100)} contra SISPO {_pesos2(-c['sispo_c'] / 100)}); "
+                                     "no se aplicó y el genérico de SAP queda como está.")
+            elif v.get("activos_excluidos"):
+                ae = v["activos_excluidos"]
+                res["avisos"].append(f"{cta}: solo cuadró sin el grupo [6] - ACTIVOS FIJOS; se excluyeron {ae['n']} salidas.")
+        pend = sum(ev["n_pend_cta"][c] for c, _ in ev["por_aplicar"])
+        if pend:
+            res["avisos"].append(f"{pend} salidas quedaron como PENDIENTE DE CLASIFICACIÓN (referencias que no están en la base maestra).")
+        if not ev["por_aplicar"] and not hechas:
+            res["avisos"].append("Mantenimiento: no había cuentas nuevas que aplicar (ya estaban aplicadas con este mismo archivo, o ninguna cuadra).")
+    except Exception as e:
+        res["errores"].append(f"No pude aplicar el SISPO automáticamente: {e}. Se puede hacer a mano en Mantenimiento.")
+    return res
+
+
 def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     ctx = S.ctx
     lin, info = a["lin"], a["info"]
@@ -2079,26 +2184,13 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     empresa = c_e.selectbox("Compañía del SISPO", list(EMPRESAS), index=list(EMPRESAS).index(inferida) if inferida else
                             list(EMPRESAS).index(S.sel[0]), key="mt_sispo_empresa",
                             help="Se propone según «EmpresaAgencia» del archivo; si no coincide, la aplicación no deja continuar.")
-    bloqueos = []
-    if inferida and inferida != empresa:
-        bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
     if len(periodos) != 1:
-        bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, periodos)) or "ninguno") + ".")
         periodo = None
     else:
         periodo = periodos[0]
         c_p.metric("Periodo (cierre)", f"{MESES_L[periodo % 100 - 1].capitalize()} {periodo // 100}")
-        if periodo // 100 != int(S.cfg["anio"]):
-            bloqueos.append(f"El periodo es de {periodo // 100}, pero el escenario elegido arriba es de {S.cfg['anio']}: cámbialo para procesarlo.")
-
-    # ---- UNA conciliación por cuenta con la misma función (la regla es la de Flota)
-    por = L.sispo_conciliar_cuentas(lin, S.sap_salidas, empresa, periodo)
-    for v in por.values():                      # si el genérico está en varios sub-rubros, cada uno debe quedar igual que en SAP
-        if v["estado"] == "Cuadra":
-            t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
-            if not t["cuadra"].all():
-                v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
-    problemas = L.sispo_validar_cuentas(lin, a["original"], por)
+    ev = _sispo_evaluar(S, a, empresa, periodo, maestro)         # conciliación por cuenta + validaciones (la misma que aplica al guardar)
+    por, bloqueos, n_pend_cta, reg = ev["por"], list(ev["bloqueos"]), ev["n_pend_cta"], ev["reg"]
     for cta, v in por.items():
         if v.get("activos_excluidos"):
             ae = v["activos_excluidos"]
@@ -2108,8 +2200,6 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
         st.info(f"{cta} ({L.CODIGOS_CUENTA[cta]}) en {empresa}: no se concilia ni se reemplaza con SISPO; se conserva el desagregado de SAP "
                 f"(sus movimientos «Salida de inventario» quedan como vienen, con su centro de costo y su «Denominación del objeto»).",
                 icon=":material/info:")
-    n_pend_cta = {c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()}
-    reg = info["por_cuenta"].set_index("cuenta")["registros"]
 
     st.markdown("**3. Validación antes de aplicar**")
     filas = []
@@ -2161,18 +2251,6 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
             st.warning(f"{cta}: SISPO trae {int(reg.get(cta, 0))} registros pero ninguno con costo negativo"
                        + (f", y SAP tiene {_pesos2(v['conc']['sap_c'] / 100)} como genérico sin detalle. No se aplica." if v["conc"]["n_sap"] else ". No hay nada que reclasificar."),
                        icon=":material/warning:")
-    for p_ in problemas:
-        bloqueos.append(p_)
-    faltan_col = L.sispo_sin_columnas_clave(a["original"])
-    if faltan_col["sin_id"] or faltan_col["sin_codigo"]:         # el lector las tolera (para poder diagnosticar), pero aplicar exige ambas
-        nombres = " ni ".join(n for n, f in (("«IdKardex»", faltan_col["sin_id"]), ("«Codigo Articulo»", faltan_col["sin_codigo"])) if f)
-        bloqueos.append(f"El archivo no trae {nombres}: son obligatorias para aplicar (el IdKardex identifica cada salida y la referencia "
-                        "es lo que se cruza con la base maestra). Descarga el SISPO completo e inténtalo de nuevo.")
-    if info["con_mas_de_2_decimales"]:
-        bloqueos.append(f"{info['con_mas_de_2_decimales']} valores del SISPO traen más de 2 decimales: no se redondean, revisa el archivo.")
-    if info["repetidos"]:
-        bloqueos.append(f"{info['repetidos']} IdKardex aparecen repetidos: revisa el archivo para no duplicar movimientos.")
-
     with st.expander("Distribución de valores por cuenta y concepto", icon=":material/stacked_bar_chart:", expanded=True):
         st.dataframe(L.sispo_distribucion(lin, por_cuenta=True), hide_index=True, width="stretch", column_config={
             "cuenta": "Cuenta", "concepto": "Concepto", "lineas": st.column_config.NumberColumn("Salidas", format="%d"),
@@ -2198,23 +2276,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
 
     # ---- aplicar
     st.markdown("**4. Aplicar**")
-    huella_m = L.sispo_huella_maestro(maestro[["codigo", "concepto"]])
-    previo = ctx.leer("SELECT cuenta, huella, huella_maestro, fecha, usuario, estado FROM mtto_sispo_periodo WHERE empresa=? AND periodo=?",
-                      (empresa, int(periodo or 0)))
-    previo = {(L.cuenta_de(r.cuenta) or L.SISPO_CUENTA): r for r in previo.itertuples()}
-    por_aplicar, plan = [], []
-    for cta, v in por.items():
-        if v["estado"] != "Cuadra":
-            continue
-        h, p0 = L.sispo_huella(v["lin"]), previo.get(cta)
-        if p0 is not None and p0.huella == h and p0.huella_maestro == huella_m and p0.estado != ESTADO_APLICACION_SIN_SAP_HEREDADA:
-            plan.append((cta, "Ya aplicada con este mismo archivo y base maestra: no hay nada que cambiar", f"{p0.fecha} · {p0.usuario}"))
-        else:
-            por_aplicar.append((cta, h))
-            accion = "Aplicar" if p0 is None else (
-                "Reprocesar: la aplicación anterior fue sin conciliar con SAP; se reemplaza (no se duplica)"
-                if p0.estado == ESTADO_APLICACION_SIN_SAP_HEREDADA else "Reprocesar: reemplaza lo aplicado antes (no se duplica)")
-            plan.append((cta, accion, "" if p0 is None else f"{p0.fecha} · {p0.usuario}"))
+    por_aplicar, plan = ev["por_aplicar"], ev["plan"]
     if plan:
         st.dataframe(pd.DataFrame(plan, columns=["Cuenta", "Acción", "Aplicada antes"]), hide_index=True, width="stretch")
     else:
@@ -2231,24 +2293,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     etiqueta = (f"Aplicar reclasificación ({n_mtto} cuenta{'s' if n_mtto != 1 else ''}" + (" + Operaciones)" if ops_hacer else ")"))
     listo = (bool(por_aplicar) and ok_pend) or ops_hacer
     if st.button(etiqueta, key="mt_sispo_aplicar", type="primary", icon=":material/done_all:", disabled=bool(bloqueos) or not listo):
-        hechas = []
-        if ok_pend:                                          # sin la confirmación de pendientes no se toca Mantenimiento
-            for cta, h in por_aplicar:
-                v = por[cta]
-                gen = " / ".join(sorted({str(t) for t in v["sap"]["texto"]}))
-                _sispo_aplicar(ctx, empresa, periodo, cta, v["lin"], v["sap"], v["conc"], archivo, h, huella_m, gen)
-                hechas.append(cta)
-        falla_ops = None
-        if ops_hacer:
-            try:
-                n_ops = ops["PO"].sispo_guardar(ctx, empresa, periodo, ops["a"], archivo)
-                leido = ctx.leer("SELECT n_lineas FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
-                if leido.empty:                                  # comprobación de lectura: que de verdad quedó en la base
-                    falla_ops = "se ejecutó el guardado pero el periodo no aparece en la tabla de Operaciones."
-                else:
-                    hechas.append(f"Operaciones ({n_ops} líneas, verificado en la base)")
-            except Exception as e:
-                falla_ops = str(e)
+        hechas, falla_ops = _sispo_ejecutar(ctx, ev, empresa, periodo, archivo, ops if ops_hacer else None, con_mtto=ok_pend)
         if falla_ops:
             st.session_state["_mt_sispo_msg"] = ("error", ("Aplicado en Mantenimiento: " + ("; ".join(hechas) if hechas else "nada nuevo")
                                                            + f". Operaciones NO se guardó: {falla_ops}"))
