@@ -135,14 +135,6 @@ def _cargar_mantenimiento_operaciones(ctx):
                     with tab:
                         operaciones.admin_presupuesto(ctx, e)
 
-    st.divider()
-    st.markdown("**Descargas de ejecución y revisión técnica** (archivo de ejecución, informe de placas, validaciones, conciliación y reclasificación; usa los mismos cálculos de cada módulo)")
-    c_rm, c_ro = st.columns(2)
-    if c_rm.toggle("Mantenimiento", key="adm_rev_mtto", help="Se calcula solo al activarlo."):
-        mod_mantenimiento.admin_revision_tecnica(ctx)
-    if c_ro.toggle("Operaciones", key="adm_rev_oper", help="Se calcula solo al activarlo."):
-        operaciones.admin_revision_tecnica(ctx)
-
 
 def _ejecuciones(ctx):
     """Vista central (solo lectura) de las ejecuciones que ya están cargadas y procesadas: SAP por rubro y mes, y el estado de cada periodo
