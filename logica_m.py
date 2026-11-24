@@ -2039,7 +2039,6 @@ def cuenta_de(x, cuentas=SISPO_CUENTAS) -> str | None:
 # Los activos fijos NO se excluyen de entrada: se cruza con todo y SOLO si una cuenta no cuadra con SAP se reintenta sin este grupo (ver
 # `sispo_conciliar_cuentas` y `_sispo_cc_conciliados`). Si así cuadra, esa cuenta se aplica sin ellos.
 SISPO_GRUPOS_EXCLUIDOS = ("[6] - ACTIVOS FIJOS",)
-SISPO_GRUPOS_EXCLUIDOS_MTTO = SISPO_GRUPOS_EXCLUIDOS          # nombre anterior, se conserva por compatibilidad
 
 
 def es_activo_fijo(grupo: pd.Series) -> pd.Series:

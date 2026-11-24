@@ -466,7 +466,6 @@ def encabezado(titulo: str, subtitulo: str, chips: list[tuple[str, str]]) -> str
             f'<div class="nf-chips">{cs}</div></div>')
 
 
-TONO_COLOR = {"ok": VERDE, "bad": ROJO, "warn": "#e8892c", "na": "#9aa7b8"}
 
 
 def delta(texto: str, tono: str = "na", flecha: str | None = None) -> str:
@@ -647,11 +646,6 @@ def lista_avance(filas: list[tuple]) -> str:
     return f'<div class="notranslate" translate="no">{out}</div>'
 
 
-# ------------------------------------------------------------------ tabla desplegable
-COLS = ["Presupuesto anual", "Presupuesto al corte", "Ejecutado al corte", "Variación"]
-MAX_TERCEROS = 15
-
-
 def _celdas(r) -> str:
     """r: fila con 'Presupuesto anual', 'Presupuesto al corte', 'Ejecutado al corte' en signo SAP."""
     m = metricas(r["Presupuesto anual"], r["Presupuesto al corte"], r["Ejecutado al corte"])
@@ -660,93 +654,6 @@ def _celdas(r) -> str:
             + f'{millones(m["var"])}</div>'
             + f'<div class="nf-pct">{barra(m["pct"], m["ec"], m["ingreso"])}<span>{pct_txt(m["pct"])}</span></div>'
             + f"<div>{pill(m['pct'], m['ec'], m['ingreso'])}</div>")
-
-
-def _agregar(df: pd.DataFrame) -> pd.Series:
-    return df[COLS[:3]].sum()
-
-
-def _filas_terceros(t: pd.DataFrame, total_sub: float, signo: int = 1) -> str:
-    """Filas de terceros de un sub-rubro: solo ejecución (el presupuesto no se abre por tercero)."""
-    t = t.reindex(t["valor"].mul(signo).sort_values(ascending=False).index)
-    if len(t) > MAX_TERCEROS:
-        resto = t.iloc[MAX_TERCEROS:]
-        t = pd.concat([t.iloc[:MAX_TERCEROS], pd.DataFrame([{
-            "tercero": f"Otros {len(resto)} terceros", "valor": resto["valor"].sum(), "docs": resto["docs"].sum()}])])
-    html = ""
-    for _, r in t.iterrows():
-        part = r["valor"] / total_sub if total_sub else float("nan")
-        ancho = 0 if pd.isna(part) else max(0, min(part, 1)) * 100
-        html += (f'<div class="nf-row nf-ter"><div class="nf-name"><span title="{escape(str(r["tercero"]))}">'
-                 f'{escape(str(r["tercero"]))}</span></div><div>—</div><div>—</div>'
-                 f'<div>{millones(signo * r["valor"])}</div><div>—</div>'
-                 f'<div class="nf-pct"><div class="nf-bar"><div style="width:{ancho:.1f}%;background:#8fb0e3"></div>'
-                 f'</div><span>{pct_txt(part)}</span></div>'
-                 f'<div class="nf-docs">{int(r["docs"])} doc{"s" if r["docs"] != 1 else ""}</div></div>')
-    return html
-
-
-def _orden_rubro(rubro: str) -> tuple:
-    import re
-    return tuple(int(p) for p in re.findall(r"\d+", str(rubro).split(" ")[0])) or (99,)
-
-
-def tabla_desplegable(det: pd.DataFrame, niveles: list[str], abierto: bool = False,
-                      terceros: pd.DataFrame | None = None, etiquetas: list[str] | None = None) -> str:
-    """
-    det: una fila por sub-rubro con columnas COLS + '% ejecución' y las de `niveles`.
-    niveles: ['rubro'] o ['gerencia', 'rubro'] -> grupos desplegables; luego 'sub_rubro'.
-    terceros: (sub_rubro, tercero, valor, docs) -> cada sub-rubro se despliega en sus terceros.
-    etiquetas: nombres visibles de las 4 columnas de valores.
-    """
-    op = " open" if abierto else ""
-    etiquetas = etiquetas or COLS
-    cab = ('<div class="nf-row nf-head"><div>' + " / ".join(n.replace("_", "-").capitalize() for n in niveles)
-           + " / Sub-rubro" + (" / Tercero" if terceros is not None else "") + "</div>"
-           + "".join(f"<div>{c}</div>" for c in etiquetas)
-           + "<div>% ejecución</div><div>Estado</div></div>")
-    por_sub = {}
-    if terceros is not None and not terceros.empty:
-        por_sub = {k: v for k, v in terceros.groupby(["rubro", "sub_rubro"])}
-
-    def bloque(df, nivel_idx):
-        col = niveles[nivel_idx]
-        html = ""
-        if col == "rubro":
-            orden = sorted(df[col].unique(), key=lambda x: _orden_rubro(x))
-        else:
-            orden = sorted(df[col].unique(), key=lambda x: (x == "Sin asignar", str(x)))
-        for nombre in orden:
-            g = df[df[col] == nombre]
-            agg = _agregar(g)
-            n_sub = g["sub_rubro"].nunique()
-            cls = "nf-l0" if nivel_idx == 0 else "nf-l1"
-            html += (f'<details class="{cls}"{op}><summary class="nf-row"><div class="nf-name">{_CHEV}'
-                     f'<span>{escape(str(nombre))}</span><small>{n_sub} sub-rubros</small></div>'
-                     f"{_celdas(agg)}</summary>")
-            if nivel_idx + 1 < len(niveles):
-                html += bloque(g, nivel_idx + 1)
-            else:
-                g = g.reindex(g["Presupuesto anual"].abs().sort_values(ascending=False).index)
-                for _, r in g.iterrows():
-                    nom = escape(r["sub_rubro"])
-                    ters = por_sub.get((r["rubro"], r["sub_rubro"]))
-                    sg = -1 if es_ingreso(r["Presupuesto anual"], r["Presupuesto al corte"], r["Ejecutado al corte"]) else 1
-                    if ters is not None and not ters.empty:
-                        html += (f'<details class="nf-l2"><summary class="nf-row nf-sub"><div class="nf-name">{_CHEV}'
-                                 f'<span title="{nom}">{nom}</span><small>{len(ters)} tercero'
-                                 f'{"s" if len(ters) != 1 else ""}</small></div>{_celdas(r)}</summary>'
-                                 f'{_filas_terceros(ters, ters["valor"].sum(), sg)}</details>')
-                    else:
-                        html += (f'<div class="nf-row nf-sub"><div class="nf-name"><span class="nf-sp"></span>'
-                                 f'<span title="{nom}">{nom}</span></div>{_celdas(r)}</div>')
-            html += "</details>"
-        return html
-
-    total = _agregar(det)
-    pie = f'<div class="nf-row nf-total"><div>Total</div>{_celdas(total)}</div>'
-    return (f'<div class="nf-scroll notranslate" translate="no"><div class="nf-t">{cab}{bloque(det, 0)}{pie}'
-            f'</div></div>')
 
 
 def lista_desviaciones(df: pd.DataFrame, sufijo: str = "al corte") -> str:

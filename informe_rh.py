@@ -37,7 +37,6 @@ CONCEPTOS = [
     ("Suministros", "Transporte operarios", "3.6", ["transporte operarios", "transportes"]),
     ("Suministros", "Servicio de comedor", "3.9", ["casino", "comedor"]),
 ]
-GRUPOS = list(dict.fromkeys(g for g, *_ in CONCEPTOS))
 
 
 def concepto_de(codigo, sub_rubro) -> str | None:
@@ -91,18 +90,7 @@ def resumen(t: pd.DataFrame, hasta: int) -> pd.DataFrame:
 # ------------------------------------------------------------------ formato del Excel
 AZUL, AZUL_SUAVE, GRIS = "1F5FBF", "EAF1FB", "F2F4F7"
 _borde = Border(bottom=Side(style="thin", color="D9E1EC"))
-_mon = '#,##0;[Red]-#,##0'
 _pct = '0.0%'
-
-
-def _titulo(ws, texto: str, sub: str):
-    ws.page_setup.orientation = "landscape"             # al imprimir: horizontal y a lo ancho de una página
-    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws["A1"] = texto
-    ws["A1"].font = Font(bold=True, size=14, color="10284A")
-    ws["A2"] = sub
-    ws["A2"].font = Font(italic=True, size=9, color="5B6B82")
 
 
 def _encabezado(ws, fila: int, nombres: list, desde: int = 1):
@@ -123,35 +111,6 @@ def _fila(ws, fila: int, valores: list, formatos: list, estilo: str = ""):
         if estilo in ("grupo", "total"):
             c.font = Font(bold=True, color="10284A" if estilo == "grupo" else "FFFFFF")
             c.fill = PatternFill("solid", fgColor=AZUL_SUAVE if estilo == "grupo" else "10284A")
-
-
-def _anchos(ws, anchos: dict):
-    for col, w in anchos.items():
-        ws.column_dimensions[col].width = w
-
-
-def _hoja_df(wb, nombre: str, df: pd.DataFrame, titulo: str, sub: str, formatos: dict | None = None,
-             anchos: dict | None = None):
-    ws = wb.create_sheet(nombre)
-    _titulo(ws, titulo, sub)
-    _encabezado(ws, 4, list(df.columns))
-    formatos = formatos or {}
-    for i, fila in enumerate(df.itertuples(index=False), start=5):
-        for j, v in enumerate(fila, start=1):
-            if isinstance(v, float) and pd.isna(v):
-                v = None
-            elif isinstance(v, pd.Timestamp):
-                v = v.to_pydatetime()
-            c = ws.cell(row=i, column=j, value=v)
-            f = formatos.get(df.columns[j - 1])
-            if f:
-                c.number_format = f
-    ws.freeze_panes = "A5"
-    if len(df):
-        ws.auto_filter.ref = f"A4:{get_column_letter(len(df.columns))}{4 + len(df)}"
-    for j, col in enumerate(df.columns, start=1):
-        ws.column_dimensions[get_column_letter(j)].width = (anchos or {}).get(col, max(10, min(45, len(str(col)) + 4)))
-    return ws
 
 
 # ------------------------------------------------------------------ formato igual al archivo de Gestión Humana

@@ -20,14 +20,6 @@ def empresa_de_nombre(nombre: str) -> str:
     return "ALSM" if "ALSM" in n or "MEDIO AMBIENT" in n or "MEDIOAMBIENT" in n else EMPRESA_DEFECTO
 
 
-def selector_empresa(contenedor, disponibles, key: str, label: str = "Compañía"):
-    """Selector de compañía; si solo hay una con datos, no se muestra nada y se devuelve esa."""
-    disponibles = [e for e in EMPRESAS if e in set(disponibles)] or [EMPRESA_DEFECTO]
-    if len(disponibles) == 1:
-        return disponibles[0]
-    return contenedor.selectbox(label, disponibles, key=key, format_func=lambda e: f"{e} · {EMPRESAS[e]}")
-
-
 def ahora():
     """Fecha y hora de Colombia (en la nube el servidor está en otra zona horaria)."""
     from datetime import datetime, timedelta, timezone

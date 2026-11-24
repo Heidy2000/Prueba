@@ -105,10 +105,6 @@ def _lista(pares, n: int = 3) -> str:
     return ", ".join(f"{_corto(k, 40).lower()} ({_M(v, True)})" for k, v in pares[:n])
 
 
-def _cap(t: str) -> str:
-    return t[:1].upper() + t[1:] if t else t
-
-
 # ------------------------------------------------------------------ piezas de la diapositiva
 def _fuente(run, nombre, tam, negrita=False, color=NEGRO):
     f = run.font
