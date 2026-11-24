@@ -9,7 +9,6 @@ ACTIVIDADES (exámenes médicos, capacitaciones, etc.) son servicios que no pasa
 """
 import re
 import unicodedata
-from difflib import SequenceMatcher
 
 import pandas as pd
 
@@ -45,22 +44,33 @@ def _num(x):
 
 # ================================================================== presupuesto
 def leer_ppto(archivo) -> tuple[pd.DataFrame, dict]:
-    """Lee el libro de presupuesto de dotación. Devuelve (filas largas: seccion, elemento, precio, mes, cantidad, valor; info).
+    """Lee el libro de presupuesto de dotación. Devuelve (filas largas: seccion, elemento, precio, mes, cantidad, valor, anio_rel; info).
+    `anio_rel` es 0 para el primer bloque de meses del libro, 1 para el siguiente año, etc.
     Las celdas con fórmula se leen por su valor guardado; si no lo traen, el valor se calcula como cantidad × precio unitario."""
     import openpyxl
     wb = openpyxl.load_workbook(archivo, data_only=True)
     ws = next((h for h in wb.worksheets if "DOTAC" in _norm(h.title)), wb.worksheets[0])
-    col_mes = {}                                                 # mes -> columna de «Cant.»; la de «Valor» es la siguiente
+    meses_cols, cab_fila = [], None                              # [(columna de «Cant.», mes)] de la fila de encabezados; la de «Valor» es la siguiente
     for fila in ws.iter_rows(min_row=1, max_row=12):
-        hallados = {MESES_NOMBRE.index(_norm(c.value)) + 1: c.column for c in fila if c.value is not None and _norm(c.value) in MESES_NOMBRE}
+        hallados = [(c.column, MESES_NOMBRE.index(_norm(c.value)) + 1) for c in fila if c.value is not None and _norm(c.value) in MESES_NOMBRE]
         if len(hallados) >= 3:                                 # el UPA 2026 solo trae septiembre-diciembre
-            col_mes = hallados
+            meses_cols, cab_fila = hallados, fila
             break
-    if not col_mes:
+    if not meses_cols:
         raise ValueError("No encontré los meses (ENERO … DICIEMBRE) en los encabezados del libro de dotación.")
+    # Un libro puede traer varios años uno al lado del otro (p. ej. sep-dic 2026 y luego ene-dic 2027): el bloque nuevo empieza
+    # cuando el mes no sube. Cada bloque tiene su propia columna «PRECIO UNITARIO» (la más cercana a su izquierda; por defecto la D).
+    # Una columna «PROYECTO» no estorba: cada fila es un elemento de un proyecto y sus cantidades y valores se suman por elemento.
+    precios = [c.column for c in cab_fila if c.value is not None and _norm(c.value) == "PRECIO UNITARIO"]
+    bloques, previo = [], None
+    for col, mes in meses_cols:
+        if previo is None or mes <= previo:
+            bloques.append(dict(meses={}, precio=max([x for x in precios if x < col], default=4)))
+        bloques[-1]["meses"][mes] = col
+        previo = mes
     seccion, filas, sin_valor = None, [], 0
     for r in range(1, ws.max_row + 1):
-        b, c, d = ws.cell(r, 2).value, ws.cell(r, 3).value, ws.cell(r, 4).value
+        b, c = ws.cell(r, 2).value, ws.cell(r, 3).value
         nb, nc = _norm(b), _norm(c)
         if nb.startswith("TOTAL") or nc.startswith("TOTAL"):
             continue
@@ -72,22 +82,26 @@ def leer_ppto(archivo) -> tuple[pd.DataFrame, dict]:
         elif nb.startswith("ACTIVIDADES"):
             seccion = ACTIVIDADES
             continue
-        if seccion is None or not nc or nc in ("ELEMENTO", "CONCEPTO") or _num(d) is None:
+        if seccion is None or not nc or nc in ("ELEMENTO", "CONCEPTO"):
             continue
-        precio = _num(d)
         elemento = " ".join(str(c).split())
-        for mes, cc in col_mes.items():
-            cant, val = _num(ws.cell(r, cc).value), _num(ws.cell(r, cc + 1).value)
-            if val is None:
-                val = (cant or 0.0) * precio
-                sin_valor += cant is not None
-            filas.append(dict(seccion=seccion, elemento=elemento, precio=precio, mes=mes, cantidad=cant or 0.0, valor=val))
+        for k, bl in enumerate(bloques):
+            precio = _num(ws.cell(r, bl["precio"]).value)
+            if precio is None:
+                continue
+            for mes, cc in bl["meses"].items():
+                cant, val = _num(ws.cell(r, cc).value), _num(ws.cell(r, cc + 1).value)
+                if val is None:
+                    val = (cant or 0.0) * precio
+                    sin_valor += cant is not None
+                filas.append(dict(seccion=seccion, elemento=elemento, precio=precio, mes=mes, cantidad=cant or 0.0, valor=val, anio_rel=k))
     if not filas:
         raise ValueError("No encontré elementos con precio unitario en el libro de dotación.")
     d = pd.DataFrame(filas)
     anio = next((int(y) for y in re.findall(r"20\d{2}", ws.title)), None)
     info = dict(hoja=ws.title, anio=anio, elementos=int(d["elemento"].nunique()), valor_total=float(d["valor"].sum()), sin_valor=int(sin_valor),
-                por_seccion=d.groupby("seccion")["valor"].sum().to_dict())
+                por_seccion=d.groupby("seccion")["valor"].sum().to_dict(), bloques=len(bloques),
+                por_bloque={int(k): g.groupby("seccion")["valor"].sum().to_dict() for k, g in d.groupby("anio_rel")})
     return d, info
 
 
