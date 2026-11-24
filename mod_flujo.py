@@ -8,10 +8,12 @@ import streamlit as st
 
 import estilo as E
 from flujo import PENDIENTE
-from ui import EMPRESAS, MESES, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
 
 MAX_TERCEROS = 15
 SALDOS_INI = {"saldo inicial", "saldo inicial otros componentes"}
+PROPIO = "Propio de la compañía"
+SUBOLSAS = "Subolsas"
 SALDOS_FIN = {"flujo de caja operación", "flujo de caja financiero", "saldo final otros componentes",
               "saldo final caja"}
 
@@ -48,6 +50,10 @@ def _indicadores(serie, total, info, mov, per, meses, ult, operativa, c_ini, c_i
     por_ter = (-pagos.groupby("tercero")["valor"].sum()).sort_values(ascending=False)
     top10 = dv(float(por_ter.head(10).sum()), float(por_ter.sum()))
 
+    saldos_p = {m: float(sf.get(m, 0.0)) for m in ms}
+    min_mes = min(saldos_p, key=saldos_p.get) if saldos_p else None
+    min_saldo = saldos_p.get(min_mes, 0.0) if min_mes else 0.0
+
     with st.container(key="card_fc_ind"):
         titulo_tarjeta("Indicadores de caja", f"{per.texto.capitalize()} · las razones se calculan sobre el periodo; "
                        "los saldos, al cierre del último mes")
@@ -59,9 +65,10 @@ def _indicadores(serie, total, info, mov, per, meses, ult, operativa, c_ini, c_i
             dict(label="Margen de caja", valor=E.pct_txt(margen) if margen is not None else "—",
                  sub=f"Flujo neto {E.millones(neto)} sobre ingresos", icono="piggy",
                  color=E.VERDE if neto >= 0 else E.ROJO, fondo=E.VERDE_SUAVE if neto >= 0 else E.ROJO_SUAVE),
-            dict(label="Días de caja", valor="—" if dias is None else f"{dias:,.0f} días".replace(",", "."),
-                 sub=f"Saldo {E.millones(saldo)} ÷ egreso diario promedio (últimos 3 meses)", icono="calendar",
-                 color=E.AZUL, fondo=E.AZUL_SUAVE),
+            dict(label="Punto más bajo", valor=E.millones(min_saldo) if min_mes else "—",
+                 sub=(f"Saldo de cierre de {MESES[min_mes - 1].lower()} · el más bajo del periodo" if min_mes
+                      else "Sin saldos"), icono="alert" if min_saldo < 0 else "calendar",
+                 color=E.ROJO if min_saldo < 0 else E.AZUL, fondo=E.ROJO_SUAVE if min_saldo < 0 else E.AZUL_SUAVE),
             dict(label="Concentración de pagos", valor=E.pct_txt(top10) if top10 is not None else "—",
                  sub=(f"Top 10 terceros · el mayor: {escape(str(por_ter.index[0]))[:34]}" if len(por_ter)
                       else "Sin pagos con tercero"), icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
@@ -142,6 +149,65 @@ def _indicadores(serie, total, info, mov, per, meses, ult, operativa, c_ini, c_i
                     "% de los pagos": st.column_config.NumberColumn(format="percent")})
 
 
+def _sin_tercero(t) -> bool:
+    """Movimientos sin tercero identificado (p. ej. traslados a la fiducia): '', 'Sin tercero', '(Sin tercero)'."""
+    return str(t or "").strip().strip("()").strip().lower() in ("", "sin tercero", "nan", "none")
+
+
+def _mayores_egresos(mov: pd.DataFrame, info: pd.DataFrame, meses: list[int], anio: int, operativa: bool = True,
+                     n: int = 5):
+    """Los n egresos más grandes de cada mes, sumados por tercero (si a un tercero se le pagó varias veces en el mes,
+    cuenta una sola vez con el total). Sigue el filtro del módulo: propio de la compañía = sección Egresos; subolsas =
+    salidas de Otros componentes (fiducia). Se excluyen los movimientos sin tercero."""
+    seccion = "Egresos" if operativa else "Otros componentes"
+    with st.container(key="card_fc_top_egresos"):
+        titulo_tarjeta(f"Mayores egresos de cada mes · {n} por mes · {PROPIO if operativa else SUBOLSAS}",
+                       f"Pagos de la sección {seccion} (movimientos de bancos de SAP), sumados por tercero en el mes y "
+                       "sin los movimientos sin tercero. El % es la parte de los egresos del mes que se llevó ese tercero.")
+        conc_egr = set(info.loc[(info["seccion"] == seccion) & (info["tipo"] == "linea"), "concepto"])
+        e = mov[mov["concepto"].isin(conc_egr) & mov["mes"].isin(meses) & (mov["valor"] < 0)] if not mov.empty else mov
+        if not e.empty:
+            e = e[~e["tercero"].map(_sin_tercero)]
+        if e.empty:
+            st.info(f"No hay egresos con tercero en {seccion.lower()} para el periodo.")
+            return
+        e = e.assign(valor=-e["valor"])
+        tarjetas = []
+        for m in meses:
+            em = e[e["mes"] == m]
+            if em.empty:
+                continue
+            tot = em["valor"].sum()
+            g = em.groupby("tercero").agg(valor=("valor", "sum"), concepto=("concepto", lambda c: c.value_counts().index[0]))
+            g = g.nlargest(n, "valor")
+            filas = "".join(
+                f'<div class="fe-f"><span class="fe-n">{i}</span><div class="fe-t"><b title="{escape(t)}">{escape(t)}</b>'
+                f'<small>{escape(_nombre(r.concepto))}</small></div><div class="fe-v">{E.millones(r.valor)}'
+                f'<small>{E.pct_txt(r.valor / tot)}</small></div></div>'
+                for i, (t, r) in enumerate(g.iterrows(), 1))
+            tarjetas.append(f'<div class="fe-c"><div class="fe-h"><b>{MESES_L[m - 1].capitalize()}</b>'
+                            f'<span>Con tercero {E.millones(tot)}</span></div>{filas}</div>')
+        st.html(_CSS_EGRESOS + '<div class="fe-g">' + "".join(tarjetas) + "</div>")
+
+
+_CSS_EGRESOS = f"""<style>
+.fe-g {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(250px, 1fr)); gap:.75rem; }}
+.fe-c {{ border:1px solid {E.BORDE}; border-radius:12px; padding:.65rem .8rem; background:#fff; }}
+.fe-h {{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:.35rem;
+    padding-bottom:.35rem; border-bottom:1px solid #eef1f6; }}
+.fe-h b {{ font-size:.9rem; color:{E.TEXTO}; }}
+.fe-h span {{ font-size:.74rem; color:{E.TEXTO_2}; }}
+.fe-f {{ display:grid; grid-template-columns:20px minmax(0,1fr) auto; gap:.45rem; align-items:center; padding:.3rem 0; }}
+.fe-n {{ width:20px; height:20px; border-radius:50%; background:{E.AZUL_SUAVE}; color:{E.AZUL}; font-size:.7rem;
+    font-weight:700; display:flex; align-items:center; justify-content:center; }}
+.fe-t {{ min-width:0; display:flex; flex-direction:column; }}
+.fe-t b {{ font-size:.8rem; color:{E.TEXTO}; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.fe-t small, .fe-v small {{ font-size:.7rem; color:{E.TEXTO_2}; }}
+.fe-v {{ text-align:right; font-size:.8rem; font-weight:700; color:{E.ROJO}; font-variant-numeric:tabular-nums;
+    display:flex; flex-direction:column; }}
+</style>"""
+
+
 def mostrar(ctx):
     leer = ctx.leer
     zona_encabezado = st.container()
@@ -175,8 +241,9 @@ def mostrar(ctx):
         ult = lin.loc[(lin["tipo"] == "linea") & (lin["valor"] != 0), "mes"].max()
         ult = 1 if pd.isna(ult) else int(ult)
         per = selector_periodo(c[1], c[2], ult, "fc")
-        vista = c[3].segmented_control("Vista", ["Caja operativa", "Otros componentes"], default="Caja operativa",
-                                       key="fc_vista") or "Caja operativa"
+        vista = c[3].segmented_control("Flujo", [PROPIO, SUBOLSAS], default=PROPIO, key="fc_flujo",
+                                       help="Flujo propio de la compañía (caja operativa) o el de las subolsas "
+                                            "(otros componentes de la fiducia).") or PROPIO
 
     proy = leer("SELECT concepto, proyectado, observacion FROM flujo_proyectado WHERE anio=? AND empresa=?",
                 (anio, empresa)) \
@@ -216,57 +283,159 @@ def mostrar(ctx):
                                       f"Flujo de caja ejecutado · {vista.lower()} · {per.texto} · millones de pesos",
                                       chips))
 
-    operativa = vista == "Caja operativa"
+    operativa = vista == PROPIO
     if operativa:
         c_ini, c_ing, c_egr, c_fin = "Saldo inicial", "Total Ingresos", "Total Egresos", "Flujo de caja operación"
     else:
         c_ini, c_ing, c_egr, c_fin = ("Saldo inicial Otros componentes", "Ingresos otros componentes",
                                       "Egresos otros componentes", "Saldo Final otros componentes")
     ing, egr = total(c_ing), total(c_egr)
+    s_ing, s_egr, s_fin = serie(c_ing), serie(c_egr), serie(c_fin)
+    ms_v = [m for m in meses if m <= ult] or meses
+
+    def tendencia(s_):
+        return [float(s_.get(m, 0.0)) if m <= ult else None for m in range(1, max(ms_v) + 1)] if not per.solo else None
+    saldo_ini, saldo_fin = total(c_ini), total(c_fin)
+    m_fin = ms_v[-1]
+    egr_3m = [-float(s_egr.get(k, 0.0)) for k in range(max(1, m_fin - 2), m_fin + 1)]
+    egr_prom = sum(egr_3m) / len(egr_3m) if egr_3m else 0.0
+    dias = saldo_fin / (egr_prom / 30) if egr_prom else None
     st.html(E.kpis([
-        dict(label="Saldo inicial", valor=E.millones(total(c_ini)), sub=f"Al inicio de {MESES[meses[0]-1].lower()}",
+        dict(label="Saldo inicial", valor=E.millones(saldo_ini), sub=f"Al inicio de {MESES[meses[0]-1].lower()}",
              icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label=f"Ingresos {per.suf}", valor=E.millones(ing), sub=per.texto.capitalize(),
-             icono="piggy", color=E.VERDE, fondo=E.VERDE_SUAVE),
+             icono="piggy", color=E.VERDE, fondo=E.VERDE_SUAVE, spark=tendencia(s_ing)),
         dict(label=f"Egresos {per.suf}", valor=E.millones(-egr),
-             sub=f"Flujo neto: <b>{E.millones(ing + egr)}</b>", icono="receipt", color=E.ROJO, fondo=E.ROJO_SUAVE),
+             sub=f"Flujo neto: <b>{E.millones(ing + egr)}</b>", icono="receipt", color=E.ROJO, fondo=E.ROJO_SUAVE,
+             spark=[None if x is None else -x for x in tendencia(s_egr)] if not per.solo else None),
         dict(label="Saldo final" + (" caja operativa" if operativa else " otros comp."),
-             valor=E.millones(total(c_fin)),
+             valor=E.millones(saldo_fin),
+             delta=E.delta_valor(saldo_fin - saldo_ini, saldo_ini, sufijo="vs saldo inicial"),
              sub=f"Caja total (incl. otros componentes): {E.millones(total('Saldo Final Caja'))}",
-             icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE),
-    ]))
+             icono="calendar", color=E.AZUL, fondo=E.AZUL_SUAVE, spark=tendencia(s_fin)),
+        dict(label="Días de caja", valor="—" if dias is None else f"{dias:,.0f} días".replace(",", "."),
+             sub="Al ritmo de pagos de los últimos 3 meses", icono="alert" if (dias or 0) < 30 else "check",
+             color=E.ROJO if (dias or 0) < 30 else E.VERDE,
+             fondo=E.ROJO_SUAVE if (dias or 0) < 30 else E.VERDE_SUAVE),
+    ], columnas=5))
 
     t1, t2, t3 = st.tabs(["Resumen", "Flujo por concepto", "Movimientos"], on_change="rerun", key="fc_tabs")
 
     # ============ RESUMEN
     with t1:
         if t1.open:   # solo se calcula la pestaña abierta
+            neto_m = {m: float(s_ing.get(m, 0.0)) + float(s_egr.get(m, 0.0)) for m in ms_v}
+            peor = min(neto_m, key=neto_m.get) if neto_m else None
+            colchon_l = sum(-float(s_egr.get(m, 0.0)) for m in ms_v) / len(ms_v) if ms_v else 0.0
+            bajo_l = [m for m in ms_v if float(s_fin.get(m, 0.0)) < colchon_l]
+            neto = ing + egr
+            texto = (f"Entraron {E.millones(ing)} y salieron {E.millones(-egr)}: flujo neto "
+                     f"<b>{'+' if neto >= 0 else ''}{E.millones(neto)}</b>. El saldo cerró "
+                     f"{MESES[m_fin - 1].lower()} en <b>{E.millones(saldo_fin)}</b>"
+                     + (", unos " + f"{dias:,.0f}".replace(",", ".") + " días de pagos" if dias else "") + ".")
+            if peor is not None and neto_m[peor] < 0 and len(ms_v) > 1:
+                texto += (f" El mes más exigente fue {MESES_L[peor - 1]} (neto {E.millones(neto_m[peor])}).")
+            if bajo_l:
+                texto += (f" En {len(bajo_l)} mes{'es' if len(bajo_l) > 1 else ''} el saldo quedó por debajo de un mes "
+                          f"de pagos ({', '.join(MESES[m - 1] for m in bajo_l)}).")
+            tono = "bad" if saldo_fin < 0 else ("warn" if bajo_l or neto < 0 else "ok")
+            titulo_l = ("La caja crece en el periodo." if neto >= 0 else "La caja se reduce en el periodo.") \
+                if not per.solo else (f"{MESES_L[per.mes - 1].capitalize()}: la caja "
+                                      + ("crece." if neto >= 0 else "se reduce."))
+            st.html(E.lectura(titulo_l, texto, tono))
             izq, der = st.columns([2.1, 1], gap="medium")
             with izq:
                 with st.container(key="card_fc_mes"):
-                    titulo_tarjeta("Ingresos, egresos y saldo", "Barras: ingresos y egresos del mes · línea: saldo final · "
-                                   "millones de pesos")
-                    si, se, sf = serie(c_ing), serie(c_egr), serie(c_fin)
+                    vista_g = st.segmented_control("Gráfico", ["Ingresos y egresos", "Saldo de caja"],
+                                                   default="Ingresos y egresos", key="fc_grafico",
+                                                   label_visibility="collapsed") or "Ingresos y egresos"
+                    si, se, sf = serie(c_ing).copy(), serie(c_egr).copy(), serie(c_fin).copy()
                     vacios = [m for m in range(1, 13) if m > ult]
-                    for s in (si, se, sf):
-                        s.loc[vacios] = None
-                    fig = go.Figure()
-                    etiqueta = dict(texttemplate="%{y:,.0f}", textposition="inside", insidetextanchor="end",
-                                    textangle=-90, textfont=dict(color="white", size=11), cliponaxis=False)
-                    fig.add_bar(x=MESES, y=si / 1e6, name="Ingresos", marker_color=E.VERDE, hovertemplate="%{y:,.1f} M",
-                                **etiqueta)
-                    fig.add_bar(x=MESES, y=se / 1e6, name="Egresos", marker_color="#e57373", hovertemplate="%{y:,.1f} M",
-                                **etiqueta)
-                    fig.add_scatter(x=MESES, y=sf / 1e6, name="Saldo final", mode="lines+markers+text",
-                                    line=dict(color=E.NAVY, width=2.5), marker=dict(size=6), hovertemplate="%{y:,.1f} M",
-                                    texttemplate="<b>%{y:,.0f}</b>", textposition="top center",
-                                    textfont=dict(color=E.NAVY, size=11), cliponaxis=False)
-                    if per.solo:
-                        fig.add_vrect(x0=per.mes - 1.5, x1=per.mes - 0.5, fillcolor=E.AZUL, opacity=.07, line_width=0)
-                    fig.update_layout(barmode="relative", bargap=.3, uniformtext=dict(minsize=9, mode="hide"),
-                                      yaxis=dict(tickformat=",.0f", ticksuffix=" M"))
-                    fig.add_hline(y=0, line_color=E.BORDE)
-                    st.plotly_chart(estilo_grafico(fig, 400), width="stretch", config={"displayModeBar": False})
+                    for s_ in (si, se, sf):
+                        s_.loc[vacios] = None
+                    m_graf = [m for m in range(1, 13) if m <= ult]
+                    colchon = sum(-float(se.get(m, 0.0) or 0.0) for m in m_graf) / len(m_graf) if m_graf else 0.0
+                    bajo = {m for m in m_graf if float(sf.get(m, 0.0)) < colchon}
+                    if vista_g == "Saldo de caja":
+                        titulo_tarjeta("Saldo de caja mes a mes",
+                                       "Saldo al cierre de cada mes · línea punteada: colchón de un mes de pagos "
+                                       f"(egreso mensual promedio, {E.millones(colchon)}) · en rojo, los meses por "
+                                       "debajo · millones de pesos")
+                        xs = ["Inicio"] + [MESES[m - 1] for m in m_graf]
+                        ys = [float(serie(c_ini).get(1, 0.0)) / 1e6] + [float(sf.get(m, 0.0)) / 1e6 for m in m_graf]
+                        colores = [E.NAVY] + [E.ROJO if m in bajo else E.AZUL for m in m_graf]
+                        fig = go.Figure(go.Bar(x=xs, y=ys, marker_color=colores, marker_line_width=0,
+                                               text=[f"<b>{v:,.0f}</b>".replace(",", ".") for v in ys],
+                                               textposition="outside", cliponaxis=False,
+                                               textfont=dict(color=E.TEXTO, size=11),
+                                               hovertemplate="%{x}: %{y:,.1f} M<extra></extra>"))
+                        fig.add_hline(y=colchon / 1e6, line_dash="dash", line_color="#e8892c", line_width=1.5,
+                                      annotation_text=f"Colchón {colchon / 1e6:,.0f}".replace(",", "."),
+                                      annotation_position="top right",
+                                      annotation_font=dict(color=E.AMBAR, size=11),
+                                      annotation_bgcolor="rgba(255,255,255,.85)")
+                        if per.solo:
+                            fig.add_vrect(x0=per.mes - 0.5, x1=per.mes + 0.5, fillcolor=E.AZUL, opacity=.07,
+                                          line_width=0)
+                        fig.update_layout(bargap=.35, yaxis=dict(tickformat=",.0f", ticksuffix=" M"))
+                        st.plotly_chart(estilo_grafico(fig, 340), width="stretch", config={"displayModeBar": False})
+                        # tira mensual: ingresos, egresos, neto y el egreso que más pesó
+                        if operativa:
+                            top_e = info[(info["seccion"] == "Egresos") & (info["padre"] == "") &
+                                         (info["tipo"] != "total")]
+                        else:
+                            top_e = info[info["padre"] == "Egresos otros componentes"]
+                        conceptos_e = [c for c in top_e["concepto"] if "traslado" not in c.lower()]
+
+                        prom_c = {c: sum(-float(serie(c).get(k, 0.0)) for k in m_graf) / len(m_graf)
+                                  for c in conceptos_e} if m_graf else {}
+
+                        def hito(m):
+                            """El egreso que más se salió de su promedio ese mes (prima, impuestos, una compra)."""
+                            picos = [(c, -float(serie(c).get(m, 0.0)) - prom_c[c]) for c in conceptos_e
+                                     if prom_c.get(c, 0) > 0 and -float(serie(c).get(m, 0.0)) > 1.3 * prom_c[c]]
+                            if not picos:
+                                return ""
+                            c, extra = max(picos, key=lambda x: x[1])
+                            return f'<span title="{escape(_nombre(c))}: {E.millones(extra)} por encima de su ' \
+                                   f'promedio">{escape(_nombre(c))[:18]}</span>'
+
+                        def m_(v, color=False):
+                            if v is None or pd.isna(v):
+                                return "—"
+                            txt = f"{v / 1e6:,.0f}".replace(",", ".")
+                            if color:
+                                c = E.VERDE if v > 0 else (E.ROJO if v < 0 else E.TEXTO)
+                                return f'<span style="color:{c}">{"+" if v > 0 else ""}{txt}</span>'
+                            return txt
+                        st.html(E.tira([MESES[m - 1] for m in m_graf], [
+                            ("Ingresos", [m_(si.get(m)) for m in m_graf], ""),
+                            ("Egresos", [m_(-(se.get(m) or 0)) for m in m_graf], ""),
+                            ("Neto", [m_((si.get(m) or 0) + (se.get(m) or 0), True) for m in m_graf], "n"),
+                            ("Pico de pagos", [hito(m) for m in m_graf], "x"),
+                        ], alertas={i for i, m in enumerate(m_graf) if m in bajo}))
+                    else:
+                        titulo_tarjeta("Ingresos, egresos y saldo",
+                                       "Barras: ingresos y egresos del mes · línea: saldo final · millones de pesos")
+                        fig = go.Figure()
+                        etiqueta = dict(texttemplate="%{y:,.0f}", textposition="inside", insidetextanchor="end",
+                                        textangle=-90, textfont=dict(color="white", size=11), cliponaxis=False)
+                        fig.add_bar(x=MESES, y=si / 1e6, name="Ingresos", marker_color=E.VERDE,
+                                    hovertemplate="%{y:,.1f} M", **etiqueta)
+                        fig.add_bar(x=MESES, y=se / 1e6, name="Egresos", marker_color="#e57373",
+                                    hovertemplate="%{y:,.1f} M", **etiqueta)
+                        fig.add_scatter(x=MESES, y=sf / 1e6, name="Saldo final", mode="lines+markers+text",
+                                        line=dict(color=E.NAVY, width=2.5), marker=dict(size=6),
+                                        hovertemplate="%{y:,.1f} M", texttemplate="<b>%{y:,.0f}</b>",
+                                        textposition="top center", textfont=dict(color=E.NAVY, size=11),
+                                        cliponaxis=False)
+                        if per.solo:
+                            fig.add_vrect(x0=per.mes - 1.5, x1=per.mes - 0.5, fillcolor=E.AZUL, opacity=.07,
+                                          line_width=0)
+                        fig.update_layout(barmode="relative", bargap=.3, uniformtext=dict(minsize=9, mode="hide"),
+                                          yaxis=dict(tickformat=",.0f", ticksuffix=" M"))
+                        fig.add_hline(y=0, line_color=E.BORDE)
+                        st.plotly_chart(estilo_grafico(fig, 400), width="stretch", config={"displayModeBar": False})
             with der:
                 with st.container(key="card_fc_comp"):
                     titulo_tarjeta("Composición de egresos", per.texto.capitalize())
@@ -277,6 +446,28 @@ def mostrar(ctx):
                     filas = [(_nombre(r.concepto), -total(r.concepto)) for r in top.itertuples()]
                     filas = sorted([f for f in filas if f[1] > 0], key=lambda x: -x[1])[:9]
                     st.html(E.lista_participacion(filas, color="#e57373", total=-egr))
+                with st.container(key="card_fc_pagos"):
+                    sec_e = info[info["seccion"] == ("Egresos" if operativa else "Otros componentes")]["concepto"]
+                    de_egreso = {" ".join(str(c).lower().split()) for c in sec_e if "traslado" not in str(c).lower()}
+                    pagos = mov[(mov["valor"] < 0) & mov["concepto"].map(
+                        lambda c: " ".join(str(c).lower().split())).isin(de_egreso)]
+                    pagos = pagos[pagos["tercero"].fillna("(Sin tercero)") != "(Sin tercero)"]
+                    tot_p = -float(pagos["valor"].sum())
+                    por_t = pagos.groupby("tercero").agg(valor=("valor", "sum"), n=("valor", "size"))
+                    por_t = por_t.assign(valor=-por_t["valor"]).nlargest(6, "valor")
+                    titulo_tarjeta("Pagos más grandes",
+                                   f"{len(por_t)} terceros = {E.pct_txt(por_t['valor'].sum() / tot_p if tot_p else None)}"
+                                   f" de los pagos · {per.texto}")
+                    if por_t.empty:
+                        st.caption("Sin pagos con tercero en el periodo.")
+                    else:
+                        mes_mayor = pagos.loc[pagos.groupby("tercero")["valor"].idxmin(), ["tercero", "mes"]] \
+                            .set_index("tercero")["mes"]
+                        st.html(E.lista_marcada([
+                            (MESES[int(mes_mayor.get(t_, per.mes)) - 1], t_,
+                             E.millones(r_["valor"]).replace(" M", "") + " M", "bad" if i < 2 else "")
+                            for i, (t_, r_) in enumerate(por_t.iterrows())]))
+                        st.caption("La marca es el mes del pago más grande a ese tercero.")
 
             _indicadores(serie, total, info, mov, per, meses, ult, operativa, c_ini, c_ing, c_egr, c_fin)
 
@@ -322,8 +513,8 @@ def mostrar(ctx):
         if t2.open:   # solo se calcula la pestaña abierta
             with st.container(key="card_fc_tabla"):
                 titulo_tarjeta("Flujo por concepto",
-                               "Haz clic en una sección o grupo para desplegarlo, y en un concepto para ver los terceros "
-                               "(movimientos de bancos de SAP).")
+                               "Cifras en millones de pesos. Haz clic en una sección o grupo para desplegarlo, y en un "
+                               "concepto para ver los terceros (movimientos de bancos de SAP).")
                 columnas = ["Total periodo"] + (["Proyectado 4+8", "Diferencia"] if comparable else []) + \
                     [MESES[m - 1] for m in meses]
                 por_ter = {}
@@ -402,7 +593,7 @@ def mostrar(ctx):
                     nodo("Saldo Final Caja", "saldo", nombre="Saldo final caja total", hijos=[]),
                 ]
                 abrir = st.toggle("Desplegar todo", key="fc_abrir")
-                st.html(E.tabla_meses(nodos, columnas, abierto=abrir))
+                st.html(E.tabla_meses(nodos, columnas, abierto=abrir, ajustar=True))
                 st.caption("Saldos: el total del periodo muestra el saldo al inicio (saldos iniciales) o al cierre (saldos "
                            "finales). Algunas líneas incluyen ajustes manuales (Administración → Flujo de caja) que no "
                            "son movimientos de SAP; por eso la suma de terceros puede diferir del concepto.")
@@ -412,6 +603,8 @@ def mostrar(ctx):
                 plano.columns = [MESES[m - 1] for m in plano.columns]
                 st.download_button("Descargar flujo", lambda d=plano.reset_index().drop(columns="orden"): a_excel(d),
                                    f"flujo_de_caja_{anio}.xlsx", icon=":material/download:")
+
+            _mayores_egresos(mov, info, meses, anio, operativa)
 
     # ============ MOVIMIENTOS
     with t3:
@@ -443,5 +636,5 @@ def mostrar(ctx):
                         "tercero": "Tercero", "texto": st.column_config.TextColumn("Texto", width="large"),
                         "documento": "Documento", "cuenta": "Cuenta",
                         "valor": st.column_config.NumberColumn("Valor", format="accounting")})
-                    st.download_button("Descargar movimientos", lambda d=m: a_excel(d), f"movimientos_caja_{anio}.xlsx",
-                                       icon=":material/download:")
+                    st.caption("Las descargas de movimientos (lista simple y con la estructura de cargue) están en "
+                               "Administración → Flujo de caja → Revisar y clasificar.")

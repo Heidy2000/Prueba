@@ -14,6 +14,17 @@ import pandas as pd
 COMPARTIDAS = ["ADMINISTRATIVO", "OPERATIVO", "MANTENIMIENTO", "COMERCIAL"]
 SIN_LINEA = "SIN LÍNEA"
 MESES_REALES = {"8+4": 8, "4+8": 4}
+QUINDIO = "QUINDÍO"
+MUNICIPIOS_QUINDIO = ("CIRCASIA", "TEBAIDA", "MONTENEGRO", "SALENTO")
+
+
+def unificar_quindio(serie: pd.Series) -> pd.Series:
+    """Circasia, La Tebaida, Montenegro y Salento se ven como una sola línea: QUINDÍO."""
+    import unicodedata
+
+    def n(x):
+        return unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().upper()
+    return serie.map(lambda x: QUINDIO if any(m in n(x) for m in MUNICIPIOS_QUINDIO) else x)
 
 
 def mapa_ceco(leer, empresa: str) -> dict:

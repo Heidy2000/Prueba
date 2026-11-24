@@ -17,8 +17,8 @@ import pandas as pd
 
 # tablas con identificador de fila (en SQLite es el rowid implícito; en PostgreSQL una columna id)
 CON_ID = ("ejecucion", "reglas_fijas", "cargas")
-# tablas que no van en el respaldo .db: pesadas y se rehacen cargando de nuevo los archivos de origen
-SIN_RESPALDO = ("cartera_archivo", "sispo_archivo")
+# tablas que no van en el respaldo .db: son muy grandes y se rehacen cargando de nuevo los archivos de origen
+SIN_RESPALDO = ("cartera_cuentas", "cartera_archivo", "sispo_archivo")
 
 
 class Base:
@@ -143,6 +143,25 @@ class Base:
         cols = list(d.columns)
         sql = f'INSERT INTO {tabla} ({", ".join(cols)}) VALUES ({", ".join("?" * len(cols))})'
         self.executemany(sql, d.itertuples(index=False, name=None))
+
+    def anexar_masivo(self, df: pd.DataFrame, tabla: str):
+        """Como anexar, para cientos de miles de filas: en PostgreSQL usa COPY (mucho más rápido que INSERT)."""
+        if df.empty:
+            return
+        if self.motor != "postgres":
+            return self.anexar(df, tabla)
+        import io
+        self._cache.clear()
+        self._pendiente = True
+        cols = list(df.columns)
+        def f():
+            buf = io.StringIO()
+            df.to_csv(buf, index=False, header=False, na_rep="")
+            buf.seek(0)
+            cur = self.con.cursor()
+            cur.copy_expert(f"COPY {tabla} ({', '.join(cols)}) FROM STDIN WITH (FORMAT csv, NULL '')", buf)
+            return cur
+        return self._correr(f)
 
     # ---------------------------------------------------------------- esquema
     def crear_tablas(self, ddl: str):

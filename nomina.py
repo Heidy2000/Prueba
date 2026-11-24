@@ -272,6 +272,8 @@ def leer_ejecucion(archivo) -> pd.DataFrame:
     principal = fecha.dt.to_period("M").mode()
     if len(principal):
         fecha = pd.Series(principal.iloc[0].to_timestamp(), index=df.index)
+    else:                                       # el archivo no trae fecha: el mes lo elige quien carga (año 1900 = sin mes)
+        fecha = pd.Series(pd.Timestamp("1900-01-01"), index=df.index)
     txt = lambda k: df[c[k]].fillna("").astype(str).str.strip() if c[k] else ""
     out = pd.DataFrame({
         "anio": fecha.dt.year, "mes": fecha.dt.month, "cc": txt("cc").str.upper(),

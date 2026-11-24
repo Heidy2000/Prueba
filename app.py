@@ -4,11 +4,9 @@ Panel financiero · Área Limpia
 Módulos (menú de la izquierda):
 - Presupuesto:    presupuesto vs ejecución de gastos de explotación
 - Flujo de caja:  flujo de caja calculado desde los movimientos de bancos de SAP, proyectado y detalle por tercero
-- Cartera:        cartera de usuarios: comparativo de un mes contra otro, edades, deterioro y castigo
-- Combustible:    relación de combustible de ALDC y ALSM
-- Mantenimiento:  Detallado por placa de mantenimiento y combustible
-- Nómina:         presupuesto de personal vs nómina ejecutada (cargos, personas, conceptos)
-- Administración: carga de archivos (incluido el SISPO y los datos de Mantenimiento y Operaciones), asignaciones, homologaciones y respaldo (solo el administrador)
+- Combustible:    globos de Operación: Combustible, Mantenimiento, Operaciones y Corte y poda
+- Nómina:         globos de Personal: Nómina, Dotación 1, Dotación 2 y Otros de personal
+- Administración: carga de archivos, asignaciones, homologaciones y respaldo (solo el administrador)
 """
 import os
 from pathlib import Path
@@ -22,16 +20,14 @@ import db as base_datos
 import estilo as E
 import mod_admin
 import mod_combustible
-import mod_corte_poda
-import mod_cartera
 import mod_eeff
 import mod_flujo
 import mod_nomina
 import mod_presupuesto
+import mod_corte_poda
 import nomina
-import mod_mantenimiento
 import sispo_fuente
-import operaciones as Operaciones
+import sso
 from ui import ADMIN, ahora
 
 CARPETA = Path(__file__).parent
@@ -54,10 +50,36 @@ st.html(E.CSS)
 
 
 # ------------------------------------------------------------------ base de datos
-@st.cache_resource
-def conectar():
+def _nueva_conexion():
     # PostgreSQL si hay URL (Supabase, AWS RDS…); si no, archivo SQLite local
-    con = base_datos.Base(ruta=DB, url=DB_URL or None, esquema=DB_ESQUEMA or None)
+    return base_datos.Base(ruta=DB, url=DB_URL or None, esquema=DB_ESQUEMA or None)
+
+
+@st.cache_resource
+def preparar_base():
+    """Crea y actualiza las tablas UNA vez por proceso. La conexión que usa se cierra al terminar."""
+    con = _nueva_conexion()
+    try:
+        _crear_y_migrar(con)
+    finally:
+        con.con.close()
+    return True
+
+
+def conectar():
+    """Una conexión por sesión de usuario.
+
+    Antes era una sola conexión para todo el servidor (st.cache_resource). Con dos personas a la vez,
+    las escrituras sin confirmar de una quedaban dentro de la transacción de la otra, y un rollback de
+    una deshacía lo de la otra. Cada sesión de Streamlit tiene ahora la suya.
+    """
+    preparar_base()
+    if "_con" not in st.session_state:
+        st.session_state["_con"] = _nueva_conexion()
+    return st.session_state["_con"]
+
+
+def _crear_y_migrar(con):
     con.crear_tablas("""
     CREATE TABLE IF NOT EXISTS presupuesto(anio INT, version TEXT, codigo TEXT, rubro TEXT, sub_rubro TEXT,
                                            mes INT, valor REAL);
@@ -99,6 +121,13 @@ def conectar():
         subgrupo TEXT, linea TEXT, valor REAL, fuente TEXT);
     CREATE TABLE IF NOT EXISTS eeff_sap(empresa TEXT, anio INT, mes INT, sociedad TEXT, posicion TEXT, texto TEXT,
         inicial REAL, final REAL);
+    CREATE TABLE IF NOT EXISTS dotacion_ppto(empresa TEXT, anio INT, mes INT, categoria TEXT, articulo TEXT,
+        orden INT, precio REAL, cantidad REAL, valor REAL);
+    CREATE TABLE IF NOT EXISTS dotacion_ejec(empresa TEXT, anio INT, mes INT, fecha TEXT, clave TEXT, bodega TEXT,
+        grupo TEXT, cc TEXT, codigo TEXT, articulo TEXT, unidad TEXT, cantidad REAL, costo_unitario REAL,
+        valor_sin_iva REAL, valor REAL);
+    CREATE TABLE IF NOT EXISTS dotacion_cruce(empresa TEXT, articulo TEXT, concepto TEXT, origen TEXT, actualizado TEXT);
+    CREATE TABLE IF NOT EXISTS dotacion_contable(empresa TEXT, tipo TEXT, llave TEXT, concepto TEXT, actualizado TEXT);
     CREATE TABLE IF NOT EXISTS cargas(fecha TEXT, usuario TEXT, tipo TEXT, archivo TEXT, detalle TEXT);
     """)
     con.crear_tablas(cartera.ddl(con.motor))
@@ -117,11 +146,12 @@ def conectar():
         "flujo_mov": {"empresa": "TEXT DEFAULT 'ALDC'",
                       **{c: "TEXT DEFAULT ''" for c in ["clave", "clase", "cuenta_cod", "cc", "cab", "ter_cod", "ref1",
                                                        "ref3", "referencia", "compensacion", "anulado", "origen",
-                                                       "regla", "confianza"]}},
+                                                       "regla", "confianza", "raw"]}},
         "combustible": {c: "TEXT DEFAULT ''" for c in ["clave", "documento", "estacion", "hora", "km"]},
-        "cp_ejec": {"tarifa": "REAL", "valor_corte": "REAL", "valor_poda": "REAL", "actualizado": "TEXT DEFAULT ''"},
         "nomina_homol": {"cc": "TEXT DEFAULT ''"},
-        "nomina_ppto": {c: "DOUBLE PRECISION" for c in nomina.COLS_CONCEPTO},
+        "nomina_ppto": {"empresa": "TEXT DEFAULT 'ALDC'", **{c: "DOUBLE PRECISION" for c in nomina.COLS_CONCEPTO}},
+        "nomina_ejec": {"empresa": "TEXT DEFAULT 'ALDC'"},
+        "cp_ejec": {"tarifa": "REAL", "valor_corte": "REAL", "valor_poda": "REAL", "actualizado": "TEXT DEFAULT ''"},
         "ejecucion": {**{c: "TEXT DEFAULT ''" for c in ["clave", "origen", "regla", "confianza", "cc_sap",
                                                        "contrapartida", "anulado", "mod_cod", "mod_sub", "mod_cc",
                                                        "raw"]}, "empresa": "TEXT DEFAULT 'ALDC'"},
@@ -133,7 +163,6 @@ def conectar():
                 con.execute(f"ALTER TABLE {tabla} ADD COLUMN {c} {tipo}")
     con.commit()
     asignacion.migrar(con)
-    return con
 
 
 con = conectar()
@@ -145,7 +174,7 @@ def leer(sql, params=()):
 
 def registrar_carga(usuario, tipo, archivo, detalle):
     con.execute("INSERT INTO cargas(fecha, usuario, tipo, archivo, detalle) VALUES(?,?,?,?,?)",
-                (ahora().strftime("%Y-%m-%d %H:%M"), usuario, tipo, archivo, detalle))
+                (ahora().strftime("%Y-%m-%d %H:%M"), sso.quien(usuario), tipo, archivo, detalle))
     con.commit()
 
 
@@ -159,24 +188,28 @@ MODULOS = [  # (nombre, ícono, sección del menú, función)
     ("Presupuesto", ":material/account_balance_wallet:", "Finanzas", mod_presupuesto.mostrar),
     ("Flujo de caja", ":material/payments:", "Finanzas", mod_flujo.mostrar),
     ("Estados financieros", ":material/query_stats:", "Finanzas", mod_eeff.mostrar),
-    ("Cartera", ":material/request_quote:", "Finanzas", mod_cartera.mostrar),
     ("Combustible", ":material/local_gas_station:", "Operación", mod_combustible.mostrar),
-    ("Mantenimiento", ":material/build:", "Operación", mod_mantenimiento.mostrar),
-    ("Operaciones", ":material/engineering:", "Operación", Operaciones.mostrar),
-    ("Corte y poda", ":material/park:", "Operación", mod_corte_poda.mostrar),
     ("Nómina", ":material/badge:", "Talento humano", mod_nomina.mostrar),
-    ("Dotación", ":material/checkroom:", "Talento humano", mod_nomina.mostrar_dotacion),
     ("Administración", ":material/settings:", "Control", mod_admin.mostrar),
 ]
 
+
 # acceso por defecto de módulos sensibles cuando secrets no dice nada (así no quedan abiertos a todos)
 ACCESO_DEFECTO = {"Nómina": ["Recursos Humanos"],
-                  "Dotación": ["Recursos Humanos"],
-                  "Estados financieros": ["Dirección", "Administrativa y Financiera"],
-                  "Cartera": ["Dirección", "Administrativa y Financiera"]}
+                  "Dotación y EPP": ["Recursos Humanos", "Operaciones", "Administrativa y Financiera"],
+                  "Estados financieros": ["Dirección", "Administrativa y Financiera"]}
 # acceso fijo: manda sobre secrets (Financiera, el administrador, siempre ve todo)
-ACCESO_FIJO = {"Combustible": ["Operaciones", "Administrativa y Financiera"],
-               "Corte y poda": ["Operaciones", "Administrativa y Financiera"]}
+ACCESO_FIJO = {"Combustible": ["Operaciones", "Administrativa y Financiera", "Mantenimiento"]}
+
+
+# nombres de antes que el sistema puede seguir mandando en el pase: a qué módulo y a qué globo llevan
+ALIAS = {"Dotación y EPP": ("Nómina", "nav_personal", "Dotación 1"),
+         "Mantenimiento": ("Combustible", "nav_operacion", "Mantenimiento"),
+         "Operaciones": ("Combustible", "nav_operacion", "Operaciones"),
+         "Corte y poda": ("Combustible", "nav_operacion", "Corte y poda")}
+# quien tiene alguno de estos módulos en el pase también recibe el de la derecha (la dotación está ahora en Nómina)
+CONCEDE = {"Dotación y EPP": "Nómina", "Mantenimiento": "Combustible",
+           "Operaciones": "Combustible", "Corte y poda": "Combustible"}
 
 
 def puede_ver(usuario: str, modulo: str) -> bool:
@@ -184,11 +217,24 @@ def puede_ver(usuario: str, modulo: str) -> bool:
         return True
     if modulo == "Administración":
         return False
+    if modulo == "Nómina":         # el módulo trae también la dotación: lo ve quien ve la nómina o la dotación
+        return _permite(usuario, "Nómina") or _permite(usuario, "Dotación y EPP")
+    return _permite(usuario, modulo)
+
+
+def _permite(usuario: str, modulo: str) -> bool:
     permitidos = ACCESO_FIJO.get(modulo) or ACCESO.get(modulo, ACCESO_DEFECTO.get(modulo))
     return True if permitidos is None else ("Todos" in permitidos or usuario in permitidos)
 
 
 # ------------------------------------------------------------------ ingreso
+# Entrada desde el sistema de gestión (ver sso.py): si la dirección trae un pase válido, la sesión ya queda abierta.
+sso.recibir_pase(USUARIOS)
+# si la conexión se reabrió y la sesión se perdió, se recupera con la marca firmada de la dirección (ver sso.py)
+if "usuario" not in st.session_state:
+    sso.recuperar_sesion(USUARIOS)
+if "usuario" not in st.session_state and (sso.solo_sso() or st.session_state.get("sso_error")):
+    sso.pedir_entrar_desde_el_sistema()
 if "usuario" not in st.session_state:
     _, centro, _ = st.columns([1, 1.1, 1])
     with centro:
@@ -211,11 +257,29 @@ if "usuario" not in st.session_state:
 
 usuario = st.session_state.usuario
 es_admin = usuario == ADMIN
+if st.session_state.get("sso_modulos"):
+    concedidos = list(st.session_state.sso_modulos)
+    st.session_state.sso_modulos = list(dict.fromkeys(concedidos + [CONCEDE[m] for m in concedidos if m in CONCEDE]))
+NAV_GLOBOS = ("nav_operacion", "nav_personal")    # reporte abierto en cada módulo con globos
+if st.session_state.get("modulo") in ALIAS:
+    destino, llave, globo = ALIAS[st.session_state.modulo]
+    st.session_state.modulo, st.session_state[llave] = destino, globo
+    st.session_state["_modulo_previo"] = destino
+elif st.session_state.get("modulo") != st.session_state.get("_modulo_previo"):
+    for k in NAV_GLOBOS:                            # al cambiar de módulo se entra por el menú de globos
+        st.session_state.pop(k, None)
+    st.session_state["_modulo_previo"] = st.session_state.get("modulo")
 # perfiles que ven el presupuesto de toda la compañía (además de Financiera), p. ej. Dirección
 ver_todo = es_admin or usuario in ACCESO.get("Presupuesto completo", [])
-visibles = [m for m in MODULOS if puede_ver(usuario, m[0])]
+visibles = sso.visibles(MODULOS, puede_ver, usuario, ADMIN)
+if not visibles:
+    st.warning("Tu usuario no tiene módulos del panel. Pídele al administrador que te los conceda.")
+    st.stop()
+if sso.activo():
+    sso.ocultar_menu()
 if st.session_state.get("modulo") not in [m[0] for m in visibles]:
     st.session_state.modulo = visibles[0][0]
+sso.recordar_sesion(USUARIOS)
 
 # ------------------------------------------------------------------ menú lateral
 with st.sidebar:
@@ -236,10 +300,21 @@ with st.sidebar:
     if st.button("Cerrar sesión", icon=":material/logout:", width="stretch", key="salir"):
         for k in ("usuario", "modulo"):
             st.session_state.pop(k, None)
+        sso.olvidar_sesion()
         st.rerun()
     st.html('<div class="nf-foot">Dirección Financiera<br>Panel financiero v0.9</div>')
 
 # ------------------------------------------------------------------ módulo activo
+def puede_ver_reporte(reporte: str, base: str) -> bool:
+    """Reportes dentro de un módulo (globos): si secrets trae una llave con el nombre del reporte, esa manda; si no,
+    se ve como el módulo `base`."""
+    if es_admin:
+        return True
+    if reporte in ACCESO:
+        return "Todos" in ACCESO[reporte] or usuario in ACCESO[reporte]
+    return _permite(usuario, base)
+
+
 ctx = SimpleNamespace(con=con, leer=leer, usuario=usuario, es_admin=es_admin, ver_todo=ver_todo,
-                      registrar_carga=registrar_carga, usuarios=USUARIOS, acceso=ACCESO)
+                      registrar_carga=registrar_carga, usuarios=USUARIOS, acceso=ACCESO, puede_ver=puede_ver_reporte)
 dict((m[0], m[3]) for m in visibles)[st.session_state.modulo](ctx)

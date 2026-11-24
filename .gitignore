@@ -1,5 +1,20 @@
+# Datos y claves: NUNCA se suben al repositorio
+presupuesto.db
+*.db
+*.db-journal
+.streamlit/secrets.toml
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+respaldo*/
+
+# Archivos temporales
 __pycache__/
 *.pyc
-*.db
-.streamlit/secrets.toml
+~$*
+.DS_Store
+Thumbs.db
 .env
+.venv/
+venv/

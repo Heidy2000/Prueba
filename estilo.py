@@ -24,6 +24,10 @@ CSS = f"""
 <style>
 /* ---------- base ---------- */
 [data-testid="stHeader"] {{ background: transparent; }}
+/* la franja superior (transparente) no debe tapar lo que queda debajo, como el botón «Volver a los reportes»;
+   sus propios botones (menú ⋮) siguen funcionando */
+[data-testid="stHeader"], [data-testid="stHeader"] div {{ pointer-events:none; }}
+[data-testid="stHeader"] button, [data-testid="stHeader"] a, [data-testid="stHeader"] [role="button"] {{ pointer-events:auto; }}
 [data-testid="stMainBlockContainer"], .block-container {{ padding-top: 1.2rem; max-width: 1400px; }}
 h1, h2, h3 {{ letter-spacing: -0.01em; }}
 
@@ -138,7 +142,16 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-dv span b {{ font-size:.82rem; }}
 .nf-dv span small {{ font-size:.68rem; font-weight:600; opacity:.85; }}
 
-/* ---------- avisos ---------- */
+/* ---------- lista marcada (pagos más grandes) y avisos ---------- */
+.nf-mk {{ display:flex; align-items:center; gap:.6rem; border:1px solid {BORDE}; border-radius:10px;
+    padding:.45rem .7rem; margin-bottom:.45rem; font-size:.82rem; }}
+.nf-mk em {{ font-style:normal; font-size:.7rem; font-weight:700; border-radius:6px; padding:.12rem .45rem;
+    background:{AZUL_SUAVE}; color:{AZUL}; flex-shrink:0; min-width:2.6rem; text-align:center; }}
+.nf-mk em.bad {{ background:{ROJO_SUAVE}; color:{ROJO}; }}
+.nf-mk em.warn {{ background:{AMBAR_SUAVE}; color:{AMBAR}; }}
+.nf-mk em.ok {{ background:{VERDE_SUAVE}; color:{VERDE}; }}
+.nf-mk span {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.nf-mk b {{ font-variant-numeric:tabular-nums; }}
 .nf-avisos {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(125px,1fr)); gap:.6rem; }}
 .nf-aviso {{ border:1px solid #f0c89a; background:{AMBAR_SUAVE}; border-radius:12px; padding:.6rem .75rem;
     font-size:.76rem; color:#7a4a12; line-height:1.3; }}
@@ -160,6 +173,15 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-inf li {{ margin:.15rem 0; }}
 .nf-inf .up {{ color:{ROJO}; font-weight:700; }}
 .nf-inf .dn {{ color:{VERDE}; font-weight:700; }}
+/* ---------- tira mensual bajo un gráfico ---------- */
+.nf-tira {{ display:grid; font-size:.76rem; color:{TEXTO}; border-top:1px solid {BORDE}; margin-top:.2rem; }}
+.nf-tira > div {{ padding:.32rem .2rem; text-align:center; font-variant-numeric:tabular-nums; white-space:nowrap;
+    border-bottom:1px solid #f1f4f8; overflow:hidden; text-overflow:ellipsis; }}
+.nf-tira > div.l {{ text-align:left; color:{TEXTO_2}; font-weight:600; }}
+.nf-tira > div.h {{ color:{TEXTO_2}; font-weight:700; }}
+.nf-tira > div.n {{ font-weight:700; }}
+.nf-tira > div.x {{ font-size:.68rem; color:{TEXTO_2}; white-space:normal; line-height:1.2; }}
+.nf-tira > div.alerta {{ background:{ROJO_SUAVE}; }}
 /* ---------- mini barra de variación dentro de las tablas ---------- */
 .nf-mb {{ display:flex !important; align-items:center; justify-content:flex-end; gap:.45rem; }}
 .nf-mb > i {{ position:relative; width:56px; height:12px; flex-shrink:0; display:block; }}
@@ -187,39 +209,6 @@ h1, h2, h3 {{ letter-spacing: -0.01em; }}
 .nf-prog-h b {{ font-weight:700; }}
 .nf-bar {{ height:6px; background:{GRIS_BARRA}; border-radius:99px; overflow:hidden; }}
 .nf-bar > div {{ height:100%; border-radius:99px; }}
-
-/* ---------- tabla visual: cifras + barra (bullet) + participación ---------- */
-.tv {{ border:1px solid {BORDE}; border-radius:14px; background:#fff; overflow:hidden; font-size:.86rem; }}
-.tv-row {{ display:grid; grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr) minmax(170px,1.7fr);
-          align-items:center; gap:.7rem; padding:.62rem .9rem; border-bottom:1px solid #eef1f6; }}
-.tv-row.tv-sin-bullet {{ grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr); }}
-.tv-row > div:not(:first-child):not(:last-child) {{ text-align:right; font-variant-numeric:tabular-nums; }}
-.tv-head {{ background:#f7f9fc; color:{TEXTO_2}; font-size:.74rem; font-weight:600; border-bottom:1px solid {BORDE}; }}
-.tv details > summary {{ list-style:none; cursor:pointer; }}
-.tv details > summary::-webkit-details-marker {{ display:none; }}
-.tv details > summary:hover {{ background:#f7faff; }}
-.tv-n {{ display:flex; align-items:center; gap:.45rem; min-width:0; font-weight:600; color:{TEXTO}; }}
-.tv-n span.t {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.tv-n small {{ color:{TEXTO_2}; font-weight:500; white-space:nowrap; }}
-.tv-hijo .tv-n {{ padding-left:1.4rem; font-weight:500; }}
-.tv-hijo {{ background:#fbfcfe; }}
-.tv-chev {{ display:inline-block; width:.5rem; color:{TEXTO_2}; transition:transform .12s; }}
-details[open] > summary .tv-chev {{ transform:rotate(90deg); }}
-.tv-sp {{ display:inline-block; width:.5rem; }}
-.tv-pos {{ color:{VERDE}; font-weight:600; }}  .tv-neg {{ color:{ROJO}; font-weight:700; }}
-.tv-part {{ position:relative; }}
-.tv-part i {{ display:block; height:3px; border-radius:99px; background:#b9c6d8; margin-top:3px; margin-left:auto; }}
-.tv-pct {{ font-weight:700; }}
-.tv-bar {{ position:relative; height:12px; background:{GRIS_BARRA}; border-radius:99px; }}
-.tv-bar > div.f {{ position:absolute; left:0; top:0; height:100%; border-radius:99px; }}
-.tv-bar > div.m {{ position:absolute; top:-3px; width:2px; height:18px; background:{TEXTO}; border-radius:2px; opacity:.75; }}
-.tv-total {{ background:#f7f9fc; font-weight:700; border-bottom:none; }}
-.tv-total .tv-n {{ font-weight:700; }}
-.tv-leg {{ display:flex; flex-wrap:wrap; gap:.35rem .9rem; font-size:.76rem; color:{TEXTO_2}; margin:.45rem 0 .1rem 0; }}
-.tv-leg i {{ display:inline-block; width:9px; height:9px; border-radius:3px; margin-right:.35rem; vertical-align:-1px; }}
-.tv-seg {{ display:flex; width:100%; height:22px; border-radius:8px; overflow:hidden; background:{GRIS_BARRA}; }}
-.tv-seg > div {{ height:100%; min-width:2px; }}
-.tv-seg > div + div {{ border-left:2px solid #fff; }}
 
 /* ---------- tabla desplegable ---------- */
 .nf-t {{ font-size:.82rem; color:{TEXTO}; }}
@@ -271,6 +260,12 @@ details[open] > summary .tv-chev {{ transform:rotate(90deg); }}
 .nf-tm details[open] > summary .nf-chev {{ transform:rotate(45deg); border-color:{AZUL}; }}
 .nf-tm .nf-name small {{ color:{TEXTO_2}; font-weight:500; margin-left:.35rem; white-space:nowrap; }}
 .nf-m-saldo {{ background:#f2f6fc; font-weight:800; }}
+/* tabla ajustada al ancho (flujo por concepto): todas las columnas caben sin desplazarse */
+.nf-fit {{ overflow-x:hidden; }}
+.nf-fit .nf-tm .nf-row {{ padding:.42rem .55rem; column-gap:.35rem; font-size:.76rem; }}
+.nf-fit .nf-tm .nf-row.nf-head {{ font-size:.7rem; }}
+.nf-fit .nf-tm .nf-row > div {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.nf-fit .nf-name {{ gap:.3rem; }}
 .nf-m-seccion {{ font-weight:800; }}
 summary.nf-m-seccion {{ background:#fbfcfe; }}
 .nf-m-grupo {{ font-weight:700; }}
@@ -284,6 +279,64 @@ summary.nf-m-seccion {{ background:#fbfcfe; }}
 .st-key-card_filtros label p {{ font-size:.74rem !important; color:{TEXTO_2}; font-weight:600; }}
 .nf-ftit {{ display:flex; align-items:center; gap:.45rem; font-size:.78rem; font-weight:700; color:{TEXTO};
     text-transform:uppercase; letter-spacing:.06em; margin-bottom:.1rem; }}
+
+/* ---------- tabla visual: cifras + barra (bullet) + participación ---------- */
+.tv {{ border:1px solid {BORDE}; border-radius:14px; background:#fff; overflow-x:auto; font-size:.86rem; }}
+.tv-row {{ display:grid; grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr) minmax(170px,1.7fr);
+          align-items:center; gap:.7rem; padding:.62rem .9rem; border-bottom:1px solid #eef1f6; }}
+.tv-row.tv-sin-bullet {{ grid-template-columns:minmax(190px,2.3fr) minmax(104px,1fr) minmax(104px,1fr) minmax(104px,1fr) minmax(86px,.8fr) minmax(64px,.6fr); }}
+.tv-row > div:not(:first-child):not(:last-child) {{ text-align:right; font-variant-numeric:tabular-nums; }}
+.tv-head {{ background:#f7f9fc; color:{TEXTO_2}; font-size:.74rem; font-weight:600; border-bottom:1px solid {BORDE}; }}
+.tv details > summary {{ list-style:none; cursor:pointer; }}
+.tv details > summary::-webkit-details-marker {{ display:none; }}
+.tv details > summary:hover {{ background:#f7faff; }}
+.tv-n {{ display:flex; align-items:center; gap:.45rem; min-width:0; font-weight:600; color:{TEXTO}; }}
+.tv-n span.t {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.tv-n small {{ color:{TEXTO_2}; font-weight:500; white-space:nowrap; }}
+.tv-hijo .tv-n {{ padding-left:1.4rem; font-weight:500; }}
+.tv-hijo {{ background:#fbfcfe; }}
+.tv-chev {{ display:inline-block; width:.5rem; color:{TEXTO_2}; transition:transform .12s; }}
+details[open] > summary .tv-chev {{ transform:rotate(90deg); }}
+.tv-sp {{ display:inline-block; width:.5rem; }}
+.tv-pos {{ color:{VERDE}; font-weight:600; }}  .tv-neg {{ color:{ROJO}; font-weight:700; }}
+.tv-part {{ position:relative; }}
+.tv-part i {{ display:block; height:3px; border-radius:99px; background:#b9c6d8; margin-top:3px; margin-left:auto; }}
+.tv-pct {{ font-weight:700; }}
+.tv-bar {{ position:relative; height:12px; background:{GRIS_BARRA}; border-radius:99px; }}
+.tv-bar > div.f {{ position:absolute; left:0; top:0; height:100%; border-radius:99px; }}
+.tv-bar > div.m {{ position:absolute; top:-3px; width:2px; height:18px; background:{TEXTO}; border-radius:2px; opacity:.75; }}
+.tv-total {{ background:#f7f9fc; font-weight:700; border-bottom:none; }}
+.tv-total .tv-n {{ font-weight:700; }}
+.tv-leg {{ display:flex; flex-wrap:wrap; gap:.35rem .9rem; font-size:.76rem; color:{TEXTO_2}; margin:.45rem 0 .1rem 0; }}
+.tv-leg i {{ display:inline-block; width:9px; height:9px; border-radius:3px; margin-right:.35rem; vertical-align:-1px; }}
+.tv-seg {{ display:flex; width:100%; height:22px; border-radius:8px; overflow:hidden; background:{GRIS_BARRA}; }}
+.tv-seg > div {{ height:100%; min-width:2px; }}
+.tv-seg > div + div {{ border-left:2px solid #fff; }}
+
+/* ---------- globos de navegación (tarjetas de reportes, como el menú del sistema) ---------- */
+.nf-nav-tit {{ font-size:.78rem; font-weight:700; color:{TEXTO_2}; text-transform:uppercase; letter-spacing:.06em;
+    margin:.2rem 0 .45rem 0; display:flex; align-items:center; gap:.4rem; }}
+.nf-nav-tit b {{ color:{TEXTO}; }}
+.nf-globo {{ position:relative; background:#fff; border:1px solid {BORDE}; border-radius:14px; padding:.85rem 1rem .8rem 1rem;
+    min-height:122px; transition:border-color .12s, box-shadow .12s, transform .12s; }}
+.nf-globo .ico {{ width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center;
+    font-family:'Material Symbols Rounded'; font-size:20px; line-height:1; }}
+.nf-globo .tt {{ font-size:.98rem; font-weight:700; color:{TEXTO}; margin-top:.55rem; line-height:1.2; }}
+.nf-globo .sb {{ font-size:.74rem; color:{TEXTO_2}; margin-top:.15rem; line-height:1.25; }}
+.nf-globo.on {{ border:1.5px solid {AZUL}; box-shadow:0 0 0 3px {AZUL_SUAVE}; }}
+.nf-globo.on .tt {{ color:{AZUL}; }}
+.nf-globo .marca {{ position:absolute; top:.7rem; right:.8rem; font-size:.66rem; font-weight:700; color:{AZUL};
+    background:{AZUL_SUAVE}; border-radius:99px; padding:.1rem .5rem; }}
+div[class*="st-key-globo_"] {{ position:relative; }}
+div[class*="st-key-globo_"]:hover .nf-globo:not(.on) {{ border-color:#b9c9e3; box-shadow:0 4px 14px rgba(16,40,74,.08);
+    transform:translateY(-1px); }}
+/* el botón (invisible) cubre toda la tarjeta: así el clic en cualquier parte del globo lo abre */
+div[class*="st-key-globo_"] > div[class*="st-key-gbtn_"] {{ position:absolute !important; inset:0; z-index:2; margin:0; }}
+div[class*="st-key-gbtn_"] div[data-testid="stButton"] {{ position:absolute; inset:0; }}
+div[class*="st-key-gbtn_"] div[data-testid="stButton"] button {{ width:100%; height:100%; opacity:0; cursor:pointer;
+    border:none; }}
+.nf-migas {{ font-size:.8rem; color:{TEXTO_2}; margin:-.2rem 0 .6rem 0; }}
+.nf-migas b {{ color:{TEXTO}; }}
 
 /* ---------- login ---------- */
 .nf-login {{ text-align:center; margin:3rem 0 1rem 0; }}
@@ -413,6 +466,7 @@ def encabezado(titulo: str, subtitulo: str, chips: list[tuple[str, str]]) -> str
             f'<div class="nf-chips">{cs}</div></div>')
 
 
+TONO_COLOR = {"ok": VERDE, "bad": ROJO, "warn": "#e8892c", "na": "#9aa7b8"}
 
 
 def delta(texto: str, tono: str = "na", flecha: str | None = None) -> str:
@@ -521,6 +575,30 @@ def barras_divergentes(filas: list[dict], columnas: list[str], nombre_col: str =
                    f"{celdas}</div>")
     return (f'<div class="nf-scroll notranslate" translate="no" style="border:none">'
             f'<div class="nf-dvt" style="min-width:{150 + 160 * n}px">{cab}{cuerpo}</div></div>')
+
+
+def lista_marcada(items: list[tuple]) -> str:
+    """Filas con una marca a la izquierda: (marca, nombre, valor_txt, tono) — p. ej. pagos más grandes."""
+    out = ""
+    for marca, nombre, valor, tono in items:
+        out += (f'<div class="nf-mk"><em class="{tono}">{escape(str(marca))}</em>'
+                f'<span title="{escape(str(nombre))}">{escape(str(nombre))}</span><b>{valor}</b></div>')
+    return f'<div class="notranslate" translate="no">{out}</div>'
+
+
+def tira(columnas: list[str], filas: list[tuple], alertas: set | None = None) -> str:
+    """Tabla compacta de pocas filas bajo un gráfico mensual: filas = (nombre, [celdas html], clase '', 'n' o 'x').
+    alertas: índices de columna a resaltar."""
+    alertas = alertas or set()
+    n = len(columnas)
+    html = '<div class="l"></div>' + "".join(
+        f'<div class="h{" alerta" if i in alertas else ""}">{escape(c)}</div>' for i, c in enumerate(columnas))
+    for nombre, celdas, clase in filas:
+        html += f'<div class="l">{escape(nombre)}</div>' + "".join(
+            f'<div class="{clase}{" alerta" if i in alertas else ""}">{c}</div>' for i, c in enumerate(celdas))
+    return (f'<div class="nf-scroll notranslate" translate="no" style="border:none"><div class="nf-tira" '
+            f'style="grid-template-columns:90px repeat({n}, minmax(58px,1fr));min-width:{90 + 60 * n}px">{html}'
+            f'</div></div>')
 
 
 def informe(titulo: str, sub: str, secciones: list[tuple[str, list[str]]]) -> str:
@@ -710,14 +788,25 @@ def _num(v, clase="") -> str:
     return f'<div class="{clase}">{millones(v)}</div>'
 
 
+def _num_corto(v, clase="") -> str:
+    """Millones con un decimal, sin «$» ni «M» (la unidad va en el título): 2.880,2 · -135.810,5."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "<div>—</div>"
+    s = f"{abs(v) / 1e6:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f'<div class="{clase}">{"-" if v < -50_000 else ""}{s}</div>'
+
+
 def tabla_meses(nodos: list[dict], columnas: list[str], abierto: bool = False,
-                formatos: list[str] | None = None, barras: list[int] | None = None, compacta: bool = False) -> str:
+                formatos: list[str] | None = None, barras: list[int] | None = None, compacta: bool = False,
+                ajustar: bool = False) -> str:
     """
     nodos: dict(nombre, valores=[...] (una por columna), clase in {'saldo','seccion','grupo','linea','tercero'},
                 hijos=[nodos], dif_col=int|None (índice de la columna diferencia, se colorea), nota='')
     barras: columnas (en millones) que llevan una mini barra de variación junto al número (solo en las filas
             donde esa columna es la de diferencia, dif_col).
     compacta: primera columna más angosta, para tarjetas a media página.
+    ajustar: todas las columnas caben en el ancho de la tarjeta (sin desplazarse): concepto más angosto, cifras en
+             millones sin «$» ni «M» y letra un poco menor. Para tablas de muchos meses (flujo por concepto).
     """
     n = len(columnas)
     barras = set()          # las mini barras junto a la variación se quitaron de los informes (solo número)
@@ -740,6 +829,8 @@ def tabla_meses(nodos: list[dict], columnas: list[str], abierto: bool = False,
     min_ancho = ancho_nom + 30 + sum(ancho_b if i in (barras or []) else ancho_v for i in range(n))
     if not barras and not compacta:          # tabla de siempre: mismas medidas de antes
         plantilla, min_ancho = f"minmax(290px,2.8fr) repeat({n}, minmax(96px,1fr))", 300 + 100 * n
+    if ajustar:                              # cabe completa: las columnas se reparten el ancho disponible
+        plantilla, min_ancho = f"minmax(140px,2.1fr) repeat({n}, minmax(0,1fr))", 0
     cab = (f'<div class="nf-row nf-head" style="grid-template-columns:{plantilla}"><div>Concepto</div>'
            + "".join(f"<div>{escape(c)}</div>" for c in columnas) + "</div>")
     op = " open" if abierto else ""
@@ -773,11 +864,11 @@ def tabla_meses(nodos: list[dict], columnas: list[str], abierto: bool = False,
                 vals += (f'<div class="nf-mb {cls}"><i><u style="{lado};width:{w:.1f}%;background:{col}"></u></i>'
                          f'<span>{millones(v)}</span></div>')
             else:
-                vals += _num(v, cls)
-        sangria = f"padding-left:{nivel * 1.3:.1f}rem"
+                vals += _num_corto(v, cls) if ajustar else _num(v, cls)
+        sangria = f"padding-left:{nivel * (0.8 if ajustar else 1.3):.1f}rem"
         chev = _CHEV if con_hijos else '<span class="nf-sp"></span>'
         nota = (f'<small title="{escape(nodo["nota"])}">ⓘ</small>' if nodo.get("nota") else "")
-        extra = f'<small>{escape(nodo["sub"])}</small>' if nodo.get("sub") else ""
+        extra = f'<small>{escape(nodo["sub"])}</small>' if nodo.get("sub") and not ajustar else ""
         return (f'<div class="nf-name" style="{sangria}">{chev}<span title="{escape(nodo["nombre"])}">'
                 f'{escape(nodo["nombre"])}</span>{extra}{nota}</div>{vals}')
 
@@ -792,6 +883,9 @@ def tabla_meses(nodos: list[dict], columnas: list[str], abierto: bool = False,
         return f'<div class="nf-row nf-m-{clase}"{estilo_fila}>{fila(nodo, nivel, False)}</div>'
 
     cuerpo = "".join(render(nd, 0) for nd in nodos)
+    if ajustar:
+        return (f'<div class="nf-scroll nf-fit notranslate" translate="no"><div class="nf-t nf-tm" '
+                f'style="min-width:0">{cab}{cuerpo}</div></div>')
     return (f'<div class="nf-scroll notranslate" translate="no"><div class="nf-t nf-tm" '
             f'style="min-width:{min_ancho}px">{cab}{cuerpo}</div></div>')
 

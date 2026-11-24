@@ -1,298 +1,387 @@
-"""Dotación y EPP's (Talento humano): presupuesto por elemento vs ejecución tomada del SISPO.
+"""
+Dotación y EPP: presupuesto por artículo, ejecución (salidas de almacén) y su cruce.
 
-Lógica pura (sin Streamlit). Presupuesto: el libro «3.1 DOTACION Y EPPS» (tres bloques: DOTACION, EPP'S y ACTIVIDADES, con cantidad y valor por
-mes). Ejecución: las salidas de inventario del SISPO de la cuenta «DOTACIÓN PERSONAL» (el mismo filtro de Mantenimiento: costo negativo). Esa
-cuenta cuadra en centavos, centro de costo por centro de costo, con el genérico «Salida de inventario» que SAP registra en la misma cuenta.
-Cada artículo del SISPO se lleva al elemento presupuestado por una equivalencia (código -> elemento) que se guarda en `dot_map`; mientras
-un artículo no tenga elemento queda como «Sin elemento asignado» (cuenta en el total, no se inventa su elemento).
-ACTIVIDADES (exámenes médicos, capacitaciones, etc.) son servicios que no pasan por inventario: se cargan pero no se comparan con SISPO.
+Archivo de presupuesto (ej. "PRESUPUESTO 2026 - 2027 DOTACION.xlsx"): una hoja por año o por parte del año
+("PPTO 2026 ENE - AGO", "PPTO 2026 SEP - DIC", "PPTO 2027"). En cada hoja:
+  - columna A: categoría (DOTACION, EPP´S, ACTIVIDADES), con el encabezado SUBRUBRO;
+  - columna B: artículo; C: precio unitario; D: cantidad total;
+  - desde la E, por cada mes (nombre del mes en la fila de encabezado) dos columnas: Cant. y Valor.
+El año sale del nombre de la hoja y los meses del encabezado, así que da igual cómo se reparta el año entre hojas.
 """
 import re
 import unicodedata
-from difflib import SequenceMatcher
 
 import pandas as pd
 
-import logica_m as L
-
-CUENTA_SISPO = "DOTACIÓN PERSONAL"
-DOTACION, EPPS, ACTIVIDADES = "Dotación", "EPP's", "Actividades"
-SECCIONES_COMPARADAS = (DOTACION, EPPS)
-SIN_ELEMENTO = "Sin elemento asignado"
-OTROS = "Otros (sin clasificar)"                    # en Dotación: artículos sin elemento y movimientos de SAP que el SISPO no detalla
-CODIGO_SAP, SUBRUBRO_SAP = "3.1", "Dotación y epp´s"      # SAP: código 3.1 y BASE GASTOS EXPLOTACIO (sub_rubro)
-MESES_NOMBRE = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
-
-TABLAS = """
-CREATE TABLE IF NOT EXISTS dot_ppto(empresa TEXT, anio INT, seccion TEXT, elemento TEXT, precio DOUBLE PRECISION, mes INT,
-    cantidad DOUBLE PRECISION, valor DOUBLE PRECISION);
-CREATE TABLE IF NOT EXISTS dot_map(empresa TEXT, codigo TEXT, articulo TEXT, elemento TEXT, usuario TEXT, fecha TEXT)
-"""
+MESES_TXT = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+             "septiembre": 9, "setiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12}
+COLS_PPTO = ["anio", "mes", "categoria", "articulo", "orden", "precio", "cantidad", "valor"]
 
 
-def _norm(x) -> str:
-    t = unicodedata.normalize("NFKD", str(x if x is not None else "")).encode("ascii", "ignore").decode().upper()
-    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", t)).strip()
+def _n(x) -> str:
+    s = unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().lower()
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
 
 
-def _num(x):
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return None
-    return None if v != v else v
+def categoria_norm(x) -> str:
+    """'EPP´S', 'EPPS', 'epp' -> 'EPP'; 'DOTACION' -> 'DOTACIÓN'; 'ACTIVIDADES' igual."""
+    t = _n(x)
+    if t.startswith("epp"):
+        return "EPP"
+    if t.startswith("dotac"):
+        return "DOTACIÓN"
+    if t.startswith("activ"):
+        return "ACTIVIDADES"
+    return " ".join(str(x).split()).upper() if pd.notna(x) else ""
 
 
-# ================================================================== presupuesto
-def leer_ppto(archivo) -> tuple[pd.DataFrame, dict]:
-    """Lee el libro de presupuesto de dotación. Devuelve (filas largas: seccion, elemento, precio, mes, cantidad, valor, anio_rel; info).
-    `anio_rel` es 0 para el primer bloque de meses del libro, 1 para el siguiente año, etc.
-    Las celdas con fórmula se leen por su valor guardado; si no lo traen, el valor se calcula como cantidad × precio unitario."""
-    import openpyxl
-    wb = openpyxl.load_workbook(archivo, data_only=True)
-    ws = next((h for h in wb.worksheets if "DOTAC" in _norm(h.title)), wb.worksheets[0])
-    meses_cols, cab_fila = [], None                              # [(columna de «Cant.», mes)] de la fila de encabezados; la de «Valor» es la siguiente
-    for fila in ws.iter_rows(min_row=1, max_row=12):
-        hallados = [(c.column, MESES_NOMBRE.index(_norm(c.value)) + 1) for c in fila if c.value is not None and _norm(c.value) in MESES_NOMBRE]
-        if len(hallados) >= 3:                                 # el UPA 2026 solo trae septiembre-diciembre
-            meses_cols, cab_fila = hallados, fila
-            break
-    if not meses_cols:
-        raise ValueError("No encontré los meses (ENERO … DICIEMBRE) en los encabezados del libro de dotación.")
-    # Un libro puede traer varios años uno al lado del otro (p. ej. sep-dic 2026 y luego ene-dic 2027): el bloque nuevo empieza
-    # cuando el mes no sube. Cada bloque tiene su propia columna «PRECIO UNITARIO» (la más cercana a su izquierda; por defecto la D).
-    # Una columna «PROYECTO» no estorba: cada fila es un elemento de un proyecto y sus cantidades y valores se suman por elemento.
-    precios = [c.column for c in cab_fila if c.value is not None and _norm(c.value) == "PRECIO UNITARIO"]
-    bloques, previo = [], None
-    for col, mes in meses_cols:
-        if previo is None or mes <= previo:
-            bloques.append(dict(meses={}, precio=max([x for x in precios if x < col], default=4)))
-        bloques[-1]["meses"][mes] = col
-        previo = mes
-    seccion, filas, sin_valor = None, [], 0
-    for r in range(1, ws.max_row + 1):
-        b, c = ws.cell(r, 2).value, ws.cell(r, 3).value
-        nb, nc = _norm(b), _norm(c)
-        if nb.startswith("TOTAL") or nc.startswith("TOTAL"):
+def _texto(x) -> str:
+    return " ".join(str(x).split()) if pd.notna(x) else ""
+
+
+def leer_presupuesto(archivo) -> tuple[pd.DataFrame, list[str]]:
+    """Devuelve (presupuesto, avisos). presupuesto: anio, mes, categoria, articulo, orden, precio, cantidad, valor
+    (una fila por artículo y mes con cantidad o valor; los artículos sin ningún valor quedan con una fila en cero)."""
+    xls = archivo if isinstance(archivo, pd.ExcelFile) else pd.ExcelFile(archivo)
+    filas, avisos = [], []
+    for hoja in xls.sheet_names:
+        m = re.search(r"(20\d\d)", hoja)
+        if not m:
+            avisos.append(f"Hoja '{hoja}' omitida: no tiene el año en el nombre.")
             continue
-        if nb.startswith("DOTACION") and nc not in ("ELEMENTO", "CONCEPTO"):
-            seccion = DOTACION
-        elif nb.startswith("EPP"):
-            seccion = EPPS
-            continue                                             # esa fila es el encabezado del bloque
-        elif nb.startswith("ACTIVIDADES"):
-            seccion = ACTIVIDADES
+        anio = int(m.group(1))
+        df = xls.parse(hoja, header=None)
+        f_enc = next((i for i in range(min(10, len(df)))
+                      if any(_n(v) == "articulo" for v in df.iloc[i] if pd.notna(v))), None)
+        if f_enc is None:
+            avisos.append(f"Hoja '{hoja}' omitida: no encontré el encabezado 'Articulo'.")
             continue
-        if seccion is None or not nc or nc in ("ELEMENTO", "CONCEPTO"):
+        enc = [_n(v) if pd.notna(v) else "" for v in df.iloc[f_enc]]
+        c_art = enc.index("articulo")
+        c_cat = c_art - 1 if c_art > 0 else None
+        c_pre = next((j for j, e in enumerate(enc) if e.startswith("precio")), None)
+        meses = {MESES_TXT[e]: j for j, e in enumerate(enc) if e in MESES_TXT}
+        if not meses:
+            avisos.append(f"Hoja '{hoja}' omitida: no encontré los meses en el encabezado.")
             continue
-        elemento = " ".join(str(c).split())
-        for k, bl in enumerate(bloques):
-            precio = _num(ws.cell(r, bl["precio"]).value)
-            if precio is None:
+        cuerpo = df.iloc[f_enc + 1:]
+        # fila de subtítulos (Cant. / Valor) debajo del encabezado
+        if cuerpo.shape[0] and _n(cuerpo.iloc[0, min(meses.values())]).startswith("cant"):
+            cuerpo = cuerpo.iloc[1:]
+        for orden, (_, r) in enumerate(cuerpo.iterrows()):
+            art = _texto(r.iloc[c_art])
+            if not art or _n(art).startswith("total"):
                 continue
-            for mes, cc in bl["meses"].items():
-                cant, val = _num(ws.cell(r, cc).value), _num(ws.cell(r, cc + 1).value)
-                if val is None:
-                    val = (cant or 0.0) * precio
-                    sin_valor += cant is not None
-                filas.append(dict(seccion=seccion, elemento=elemento, precio=precio, mes=mes, cantidad=cant or 0.0, valor=val, anio_rel=k))
-    if not filas:
-        raise ValueError("No encontré elementos con precio unitario en el libro de dotación.")
-    d = pd.DataFrame(filas)
-    anio = next((int(y) for y in re.findall(r"20\d{2}", ws.title)), None)
-    info = dict(hoja=ws.title, anio=anio, elementos=int(d["elemento"].nunique()), valor_total=float(d["valor"].sum()), sin_valor=int(sin_valor),
-                por_seccion=d.groupby("seccion")["valor"].sum().to_dict(), bloques=len(bloques),
-                por_bloque={int(k): g.groupby("seccion")["valor"].sum().to_dict() for k, g in d.groupby("anio_rel")})
-    return d, info
+            cat = categoria_norm(r.iloc[c_cat]) if c_cat is not None else ""
+            precio = pd.to_numeric(r.iloc[c_pre], errors="coerce") if c_pre is not None else float("nan")
+            precio = None if pd.isna(precio) else float(precio)
+            con_valor = False
+            for mes, j in meses.items():
+                cant = pd.to_numeric(r.iloc[j], errors="coerce")
+                val = pd.to_numeric(r.iloc[j + 1], errors="coerce") if j + 1 < len(r) else float("nan")
+                cant = 0.0 if pd.isna(cant) else float(cant)
+                val = 0.0 if pd.isna(val) else float(val)
+                if cant or val:
+                    con_valor = True
+                    filas.append((anio, mes, cat, art, orden, precio, cant, val))
+            if not con_valor:     # el artículo existe en el presupuesto aunque sin valor: queda en cero (para el cruce)
+                filas.append((anio, min(meses), cat, art, orden, precio, 0.0, 0.0))
+    return pd.DataFrame(filas, columns=COLS_PPTO), avisos
 
 
-# ================================================================== ejecución desde el SISPO
-def ejecucion_sispo(d: pd.DataFrame) -> pd.DataFrame:
-    """Salidas de inventario de la cuenta DOTACIÓN PERSONAL: periodo (AAAAMM), mes, codigo, articulo, centro de costo, cantidad y valor
-    (positivo = costo). Usa el mismo filtro de Mantenimiento (`L.sispo_filtrar`): costo negativo, una línea por IdKardex."""
-    neg, _ = L.sispo_filtrar(d, (CUENTA_SISPO,))
-    if neg.empty:
-        return pd.DataFrame(columns=["periodo", "mes", "codigo", "articulo", "cc_codigo", "cc_nombre", "cantidad", "valor"])
-    f = pd.to_datetime(neg["fecha"], errors="coerce")
-    cierre = neg["cierre"].where(neg["cierre"].astype(str).str.fullmatch(r"\d{6}"), f.dt.strftime("%Y%m").fillna("")) if "cierre" in neg else f.dt.strftime("%Y%m")
-    out = pd.DataFrame({"periodo": pd.to_numeric(cierre, errors="coerce"), "codigo": neg["codigo"].astype(str).str.strip(),
-                        "articulo": neg["articulo"].astype(str).str.strip(), "cc_codigo": neg["cc_codigo"], "cc_nombre": neg["cc_nombre"],
-                        "cantidad": pd.to_numeric(neg["cantidad"], errors="coerce").abs(), "valor": -pd.to_numeric(neg["costo_con_iva"], errors="coerce")})
-    out = out.dropna(subset=["periodo"])
-    out["periodo"] = out["periodo"].astype(int)
-    out["mes"] = out["periodo"] % 100
-    return out.reset_index(drop=True)
+# ------------------------------------------------------------------ ejecución: salidas de almacén
+COLS_EJEC = ["anio", "mes", "fecha", "clave", "bodega", "grupo", "cc", "codigo", "articulo", "unidad", "cantidad",
+             "costo_unitario", "valor_sin_iva", "valor"]
+EXCLUIR = "(No comparar)"          # concepto para artículos que no van contra el presupuesto de dotación
 
 
-# ================================================================== equivalencia artículo SISPO -> elemento del presupuesto
-def sugerir(articulo: str, elementos: list[str]) -> str | None:
-    """Elemento presupuestado que corresponde a un artículo del SISPO SOLO si es evidente: mismo nombre, o todas las palabras de uno están en
-    el otro (y es el único que cumple). Si hay duda o varios candidatos, None: lo asigna una persona."""
-    a = set(_norm(articulo).split())
-    if not a:
-        return None
-    exactos = [e for e in elementos if _norm(e) == _norm(articulo)]
-    if len(exactos) == 1:
-        return exactos[0]
-    cont = [e for e in elementos if len(a) >= 2 and len(set(_norm(e).split())) >= 2
-            and (a <= set(_norm(e).split()) or set(_norm(e).split()) <= a)]
-    return cont[0] if len(cont) == 1 else None
+def clave(x) -> str:
+    """Nombre para cruzar: sin tildes, mayúsculas, signos ni espacios dobles."""
+    return _n(x)
 
 
-def equivalencias(articulos: pd.DataFrame, elementos: list[str], guardadas: dict) -> pd.DataFrame:
-    """Por cada artículo (codigo, articulo) su elemento: el guardado manda; si no hay, el sugerido evidente; si no, SIN_ELEMENTO.
-    Devuelve codigo, articulo, elemento, origen («Guardado» | «Sugerido» | «Pendiente»)."""
-    filas = []
-    for r in articulos.drop_duplicates("codigo").itertuples():
-        g = guardadas.get(r.codigo)
-        if g:
-            filas.append((r.codigo, r.articulo, g, "Guardado"))
+def _numero(s: pd.Series) -> pd.Series:
+    """'$ 129.494,40' / '-1,00' / 0.19 -> número."""
+    def conv(x):
+        if pd.isna(x):
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        t = str(x).replace("$", "").replace(" ", "").strip()
+        if "," in t:
+            t = t.replace(".", "").replace(",", ".")
+        try:
+            return float(t)
+        except ValueError:
+            return 0.0
+    return s.map(conv)
+
+
+def _col(df: pd.DataFrame, *nombres):
+    norm = {clave(c): c for c in df.columns}
+    for n in nombres:
+        if clave(n) in norm:
+            return norm[clave(n)]
+    return None
+
+
+def leer_ejecucion(archivo) -> tuple[pd.DataFrame, list[str]]:
+    """Reporte de movimientos de almacén (kárdex): Cierre, Fecha Movimiento, Articulo, Cantidad Salida, Costo Total
+    Con Iva… Se toman las salidas (entregas). Devuelve (ejecucion, avisos)."""
+    xls = archivo if isinstance(archivo, pd.ExcelFile) else pd.ExcelFile(archivo)
+    avisos = []
+    for hoja in xls.sheet_names:
+        df = xls.parse(hoja, dtype=object)
+        if _col(df, "Articulo") is None or _col(df, "Cantidad Salida") is None:
             continue
-        s = sugerir(r.articulo, elementos)
-        filas.append((r.codigo, r.articulo, s or SIN_ELEMENTO, "Sugerido" if s else "Pendiente"))
-    return pd.DataFrame(filas, columns=["codigo", "articulo", "elemento", "origen"])
+        c = lambda *n: _col(df, *n)                               # noqa: E731
+        fecha = pd.to_datetime(df[c("Fecha Movimiento", "Fecha")], errors="coerce")
+        cierre = df[c("Cierre")].astype(str).str.extract(r"(20\d\d)(\d\d)") if c("Cierre") else None
+        anio = pd.to_numeric(cierre[0], errors="coerce") if cierre is not None else fecha.dt.year
+        mes = pd.to_numeric(cierre[1], errors="coerce") if cierre is not None else fecha.dt.month
+        anio, mes = anio.fillna(fecha.dt.year), mes.fillna(fecha.dt.month)
+        txt = lambda col: df[col].map(_texto) if col else ""      # noqa: E731
+        sal = _numero(df[c("Cantidad Salida")])
+        ent = _numero(df[c("Cantidad Entrada")]) if c("Cantidad Entrada") else 0.0
+        out = pd.DataFrame({
+            "anio": anio, "mes": mes, "fecha": fecha.dt.strftime("%Y-%m-%d"),
+            "clave": txt(c("IdKardex", "Id Kardex")), "bodega": txt(c("Bodega")), "grupo": txt(c("Grupo")),
+            "cc": txt(c("Centro Costo", "Centro de Costo")), "codigo": txt(c("Codigo Articulo")),
+            "articulo": txt(c("Articulo")), "unidad": txt(c("Unidad Medida")),
+            # salidas en positivo (una devolución, entrada en el mismo reporte, resta)
+            "cantidad": -sal - ent if (sal <= 0).all() else sal - ent,
+            "costo_unitario": _numero(df[c("Costo Unidad Sin Iva")]) if c("Costo Unidad Sin Iva") else 0.0,
+            "valor_sin_iva": -_numero(df[c("Costo Total Sin Iva")]) if c("Costo Total Sin Iva") else 0.0,
+            "valor": -_numero(df[c("Costo Total Con Iva")]) if c("Costo Total Con Iva") else 0.0,
+        })
+        out = out[out["anio"].notna() & (out["articulo"] != "")].copy()
+        out[["anio", "mes"]] = out[["anio", "mes"]].astype(int)
+        if (out["valor"] < 0).mean() > 0.5:          # el reporte trae las salidas en positivo
+            out[["valor", "valor_sin_iva"]] = -out[["valor", "valor_sin_iva"]]
+        if out["clave"].eq("").all():
+            base = out["fecha"] + "|" + out["articulo"] + "|" + out["valor"].round(2).astype(str)
+            out["clave"] = base + "#" + out.groupby(base).cumcount().astype(str)
+        return out[COLS_EJEC].reset_index(drop=True), avisos
+    raise ValueError("No encontré el reporte de almacén: faltan las columnas 'Articulo' y 'Cantidad Salida'.")
 
 
-# ================================================================== comparación presupuesto vs ejecución
-def sap_filas(pool: pd.DataFrame, empresa: str, anio: int) -> pd.DataFrame:
-    """Líneas de SAP de dotación: código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s» (incluye anulados y reversos)."""
-    if pool is None or pool.empty:
-        return pd.DataFrame(columns=["mes", "valor"])
-    k = lambda x: re.sub(r"[^A-Z0-9]", "", _norm(x))
-    es = ((pool["empresa"] == empresa) & (pd.to_numeric(pool["anio"], errors="coerce") == anio)
-          & (pool["codigo"].astype(str).str.strip() == CODIGO_SAP) & (pool["sub_rubro"].map(k) == k(SUBRUBRO_SAP)))
-    return pool[es].assign(mes=lambda d: pd.to_numeric(d["mes"], errors="coerce"))
+def leer_cruce(archivo) -> pd.DataFrame:
+    """Tabla de homologación: ARTICULO (como sale en la ejecución) -> CONCEPTO PRESUPUESTO. Devuelve articulo,
+    concepto ('' si la tabla lo deja vacío), con todas las filas (también las repetidas, para avisar)."""
+    xls = archivo if isinstance(archivo, pd.ExcelFile) else pd.ExcelFile(archivo)
+    for hoja in xls.sheet_names:
+        df = xls.parse(hoja, dtype=object)
+        ca, cc = _col(df, "Articulo"), _col(df, "Concepto Presupuesto", "Concepto", "Presupuesto")
+        if ca is None or cc is None:
+            continue
+        out = pd.DataFrame({"articulo": df[ca].map(_texto), "concepto": df[cc].map(_texto)})
+        return out[out["articulo"] != ""].reset_index(drop=True)
+    raise ValueError("No encontré la tabla de cruce: faltan las columnas 'ARTICULO' y 'CONCEPTO PRESUPUESTO'.")
 
 
-def sap_por_mes(pool: pd.DataFrame, empresa: str, anio: int) -> dict[int, float]:
-    """Ejecución OFICIAL de dotación por mes: SAP código 3.1 y BASE GASTOS EXPLOTACIO «Dotación y epp´s», neta."""
-    f = sap_filas(pool, empresa, anio)
-    return {int(m): round(float(v), 2) for m, v in f.groupby("mes")["valor"].sum().items()} if not f.empty else {}
+# ------------------------------------------------------------------ cruce y comparativo
+def asignar(ejec: pd.DataFrame, cruce: pd.DataFrame, ppto: pd.DataFrame) -> pd.DataFrame:
+    """Le pone a cada movimiento su concepto del presupuesto y su categoría.
+    estado: 'ok' | 'sin_cruce' (el artículo no está en la tabla) | 'sin_concepto' (está pero sin concepto) |
+            'sin_presupuesto' (el concepto no existe en el presupuesto) | 'excluido'."""
+    e = ejec.copy()
+    mapa = {}
+    for r in cruce.itertuples():
+        mapa.setdefault(clave(r.articulo), r.concepto)          # si hay repetidos, manda el primero (se avisa)
+    nombres = ppto.drop_duplicates("articulo")
+    nombre_de = dict(zip(nombres["articulo"].map(clave), nombres["articulo"]))
+    cat_de = dict(zip(nombres["articulo"].map(clave), nombres["categoria"]))
+    k = e["articulo"].map(clave)
+    conc = k.map(mapa)
+    e["estado"] = "ok"
+    e.loc[conc.isna(), "estado"] = "sin_cruce"
+    e.loc[conc.notna() & conc.fillna("").eq(""), "estado"] = "sin_concepto"
+    e.loc[conc == EXCLUIR, "estado"] = "excluido"
+    kc = conc.fillna("").map(clave)
+    e.loc[(e["estado"] == "ok") & ~kc.isin(nombre_de), "estado"] = "sin_presupuesto"
+    e["concepto"] = kc.map(nombre_de).fillna(conc.fillna(""))
+    e["categoria"] = kc.map(cat_de).fillna("SIN HOMOLOGAR")
+    sin = e["estado"].isin(["sin_cruce", "sin_concepto"])
+    e.loc[sin, "concepto"] = "Sin cruce · " + e.loc[sin, "articulo"]
+    e.loc[e["estado"] == "excluido", "categoria"] = "EXCLUIDO"
+    return e
 
 
-def comparar(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, meses: list[int], sap_mes: dict | None = None) -> pd.DataFrame:
-    """Presupuesto vs ejecutado por elemento en los `meses` pedidos (solo DOTACIÓN y EPP's). Las salidas sin elemento aparecen como
-    «Sin elemento asignado» (una fila por artículo) para que el total cuadre con el SISPO. Columnas: seccion, elemento, ppto_cant, presupuesto,
-    ejec_cant, ejecutado, movimientos, más saldo, pct y estado."""
-    p = ppto[ppto["seccion"].isin(SECCIONES_COMPARADAS) & ppto["mes"].isin(meses)]
-    pp = p.groupby(["seccion", "elemento"], as_index=False).agg(ppto_cant=("cantidad", "sum"), presupuesto=("valor", "sum"))
-    seccion_de = p.drop_duplicates("elemento").set_index("elemento")["seccion"].to_dict()
-    e = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
-    e["elemento"] = e["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
-    ee = e.groupby("elemento", as_index=False).agg(ejec_cant=("cantidad", "sum"), ejecutado=("valor", "sum"), movimientos=("valor", "size"))
-    ee["seccion"] = ee["elemento"].map(lambda k: DOTACION if k == OTROS else seccion_de.get(k, DOTACION))
-    if sap_mes is not None:                                       # el total es el de SAP: lo que el SISPO no detalla también va en «Otros»
-        sispo_mes = ejec.groupby("mes")["valor"].sum().round(2)
-        resto = round(sum(sap_mes.get(m, 0.0) - float(sispo_mes.get(m, 0.0)) for m in meses), 2)
-        if abs(resto) >= 0.005:
-            ee = pd.concat([ee, pd.DataFrame([dict(elemento=OTROS, ejec_cant=0.0, ejecutado=resto, movimientos=0, seccion=DOTACION)])], ignore_index=True)
-        ee = ee.groupby(["seccion", "elemento"], as_index=False).agg(ejec_cant=("ejec_cant", "sum"), ejecutado=("ejecutado", "sum"), movimientos=("movimientos", "sum"))
-    t = pp.merge(ee, on=["seccion", "elemento"], how="outer")
-    for c in ("ppto_cant", "presupuesto", "ejec_cant", "ejecutado", "movimientos"):
-        t[c] = t[c].fillna(0.0)
-    t["movimientos"] = t["movimientos"].astype(int)
-    t = L.con_metricas(t.assign(concepto=t["elemento"]))
-    t["_o"] = t["seccion"].map({DOTACION: 0, EPPS: 1}).fillna(2)
-    t["_otros"] = (t["elemento"] == OTROS).astype(int)               # «Otros» siempre al final de su sección
-    return t.sort_values(["_o", "_otros", "ejecutado", "presupuesto"], ascending=[True, True, False, False]).drop(columns=["_o", "_otros", "concepto"]).reset_index(drop=True)
+def comparativo(ppto: pd.DataFrame, ejec_asig: pd.DataFrame, meses: list[int]) -> pd.DataFrame:
+    """Por concepto: categoria, concepto, ppto_valor, ppto_cant, ejec_valor, ejec_cant, estado (en los meses dados).
+    Incluye lo ejecutado sin cruce o sin presupuesto, para que el comparativo sume todo lo ejecutado."""
+    p = ppto[ppto["mes"].isin(meses)]
+    pp = p.groupby(["categoria", "articulo"]).agg(ppto_valor=("valor", "sum"), ppto_cant=("cantidad", "sum")) \
+        .reset_index().rename(columns={"articulo": "concepto"})
+    e = ejec_asig[ejec_asig["mes"].isin(meses) & (ejec_asig["estado"] != "excluido")]
+    ee = e.groupby(["categoria", "concepto"]).agg(ejec_valor=("valor", "sum"), ejec_cant=("cantidad", "sum"),
+                                                 estado=("estado", "first")).reset_index()
+    out = pp.merge(ee, on=["categoria", "concepto"], how="outer")
+    for c in ("ppto_valor", "ppto_cant", "ejec_valor", "ejec_cant"):
+        out[c] = out[c].fillna(0.0)
+    out["estado"] = out["estado"].fillna("ok")
+    out.loc[(out["ejec_valor"] != 0) & (out["ppto_valor"] == 0) & (out["estado"] == "ok"), "estado"] = "sin_presupuesto"
+    return out
 
 
-def totales(t: pd.DataFrame) -> dict:
-    """Presupuesto, ejecutado y % de la tabla comparada. `otros` = ejecutado en «Otros (sin clasificar)» (ya incluido en el total)."""
-    p, e = float(t["presupuesto"].sum()), float(t["ejecutado"].sum())
-    return dict(presupuesto=p, ejecutado=e, variacion=e - p, pct=(e / p) if p > 0 else float("nan"),
-                otros=float(t.loc[t["elemento"] == OTROS, "ejecutado"].sum()))
-
-
-def cuadre_sap(ejec: pd.DataFrame, pool_sap: pd.DataFrame, empresa: str, periodo: int) -> dict:
-    """Compara en centavos el SISPO de DOTACIÓN PERSONAL de un mes con el genérico «Salida de inventario» de SAP en la misma cuenta
-    (por centro de costo). Devuelve sap, sispo y diferencia en pesos; sap=None si SAP no trae el genérico de ese mes."""
-    sap = L.sispo_sap_generico(pool_sap, empresa, periodo, CUENTA_SISPO) if len(pool_sap) else pd.DataFrame()
-    sispo = float(ejec.loc[ejec["periodo"] == periodo, "valor"].sum())
-    if sap is None or sap.empty:
-        return dict(sap=None, sispo=sispo, diferencia=None)
-    s = float(pd.to_numeric(sap["valor"], errors="coerce").sum())
-    return dict(sap=s, sispo=sispo, diferencia=round(s - sispo, 2))
-
-
-def libro_ejecucion(ppto: pd.DataFrame, ejec: pd.DataFrame, equiv: pd.DataFrame, sap: pd.DataFrame, sap_mes: dict, meses: list[int],
-                    titulo: str = "", rotulo: str = "PRESUPUESTO") -> bytes:
-    """Excel de la ejecución de dotación con tres hojas:
-    - «Resumen»: presupuesto (`rotulo`) de todos los meses del libro y EJECUCION mes a mes (solo los `meses` pedidos), una fila por grupo
-      (Dotación y EPP's), sin detalle por elemento. «Otros (sin clasificar)» va dentro de Dotación. Totales con fórmulas.
-    - «Dotación» y «EPPs»: los movimientos que componen la ejecución de cada grupo: las salidas del SISPO (con su elemento) y, en Dotación,
-      las líneas de SAP que el SISPO no detalla. Si SAP y SISPO difieren en la «Salida de inventario», la diferencia aparece como una fila
-      «Ajuste» para que los movimientos sumen la ejecución.
-    Debajo de los TOTALES hay un control: lo que suman las dos hojas de movimientos y su diferencia con la ejecución."""
-    from io import BytesIO
-    from openpyxl import Workbook
-    from openpyxl.styles import Font
-    from openpyxl.utils import get_column_letter as col
-
-    p = ppto[ppto["seccion"].isin(SECCIONES_COMPARADAS)]
-    meses_col = sorted(set(int(m) for m in p["mes"].unique()) | set(int(m) for m in meses))
-    p_mes = p.groupby(["seccion", "elemento", "mes"])["valor"].sum()
-    e_mes = {}                                                    # (sección, elemento, mes) -> ejecutado, igual que la pantalla (`comparar`)
-    for m in meses:
-        tm = comparar(ppto, ejec, equiv, [m], sap_mes)
-        for r in tm.itertuples():
-            e_mes[(r.seccion, r.elemento, int(m))] = float(r.ejecutado)
+def decisiones(ejec: pd.DataFrame, cruce: pd.DataFrame, ppto: pd.DataFrame) -> pd.DataFrame:
+    """Lo que Financiera debe decidir para que el comparativo quede bien. Columnas: tipo, articulo, detalle, valor,
+    accion. Ordenado por valor ejecutado."""
     filas = []
-    for sec, nombre in ((DOTACION, "Dotación"), (EPPS, "EPP's")):
-        elems = {k[1] for k in p_mes.index if k[0] == sec} | {k[1] for k in e_mes if k[0] == sec}
-        hijos = []
-        for el in elems:
-            pv = [float(p_mes.get((sec, el, m), 0.0)) for m in meses_col]
-            ev = [float(e_mes.get((sec, el, m), 0.0)) if m in meses else 0.0 for m in meses_col]
-            if any(abs(v) >= 0.005 for v in pv + ev):
-                hijos.append(dict(nombre=el, p=pv, e=ev, nivel=1, _o=(el == OTROS, -sum(ev), -sum(pv), el)))
-        filas.append(dict(nombre=nombre, p=[sum(h["p"][i] for h in hijos) for i in range(len(meses_col))],
-                          e=[sum(h["e"][i] for h in hijos) for i in range(len(meses_col))], nivel=0))   # una fila por grupo: Dotación y EPP's
+    a = asignar(ejec, cruce, ppto)
+    act = a[a["estado"] != "excluido"]
+    for (estado, art), g in act.groupby(["estado", "articulo"]):
+        v = float(g["valor"].sum())
+        if estado == "sin_cruce":
+            filas.append(("Artículo sin cruce", art, f"{g['grupo'].iloc[0]} · {len(g)} salidas", v,
+                          "Asígnale un concepto del presupuesto o márcalo como 'No comparar'"))
+        elif estado == "sin_concepto":
+            filas.append(("Cruce sin concepto", art, "Está en la tabla de cruce pero sin concepto", v,
+                          "Escribe el concepto del presupuesto o márcalo como 'No comparar'"))
+        elif estado == "sin_presupuesto":
+            filas.append(("Concepto sin presupuesto", art, f"Va a '{g['concepto'].iloc[0]}', que no tiene presupuesto "
+                          "este año", v, "Confirma el concepto o cámbialo por uno que sí tenga presupuesto"))
+    rep = cruce.assign(k=cruce["articulo"].map(clave), kc=cruce["concepto"].map(clave))
+    for k, g in rep.groupby("k"):
+        if g["kc"].nunique() > 1:
+            art = g["articulo"].iloc[0]
+            v = float(a.loc[a["articulo"].map(clave) == k, "valor"].sum())
+            filas.append(("Artículo con dos conceptos", art, "En la tabla va a: " + " / ".join(g["concepto"].unique()),
+                          v, f"Se está usando '{g['concepto'].iloc[0]}'. Deja uno solo"))
+    ya = {f[1] for f in filas}
+    # lo que Financiera ya confirmó a mano en la app no se vuelve a preguntar
+    confirmados = set(cruce.loc[cruce["origen"] == "manual", "articulo"].map(clave)) if "origen" in cruce else set()
+    otros = act[~act["grupo"].map(clave).str.contains("dotacion|insumo") & ~act["articulo"].isin(ya)
+                & ~act["articulo"].map(clave).isin(confirmados)]
+    for art, g in otros.groupby("articulo"):
+        filas.append(("Grupo distinto a dotación", art, f"Grupo de almacén: {g['grupo'].iloc[0]}",
+                      float(g["valor"].sum()), "Revisa si corresponde a dotación o márcalo como 'No comparar'"))
+    out = pd.DataFrame(filas, columns=["tipo", "articulo", "detalle", "valor", "accion"])
+    return out.sort_values("valor", ascending=False, key=abs).reset_index(drop=True)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Resumen"
-    ws.cell(row=1, column=1, value=titulo or "Dotación y EPP's: presupuesto vs ejecución").font = Font(bold=True, size=13)
-    ws.cell(row=2, column=1, value="Ejecución: " + ", ".join(MESES_NOMBRE[m - 1].capitalize() for m in meses)).font = Font(italic=False)
-    info = L.hoja_resumen_mensual(ws, filas, [MESES_NOMBRE[m - 1] for m in meses_col], rotulo, fila_enc=4)
 
-    sis = ejec[ejec["mes"].isin(meses)].merge(equiv[["codigo", "elemento"]], on="codigo", how="left")
-    sis["elemento"] = sis["elemento"].fillna(SIN_ELEMENTO).replace(SIN_ELEMENTO, OTROS)
-    seccion_de = p.drop_duplicates("elemento").set_index("elemento")["seccion"].to_dict()
-    sis["seccion"] = sis["elemento"].map(lambda k: DOTACION if k == OTROS else seccion_de.get(k, DOTACION))
-    cols = ["Mes", "Fuente", "Sección", "Elemento", "Código", "Artículo / texto SAP", "Centro de costo", "Nombre centro de costo", "Documento SAP",
-            "Fecha", "Cantidad", "Valor"]
-    mov = []
-    for r in sis.sort_values(["mes", "seccion", "elemento", "articulo"]).itertuples():
-        mov.append([f"{MESES_NOMBRE[int(r.mes) - 1].capitalize()}", "SISPO", r.seccion, r.elemento, r.codigo, r.articulo, r.cc_codigo, r.cc_nombre,
-                    None, None, float(r.cantidad), float(r.valor)])
-    s_ = sap[sap["mes"].isin(meses)] if len(sap) else sap
-    gen = s_["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False) if len(s_) and "texto" in s_ else pd.Series(False, index=s_.index)
-    for r in s_[~gen].sort_values(["mes", "fecha"] if "fecha" in s_ else ["mes"]).to_dict("records"):
-        f = pd.to_datetime(r.get("fecha"), errors="coerce")
-        mov.append([MESES_NOMBRE[int(r["mes"]) - 1].capitalize(), "SAP (sin detalle SISPO)", DOTACION, OTROS, None, r.get("texto"), r.get("cc_sap"), None,
-                    r.get("documento"), None if pd.isna(f) else f.to_pydatetime(), None, float(r["valor"])])
-    for m in meses:                                               # diferencia entre la «Salida de inventario» de SAP y el SISPO: se muestra, no se oculta
-        total_m = sum(v for (sc, el, mm), v in e_mes.items() if mm == m)
-        suma_m = sum(x[-1] for x in mov if x[0] == MESES_NOMBRE[m - 1].capitalize())
-        if abs(total_m - suma_m) >= 0.005:
-            mov.append([MESES_NOMBRE[m - 1].capitalize(), "Ajuste SAP vs SISPO", DOTACION, OTROS, None,
-                        "Diferencia entre la «Salida de inventario» de SAP y el SISPO de DOTACIÓN PERSONAL", None, None, None, None, None, round(total_m - suma_m, 2)])
-    cols.remove("Sección")                                        # el nombre de la hoja ya dice la sección
-    anchos = {"Mes": 14, "Fuente": 22, "Elemento": 36, "Código": 14, "Artículo / texto SAP": 56, "Centro de costo": 14,
-              "Nombre centro de costo": 26, "Documento SAP": 16, "Fecha": 12, "Cantidad": 10, "Valor": 16}
-    refs = []
-    for sec, hoja in ((DOTACION, "Dotación"), (EPPS, "EPPs")):    # los movimientos, separados: Dotación por un lado y solo EPP's por otro
-        filas_h = [x[:2] + x[3:] for x in mov if x[2] == sec]
-        L.escribir_hoja_movimientos(wb, hoja, cols, filas_h, {"Fecha": "dd/mm/yyyy", "Cantidad": "#,##0", "Valor": '#,##0.00'}, anchos)
-        refs.append(f"'{hoja}'!{col(len(cols))}2:{col(len(cols))}{max(len(filas_h) + 1, 2)}")
-    rc = info["fila_total"] + 2
-    ref = ",".join(refs)
-    ce = col(info["col_ejec_total"])
-    ws.cell(row=rc, column=1, value="Control · suma de las hojas de movimientos")
-    ws.cell(row=rc, column=info["col_ejec_total"], value=f"=SUM({ref})").number_format = L.FORMATO_DINERO
-    ws.cell(row=rc + 1, column=1, value="Control · diferencia con la ejecución (debe ser 0)")
-    ws.cell(row=rc + 1, column=info["col_ejec_total"], value=f"=ROUND({ce}{rc}-{ce}{info['fila_total']},2)").number_format = L.FORMATO_DINERO
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+def efectos(cmp: pd.DataFrame) -> pd.DataFrame:
+    """Desviación por concepto partida en efecto precio y efecto cantidad (solo conceptos con presupuesto y
+    ejecución con cantidades): precio = (precio real − precio ppto) × cant. real; cantidad = (cant. real − cant.
+    ppto) × precio ppto."""
+    c = cmp[(cmp["ppto_cant"] > 0) & (cmp["ejec_cant"] > 0)].copy()
+    c["precio_ppto"] = c["ppto_valor"] / c["ppto_cant"]
+    c["precio_real"] = c["ejec_valor"] / c["ejec_cant"]
+    c["efecto_precio"] = (c["precio_real"] - c["precio_ppto"]) * c["ejec_cant"]
+    c["efecto_cantidad"] = (c["ejec_cant"] - c["ppto_cant"]) * c["precio_ppto"]
+    return c
+
+
+# ------------------------------------------------------------------ ejecución contable (rubros 3.1 del presupuesto)
+# Parte de la ejecución de dotación y de seguridad en el trabajo no pasa por el almacén: se registra en contabilidad
+# directo al costo (exámenes médicos, purificadores, extintores, compras directas…). Esos registros se toman de la
+# ejecución del presupuesto (hoja BASE de SAP, ya cargada en Presupuesto) y se suman al análisis de dotación.
+ORIGEN_INV = "Movimiento de inventario"
+ORIGEN_DIRECTO = "Registro contable directo al costo"
+ORIGEN_MANUAL = "Clasificado manualmente"
+ORIGEN_PEND = "Registro contable sin clasificar"
+SIN_CLASIFICAR = "Registros contables sin clasificar"
+_MESES_TXT = r"\b(ene|feb|mar|abr|may|jun|jul|ago|sep|sept|oct|nov|dic|enero|febrero|marzo|abril|mayo|junio|julio|" \
+             r"agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b"
+_VACIAS = {"serv", "comp", "prov", "arre", "hono", "para", "con", "del", "las", "los", "por", "sas", "ltda", "s a s",
+           "provision", "servicio", "servicios", "compra", "factura", "ajuste", "nota", "credito"}
+
+
+def es_rubro_dotacion(sub_rubro) -> bool:
+    """Sub-rubros 3.1 que van al análisis de dotación: 'Dotación y EPP' y 'Actividades de Seguridad (y Salud) en el
+    Trabajo'."""
+    n = _n(sub_rubro)
+    return "dotacion" in n or ("seguridad" in n and ("salud" in n or "trabajo" in n))
+
+
+def es_inventario(texto, tercero="") -> bool:
+    """El registro contable es la salida de almacén (ya está en el kárdex): no se suma dos veces."""
+    t, r = _n(texto), _n(tercero)
+    # la contrapartida es la cuenta de inventarios ("REPUESTOS CAMIONES") o el texto dice salida de inventario
+    return bool(re.search(r"\binv(entario)?\b", t)) or ("repuestos" in r and "camiones" in r)
+
+
+def patron(tercero, texto) -> str:
+    """Llave de una regla: tercero + texto sin fechas, meses ni números (así sirve para los meses siguientes)."""
+    t = re.sub(_MESES_TXT, " ", _n(texto))
+    t = re.sub(r"\d+", " ", t)
+    return f"{_n(tercero)}|{' '.join(t.split()[:4])}"      # las primeras palabras: el resto suele ser la sede o el mes
+
+
+def _raices(x) -> set:
+    return {w[:6] for w in _n(x).split() if len(w) >= 4 and w not in _VACIAS}
+
+
+def sugerir(texto, conceptos: list[str]) -> str:
+    """Concepto del presupuesto que más palabras comparte con el texto del registro ('' si ninguno)."""
+    r = _raices(texto)
+    mejor, puntos = "", 0
+    for c in conceptos:
+        p = len(r & _raices(c))
+        if p > puntos:
+            mejor, puntos = c, p
+    return mejor
+
+
+def contables(sap: pd.DataFrame, clasif: pd.DataFrame, ppto: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    sap: ejecución del presupuesto (anio, mes, fecha, codigo, sub_rubro, cc_nombre, documento, tercero, texto, valor,
+         clave). clasif: clasificaciones guardadas (tipo 'registro'|'patron', llave, concepto).
+    Devuelve (directos, inventario):
+      directos: registros que no pasan por el almacén, con las columnas de la ejecución de dotación + estado,
+                concepto, categoria, origen, detalle, patron;
+      inventario: los registros contables de las salidas de almacén (para cuadrar contra el kárdex).
+    """
+    cols = COLS_EJEC + ["estado", "concepto", "categoria", "origen", "detalle", "patron", "sugerido", "sub_rubro",
+                        "tercero"]
+    if sap.empty:
+        return pd.DataFrame(columns=cols), sap
+    sap = sap.copy()
+    for c in ("texto", "tercero", "sub_rubro", "cc_nombre", "documento", "clave", "fecha"):
+        sap[c] = sap[c].fillna("").astype(str)
+    s = sap[sap["codigo"].astype(str).eq("3.1") & sap["sub_rubro"].map(es_rubro_dotacion)].copy()
+    inv = s[[es_inventario(t, r) for t, r in zip(s["texto"], s["tercero"])]]
+    d = s.drop(inv.index).copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols), inv
+    nombres = ppto.drop_duplicates("articulo")
+    conceptos = list(nombres["articulo"])
+    nombre_de = dict(zip(nombres["articulo"].map(clave), nombres["articulo"]))
+    cat_de = dict(zip(nombres["articulo"].map(clave), nombres["categoria"]))
+    por_reg = dict(zip(clasif.loc[clasif["tipo"] == "registro", "llave"],
+                       clasif.loc[clasif["tipo"] == "registro", "concepto"])) if not clasif.empty else {}
+    por_pat = dict(zip(clasif.loc[clasif["tipo"] == "patron", "llave"],
+                       clasif.loc[clasif["tipo"] == "patron", "concepto"])) if not clasif.empty else {}
+    d["patron"] = [patron(r, t) for r, t in zip(d["tercero"], d["texto"])]
+    d["sugerido"] = [sugerir(t, conceptos) for t in d["texto"]]
+    manual = d["clave"].map(por_reg)
+    regla = d["patron"].map(por_pat)
+    conc = manual.fillna(regla)
+    d["origen"] = ORIGEN_PEND
+    d.loc[conc.notna(), "origen"] = ORIGEN_MANUAL
+    auto = conc.isna() & d["sugerido"].ne("")
+    d.loc[auto, "origen"] = ORIGEN_DIRECTO
+    conc = conc.where(conc.notna(), d["sugerido"].where(d["sugerido"].ne(""), None))
+    kc = conc.fillna("").map(clave)
+    d["estado"] = "ok"
+    d.loc[conc.isna(), "estado"] = "sin_clasificar"
+    d.loc[conc == EXCLUIR, "estado"] = "excluido"
+    d.loc[(d["estado"] == "ok") & ~kc.isin(nombre_de), "estado"] = "sin_presupuesto"
+    d["concepto"] = kc.map(nombre_de).fillna(conc.fillna(""))
+    d["categoria"] = kc.map(cat_de).fillna("SIN HOMOLOGAR")
+    d.loc[d["estado"] == "sin_clasificar", "concepto"] = SIN_CLASIFICAR
+    d.loc[d["estado"] == "excluido", "categoria"] = "EXCLUIDO"
+    d["detalle"] = d["texto"]
+    d["articulo"] = d["concepto"].where(d["estado"] != "sin_clasificar", d["texto"]).astype(str) + " · contable"
+    d["bodega"] = "(Contable)"
+    d["grupo"] = d["sub_rubro"]
+    d["cc"] = d["cc_nombre"]
+    d["codigo"] = d["documento"]
+    d["unidad"] = ""
+    d["cantidad"] = 0.0                    # los registros contables no traen cantidades
+    d["costo_unitario"] = 0.0
+    d["valor_sin_iva"] = d["valor"]
+    for c in cols:
+        if c not in d:
+            d[c] = ""
+    return d[cols].reset_index(drop=True), inv

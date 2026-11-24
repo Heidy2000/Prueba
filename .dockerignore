@@ -1,0 +1,13 @@
+.git
+.gitignore
+.dockerignore
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+respaldo*/
+.streamlit/secrets.toml

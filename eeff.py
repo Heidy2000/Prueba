@@ -414,6 +414,10 @@ def resumen(lineas: pd.DataFrame, tasa_impuesto: float = 0.35) -> pd.DataFrame:
     t["ktno"] = t["kto"] - t["cxp"]
     t["deuda_neta"] = t["deuda_fin"] - t["efectivo"]
     t["deuda_ebitda"] = div(t["deuda_neta"], t["ebitda_12m"])
+    # versiones con EBIT (resultado operacional): las que usa el módulo Estados financieros
+    t["operacional_12m"] = t["operacional_m"].rolling(12, min_periods=12).sum()
+    t["cobertura_ebit"] = div(t["operacional"], t["gasto_fin_neto"])
+    t["deuda_ebit"] = div(t["deuda_neta"], t["operacional_12m"])
     meses_t = pd.Series(t.index.get_level_values(1), index=t.index)
     t["roe"] = div(t["neto"] * 12 / meses_t, t["PAT"])                     # anualizado
     t["roa"] = div(t["operacional"] * (1 - tasa_impuesto) * 12 / meses_t, t["kto"] + t["activo_fijo"])

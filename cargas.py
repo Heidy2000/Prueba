@@ -35,6 +35,9 @@ CLASES = {   # nombres según la tabla de rubros de Financiera (1.0 = ingresos)
     "7.0": "Impuestos",
 }
 RUBROS = {k: f"{k} {v}" for k, v in CLASES.items()}
+# clases que deben verse en el PyG y en el presupuesto por rubro de una compañía aunque aún no tengan presupuesto ni
+# ejecución (salen en cero hasta que se carguen): compañía -> [(clase, sub-rubro que se muestra)]
+CLASES_FIJAS = {"ALDC": [("4.2", "Otros proyectos")]}
 # Subtotales del PyG: nombre -> clases que suma (todo en signo SAP: ingreso negativo, gasto positivo)
 EBITDA = [k for k in CLASES if k < "4"]
 SUBTOTALES = {
