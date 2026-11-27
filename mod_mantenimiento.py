@@ -1,33 +1,8 @@
 """
 Módulo Mantenimiento: presupuesto vs ejecución · Flota y Equipo de transporte, Tecnomecánica/SOAT y Contenedores
-================================================================================================================
-Una sola pantalla con cuatro pestañas (se abren hasta el MOVIMIENTO, solo para el administrador):
-- Mantenimiento                <- resumen del rubro por sub-rubro (sin movimientos).
-- Flota y Equipo de Transporte <- concepto presupuestal (descripción TIPO VEHICULO del archivo de presupuesto, incluidos los
-                                  generales sin placa: In House, grúa, lavado…) -> placa -> concepto de gasto -> movimientos.
-- Tecnomecánica y SOAT         <- dos conceptos independientes; presupuesto mensual por placa del archivo «Soat y Tecno».
-- Contenedores                 <- vista simple: presupuesto, ejecutado, saldo y % mes a mes.
-
-Compañías: ALDC y ALSM se cargan por separado y cada movimiento conserva la suya. Arriba se elige «Consolidado» (suma de
-las dos) o una compañía. El listado oficial de placas es uno solo, compartido.
-
-Un movimiento tiene UN concepto, y el concepto define el ámbito donde aparece (no se cuenta dos veces).
-Identificador único de movimiento: «compañía|clave de SAP» (con sufijo #2, #3… si dos fueran idénticos).
-Orden de clasificación: reasignación manual > histórico aprendido > reglas editables > pendiente.
-La placa sale del texto (solo contra el listado oficial) y se puede corregir a mano.
-Reclasificar o eliminar un movimiento queda en mtto_clasif_log (usuario, fecha, antes, después, motivo). Eliminar NO borra la
-ejecución de la base: guarda el movimiento en mtto_excluidos, así no reaparece en cargas posteriores y se puede restaurar.
-
-El selector de PLACA es global: filtra los DATOS (presupuesto, ejecución, saldo, %, gráficos, tablas, detalle y Excel) de
-Flota y Tecnomecánica/SOAT. Los conceptos generales no se atribuyen a placas: con una placa elegida no se muestran.
-Escenario UPA 2026 = sep–dic 2026; Normal 2027 = ene–dic 2027. Sus cifras nunca se mezclan.
-
-La lógica de cálculo y el Excel (VEHÍCULOS, TECNOMECÁNICAS, SOAT) están en logica_m.py (sin Streamlit).
-Tablas propias: mtto_placas, mtto_ppto, mtto_ppto_ts, mtto_reglas, mtto_clasif_manual, mtto_clasif_log y mtto_excluidos.
-
-app.py lo llama como: mod_mantenimiento.mostrar(ctx)
 """
 import math
+import re
 import traceback
 from html import escape
 from types import SimpleNamespace
@@ -42,7 +17,7 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, figura_ppto_ejec_empresas, texto_periodo, titulo_tarjeta
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -76,7 +51,8 @@ CREATE TABLE IF NOT EXISTS mtto_sispo_reemplazados(empresa TEXT, periodo INT, ll
     sub_rubro TEXT DEFAULT '', sub_rubro_sap TEXT DEFAULT '');
 """
 # columnas agregadas a tablas que ya existían en versiones anteriores del módulo
-MIGRACIONES = {"mtto_ppto": {"texto_original": "TEXT DEFAULT ''"}, "mtto_clasif_manual": {"placa": "TEXT DEFAULT ''"},
+MIGRACIONES = {"mtto_sispo_ref": {"categoria": "TEXT DEFAULT ''", "bodega": "TEXT DEFAULT ''"},   # base maestra: Clasificación y Bodega
+               "mtto_ppto": {"texto_original": "TEXT DEFAULT ''"}, "mtto_clasif_manual": {"placa": "TEXT DEFAULT ''"},
                "mtto_clasif_log": {"motivo": "TEXT DEFAULT ''"},
                # la reclasificación SISPO pasó de una cuenta (flota) a siete: lo ya aplicado queda como de la flota
                "mtto_sispo_periodo": {"cuenta": "TEXT DEFAULT 'FLOTA Y EQUIPO DE TR'"},
@@ -242,7 +218,7 @@ def _movimientos_maestro(datos_e: dict, cfg: dict, hasta_mes: int, oficial: pd.D
     el usuario) quedan fuera por su llave, también en cargas posteriores.
     `sispo` = (líneas aplicadas, movimientos de SAP reemplazados): los movimientos genéricos de SAP salen y entran, en su lugar,
     las líneas de SISPO con su placa y su concepto de la base maestra (los cambios manuales siguen mandando)."""
-    m0 = cfg["meses"][0]
+    m0 = cfg.get("desde", cfg["meses"][0])
     todo = pool_sap if pool_sap is not None else _pool_sap(datos_e)
     if sispo is not None and len(sispo[0]):
         todo = todo[~todo["llave"].isin(set(sispo[1]["llave"]))]
@@ -252,11 +228,18 @@ def _movimientos_maestro(datos_e: dict, cfg: dict, hasta_mes: int, oficial: pd.D
                 nuevos["fecha"] = pd.to_datetime(nuevos["fecha"], errors="coerce")
             todo = pd.concat([todo, nuevos], ignore_index=True)
     mov = todo[(todo["mes"] >= m0) & (todo["mes"] <= hasta_mes)].reset_index(drop=True)
-    mov = L.asignar_placas(mov, oficial["placa"].tolist())
+    mov = L.asignar_placas(mov, oficial["placa"].tolist(), oficial[["placa", "numero_interno"]] if "numero_interno" in oficial else None)
     es_s = mov["sispo"].fillna(False).astype(bool) if "sispo" in mov else pd.Series(False, index=mov.index)
     if es_s.any():                                      # la placa de SISPO sale de su centro de costos, no del texto del artículo
         mov.loc[es_s, "placa"] = mov.loc[es_s, "placa_sispo"]
         mov.loc[es_s, "placa_estado"] = mov.loc[es_s, "placa_estado_sispo"]
+        por_int = mov.loc[es_s, "placa_estado"] == L.ESTADO_POR_INTERNO     # SISPO: la placa viene del centro de costos, no del texto
+        sin_p = mov.loc[es_s, "placa"] == L.SIN_PLACA
+        mov.loc[es_s, "placa_metodo"] = L.METODO_TEXTO
+        mov.loc[es_s & por_int.reindex(mov.index, fill_value=False), "placa_metodo"] = L.METODO_INTERNO
+        mov.loc[es_s & sin_p.reindex(mov.index, fill_value=False), "placa_metodo"] = L.METODO_PENDIENTE
+        mov.loc[es_s, "numero_interno_texto"] = ""
+        mov.loc[es_s, "placa_validacion"] = "Placa del centro de costos de SISPO"
     mov = L.aplicar_placas_manuales(mov, manual)
     mov = L.clasificar(mov, reglas, manual, catalogo)
     if es_s.any():                                      # el concepto sale SOLO de la base maestra (o queda pendiente); lo manual manda
@@ -286,6 +269,43 @@ def _tono(est: str):
     return {"Sobre ejecutado": (E.ROJO, E.ROJO_SUAVE), "Sin presupuesto asignado": (E.ROJO, E.ROJO_SUAVE),
             "Presupuesto agotado": (E.AMBAR, E.AMBAR_SUAVE), "Pendiente de clasificación": (E.AMBAR, E.AMBAR_SUAVE),
             "Dentro del presupuesto": (E.VERDE, E.VERDE_SUAVE)}.get(est, (E.AZUL, E.AZUL_SUAVE))
+
+
+def _sub_pres(S, base: str) -> str:
+    """Texto bajo el presupuesto de los indicadores: con un mes elegido aclara que es el de ese mes."""
+    return f"Presupuesto de {MESES_L[S.sel_mes - 1]} {S.cfg['anio']}" if S.sel_mes else base
+
+
+def _factor_mes(d, cfg: dict, mes: int, asig=None, usuario: str | None = None) -> float | None:
+    """Peso de `mes` en el presupuesto de la flota de UNA compañía (placas + generales). El presupuesto por placa y concepto se carga
+    para todo el escenario, no por mes; el mensual real existe solo para el sub-rubro Flota (que incluye Tecnomecánica/SOAT, ya
+    mensual). Por eso el peso es el del mes en el presupuesto mensual de Flota SIN Tecnomecánica/SOAT: así placas + generales + Tecno/SOAT
+    del mes suman exactamente el presupuesto mensual de Flota. None si no hay presupuesto mensual de Flota que lo respalde."""
+    kf = L.norm_texto(L.SUBRUBRO_FLOTA)
+    pb = d.ppto_base[d.ppto_base["sub_rubro"].fillna("").astype(str).map(L.norm_texto) == kf]
+    if usuario is not None and len(pb):
+        pb = pb[asignacion.columna(pb, asig) == usuario]
+    m0, m1 = cfg["meses"]
+    rango = range(m0, m1 + 1)
+    flota = pb.groupby("mes")["valor"].sum().reindex(rango, fill_value=0.0)
+    ts = d.ts_mes[(d.ts_mes["anio"] == cfg["anio"]) & (d.ts_mes["mes"] >= m0) & (d.ts_mes["mes"] <= m1)].groupby("mes")["valor"].sum().reindex(rango, fill_value=0.0)
+    neto = flota - ts
+    if neto.sum() > 0 and neto[mes] >= 0:
+        return float(neto[mes] / neto.sum())
+    return float(flota[mes] / flota.sum()) if flota.sum() > 0 else None
+
+
+def _ppto_del_mes(d, cfg: dict, mes: int, asig=None, usuario: str | None = None) -> tuple[pd.DataFrame, float | None]:
+    """Presupuesto de UNA compañía para un solo mes, en el formato de `ppto_all`: placas y generales = presupuesto del escenario × peso del
+    mes (`_factor_mes`); Tecnomecánica/SOAT = lo cargado para ese mes. Sin presupuesto mensual de Flota no se puede prorratear: se deja el
+    del escenario y se devuelve factor None para que la pantalla lo avise."""
+    f = _factor_mes(d, cfg, mes, asig, usuario)
+    ppto = d.ppto.copy()
+    if f is not None and len(ppto):
+        ppto["valor"] = pd.to_numeric(ppto["valor"], errors="coerce").fillna(0.0)
+        ppto["valor"] = ppto["valor"].where(~ppto["es_global"].isin([0, 1]), ppto["valor"] * f)
+    ts = L.ts_periodo(d.ts_mes, dict(cfg, meses=(mes, mes))).assign(empresa=d.empresa)
+    return pd.concat([ppto, ts], ignore_index=True), f
 
 
 def _kpis(presupuesto: float, ejecutado: float, movimientos: int, hasta: str, sub_pres="Año completo"):
@@ -325,12 +345,18 @@ def _tabla(df: pd.DataFrame, alto=380):
     st.dataframe(df, hide_index=True, width="stretch", height=alto, column_config=_config())
 
 
+def _tecnico() -> bool:
+    """True solo cuando la vista se pinta desde Administración (`admin_revision_tecnica`): ahí viven las descargas, validaciones y
+    herramientas técnicas. En la página del módulo no se muestran."""
+    return bool(st.session_state.get("_mt_tecnico"))
+
+
 def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bool = False):
     """Detalle de movimientos con búsqueda y descarga. Valores originales de SAP (signo SAP)."""
     cols = [c for c in ["empresa", "fecha", "mes", "tercero", "texto", "documento", "codigo_articulo", "cantidad", "cuenta_nombre",
                         "cc_nombre", "sub_rubro_sap", "valor", "llave"] if c in mov.columns]
     if vehiculo:
-        cols = [c for c in ["ambito", "placa", "placa_detectada", "placa_estado", "concepto", "origen", "confianza",
+        cols = [c for c in ["ambito", "placa", "placa_detectada", "numero_interno_texto", "placa_metodo", "placa_validacion", "placa_estado", "concepto", "origen", "confianza",
                             "concepto_sugerido"] if c in mov.columns] + cols
     buscar = st.text_input("Buscar", placeholder="Compañía, proveedor, texto, documento, placa, concepto…",
                            label_visibility="collapsed", key=f"mt_buscar_{clave}")
@@ -348,14 +374,16 @@ def _tabla_movimientos(mov: pd.DataFrame, clave: str, archivo: str, vehiculo: bo
         "fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
         "ambito": "Ámbito", "placa": "Placa (final)", "placa_detectada": "Placa detectada en el texto",
         "placa_estado": "Identificación de placa", "concepto": "Concepto",
-        "origen": "Clasificado por", "confianza": "Confianza", "concepto_sugerido": "Sugerido (confianza baja)",
+        "numero_interno_texto": "N° interno identificado", "placa_metodo": "Método de identificación",
+        "placa_validacion": "Validación placa / N° interno", "origen": "Clasificado por", "confianza": "Confianza", "concepto_sugerido": "Sugerido (confianza baja)",
         "tercero": "Proveedor / tercero", "texto": st.column_config.TextColumn("Texto original", width="large"),
         "documento": "Documento", "cuenta_nombre": "Cuenta", "cc_nombre": "Centro de coste",
         "sub_rubro_sap": "Sub-rubro (SAP)", "valor": st.column_config.NumberColumn("Valor", format="accounting"),
         "codigo_articulo": "Referencia (SISPO)", "cantidad": st.column_config.NumberColumn("Cantidad", format="%g"),
         "llave": "ID del movimiento"})
-    st.download_button("Descargar movimientos", lambda d=vista: a_excel(d), f"{archivo}.xlsx",
-                       icon=":material/download:", key=f"mt_dl_{clave}")
+    if _tecnico():
+        st.download_button("Descargar movimientos", lambda d=vista: a_excel(d), f"{archivo}.xlsx",
+                           icon=":material/download:", key=f"mt_dl_{clave}")
 
 
 def _auditoria(S, m: pd.DataFrame, clave: str, archivo: str):
@@ -380,35 +408,49 @@ def _sin_ceros(t: pd.DataFrame) -> pd.DataFrame:
     return t[(num("presupuesto").abs() > 0.5) | (num("ejecutado").abs() > 0.5) | (num("movimientos") > 0)]
 
 
-def _barras_ppto_ejec(t: pd.DataFrame, nota: str, con_pendiente: bool = False):
-    """Presupuesto vs ejecutado por concepto (los 12 mayores). Responde: ¿dónde se concentra el gasto y qué tanto se ha usado?
-    «Pendiente» (movimientos sin concepto) se omite, salvo que la tabla de al lado también lo muestre (con_pendiente)."""
-    t = t if con_pendiente else t[t["concepto"] != L.PENDIENTE]
+def _filas_visual(t: pd.DataFrame, col: str = "concepto", por_empresa: dict | None = None, sub=None) -> list[dict]:
+    """Filas de `E.tabla_visual` desde una tabla con presupuesto y ejecutado (mismas cifras, sin recalcular), de mayor a menor ejecución.
+    `por_empresa` ({compañía: tabla con `col`, `presupuesto` y `ejecutado`}): cada fila se abre en sus compañías."""
     t = t.copy()
-    for c in ("presupuesto", "ejecutado"):                   # con filtros que dejan la tabla vacía las columnas llegan como texto
+    for c in ("presupuesto", "ejecutado"):
         t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0.0)
-    t = t.assign(_m=t[["presupuesto", "ejecutado"]].max(axis=1))
-    top = t[t["_m"] > 0].nlargest(12, "_m").iloc[::-1] if len(t) else t
-    if top.empty:
-        st.caption("Aún no hay presupuesto ni ejecución para graficar.")
-        return
-    nombres = [c[:48] for c in top["concepto"]]
-    fig = go.Figure()
-    fig.add_bar(y=nombres, x=top["presupuesto"] / 1e6, name="Presupuesto", orientation="h", marker_color="#c9d4e4",
-                hovertemplate="%{y}: %{x:,.1f} M<extra>Presupuesto</extra>")
-    fig.add_bar(y=nombres, x=top["ejecutado"] / 1e6, name="Ejecutado", orientation="h", marker_color=E.AZUL,
-                hovertemplate="%{y}: %{x:,.1f} M<extra>Ejecutado</extra>")
-    fig.update_layout(barmode="group", xaxis=dict(tickformat=",.0f", ticksuffix=" M"), yaxis=dict(type="category"))
-    st.plotly_chart(estilo_grafico(fig, 420), width="stretch", config={"displayModeBar": False})
-    st.caption(nota)
+    t = t[(t["presupuesto"] != 0) | (t["ejecutado"] != 0)].sort_values(["ejecutado", "presupuesto"], ascending=False)
+    filas = []
+    for r in t.to_dict("records"):
+        hijos = []
+        for emp, d in (por_empresa or {}).items():
+            if {"presupuesto", "ejecutado", col} <= set(d.columns):
+                x = d[d[col] == r[col]]
+                if len(x) and (x["presupuesto"].sum() or x["ejecutado"].sum()):
+                    hijos.append(dict(nombre=emp, presupuesto=float(x["presupuesto"].sum()), ejecutado=float(x["ejecutado"].sum())))
+        filas.append(dict(nombre=r[col], presupuesto=r["presupuesto"], ejecutado=r["ejecutado"], hijos=hijos if len(hijos) > 1 else [],
+                          sub=sub(r) if sub else ""))
+    return filas
+
+
+def _participacion(pares: list[tuple], titulo: str):
+    seg = E.segmentos_top(pares)
+    if seg:
+        st.markdown(f"**{titulo}**")
+        st.html(E.barra_segmentada(seg))
 
 
 def _grafico_ts_mensual(S, presupuesto_mes: pd.DataFrame, ejecucion: pd.DataFrame):
-    meses = list(range(S.m0, S.m1 + 1))
+    meses = list(range(L.desde_mes(S.cfg), S.hasta_mes + 1)) if S.sel_mes else list(range(S.m0, S.m1 + 1))   # un mes: solo ese mes
     pm = presupuesto_mes.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6
     em = (ejecucion.groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6).astype(float)
     em[em.index > S.hasta_mes] = None                       # no se dibuja lo que aún no ha pasado
     x = [f"{MESES[m - 1]} {str(S.cfg['anio'])[2:]}" for m in meses]
+    if S.multi and "empresa" in ejecucion and ejecucion["empresa"].nunique() > 1:      # varias compañías: ejecución apilada por compañía
+        por_e = {}
+        for emp in [e for e in S.sel if e in set(ejecucion["empresa"])]:
+            v = (ejecucion[ejecucion["empresa"] == emp].groupby("mes")["valor"].sum().reindex(meses, fill_value=0) / 1e6).astype(float)
+            v[v.index > S.hasta_mes] = None
+            por_e[emp] = v
+        fig = figura_ppto_ejec_empresas(x, pm.to_numpy(), por_e)
+        fig.update_layout(bargap=.25)
+        st.plotly_chart(estilo_grafico(fig, 300), width="stretch", config={"displayModeBar": False})
+        return
     fig = go.Figure()
     fig.add_bar(x=x, y=pm, name="Presupuesto", marker_color="#c9d4e4", marker_line_width=0, hovertemplate="%{y:,.1f} M")
     fig.add_bar(x=x, y=em, name="Ejecutado", marker_color=E.AZUL, marker_line_width=0, hovertemplate="%{y:,.1f} M")
@@ -480,9 +522,11 @@ def _celdas(r) -> str:
     color, _fondo = _tono(r["estado"])
     var = float(r["ejecutado"]) - float(r["presupuesto"])
     c_var = E.ROJO if var > 0.5 else (E.VERDE if var < -0.5 else "")
+    pr, ej = float(r["presupuesto"]), float(r["ejecutado"])
+    c_bar = E.color_barra(ej / pr if pr > 0 else float("nan"), ej, False)         # azul dentro, naranja >90 %, rojo si se pasa o no hay presupuesto
     return (_cel(r["presupuesto"]) + _cel(r["ejecutado"]) + _cel(var, color=c_var, clase="mt-var")
-            + f'<span class="mt-n">{_p(r["pct"])}</span>'
-            + f'<span><span class="mt-est" style="color:{color}"><i style="background:{color}"></i>{escape(r["estado"])}</span></span>')
+            + f'<span class="mt-n" style="color:{c_bar};font-weight:600">{_p(r["pct"])}</span>'
+            + f'<span title="{escape(r["estado"])}">{E._bullet(pr, ej, c_bar)}</span>')
 
 
 def _pl(n, singular: str, plural: str | None = None) -> str:
@@ -556,7 +600,7 @@ def _encabezado_arbol(primera: str) -> str:
     corto = primera.split(" / ")[0]
     return (f'<div class="mt-f mt-h"><span title="{escape(primera)}">{escape(corto)}</span><span class="mt-n">Presupuesto</span>'
             '<span class="mt-n">Ejecutado</span><span class="mt-n">Variación</span><span class="mt-n">% ejecución</span>'
-            '<span>Estado</span></div>')
+            '<span>Ejecución vs presupuesto</span></div>')
 
 
 def _fila_total(p: float, e: float, n: int) -> str:
@@ -627,14 +671,6 @@ def _bloques_placa(S, nodos, grupos: dict, embebe: bool, nivel0: int, abrir: set
                          S.emp_placa.get(n["placa"]) if S.multi else "", _pl(len(h), "concepto") if len(h) else "")
         bloques.append(_bloque(_fila(n["placa"], _celdas(n), nivel0, etiqueta), hijos, nivel0 in abrir))
     return bloques
-
-
-def _html_placa_concepto(S, nodos, mov_amb: pd.DataFrame, abrir: set, con_ppto_mes: bool, titulo: str) -> str:
-    """Árbol placa -> concepto -> movimientos."""
-    grupos = _agrupar(mov_amb, ["placa", "concepto"])
-    filas = [_encabezado_arbol(titulo)] + _bloques_placa(S, nodos, grupos, len(mov_amb) <= MAX_MOV_ARBOL, 0, abrir, con_ppto_mes)
-    tp, te, tm = _totales(nodos)
-    return _cierre(filas, tp, te, tm)
 
 
 SIN_CONCEPTO = "Sin concepto presupuestal"
@@ -1296,14 +1332,10 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     pr, er = _rubro_sel(S)
     cfg = dict(S.cfg, etiqueta=str(S.escenario).split()[0])
     nombres, orden, p_, e_ = L.serie_subrubros(pr, er, cfg)
-    ppto_u, factor = S.ppto_sel, None
-    if mes:
-        kf = L.norm_texto(L.SUBRUBRO_FLOTA)
-        m0_, m1_ = cfg["meses"]
-        tot_f = sum(float(p_.get((kf, mm), 0.0)) for mm in range(m0_, m1_ + 1))
-        factor = float(p_.get((kf, mes), 0.0)) / tot_f if tot_f > 0 else 0.0
-        prorratea = ppto_u["es_global"].isin([0, 1])                                  # placas y generales; Tecno/SOAT ya son mensuales
-        ppto_u = ppto_u.assign(valor=ppto_u["valor"].where(~prorratea, ppto_u["valor"] * factor))
+    ppto_u = S.ppto_sel_anual                                                         # el del escenario completo: aquí se prorratea al `mes` pedido
+    if mes:                                                                           # placas y generales por el peso del mes; Tecno/SOAT ya son mensuales
+        usuario_ = None if S.ver_todo else S.ctx.usuario
+        ppto_u = pd.concat([_ppto_del_mes(S.datos_e[e], S.cfg, mes, S.asig, usuario_)[0] for e in S.sel], ignore_index=True)
     m = S.mov_todos[S.mov_todos["empresa"].isin(S.sel)]
     if mes:
         m = m[pd.to_numeric(m["mes"], errors="coerce") == mes]
@@ -1366,7 +1398,7 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     detalle = pd.DataFrame(filas_d, columns=["Placa", "Tipo", "Origen", "Concepto", "Fecha", "Documento", "Referencia", "Artículo / texto",
                                              "Proveedor / bodega", "Cantidad", "Valor", "% de la ejecución de la placa"])
     # ---- hoja «Resumen»: por sub-rubro y mes, y origen de la ejecución de Flota
-    meses = [mes] if mes else list(range(S.m0, S.hasta_mes + 1))
+    meses = [mes] if mes else list(range(L.desde_mes(S.cfg), S.hasta_mes + 1))
     mv = S.vistas["movimientos"]
     mv = mv[mv["ambito"].isin([L.AMB_PLACAS, L.AMB_GEN])]
     mv_s = mv["sispo"].fillna(False).astype(bool) if "sispo" in mv else pd.Series(False, index=mv.index)
@@ -1382,12 +1414,376 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
                                 rotulo_ppto=f"Presupuesto {MESES_L[mes - 1]}\n(prorrateado)" if mes else "Presupuesto")
 
 
+def _vista_mes(S, mes: int):
+    """Vista de Flota de UN mes con las mismas cifras que usa el Excel reclasificado: presupuesto del mes (el de placa y concepto se prorratea con
+    el peso del mes en el presupuesto mensual de Flota; Tecnomecánica/SOAT ya son mensuales) y solo los movimientos de ese mes. `mes` = 0:
+    la vista de la página tal cual (todo el periodo seleccionado). Devuelve (S con esas vistas, movimientos de placas)."""
+    if not mes:
+        return S, _movs(S, L.AMB_PLACAS)
+    usuario_ = None if S.ver_todo else S.ctx.usuario
+    ppto_u = pd.concat([_ppto_del_mes(S.datos_e[e], S.cfg, mes, S.asig, usuario_)[0] for e in S.sel], ignore_index=True)
+    m = S.mov_todos[S.mov_todos["empresa"].isin(S.sel)]
+    m = m[pd.to_numeric(m["mes"], errors="coerce") == mes]
+    v2 = L.calcular(ppto_u, m, S.oficial, S.placa, S.tipos)
+    S2 = SimpleNamespace(**{**vars(S), "vistas": v2})
+    S2.cfg, S2.hasta_mes, S2.hasta = dict(S.cfg, meses=(mes, S.cfg["meses"][1])), mes, f"{MESES_L[mes - 1]} {S.cfg['anio']}"
+    return S2, _movs(S2, L.AMB_PLACAS)
+
+
+def _top_desviacion(nodos: list[dict], n: int = 10) -> list[dict]:
+    """Las `n` placas con mayor diferencia (en valor absoluto) entre ejecutado y presupuesto, de mayor a menor. Se excluye «SIN PLACA
+    IDENTIFICADA» (no es un vehículo) y las placas sin presupuesto ni ejecución."""
+    c = [x for x in nodos if x["placa"] != L.SIN_PLACA and (float(x["presupuesto"]) != 0 or float(x["ejecutado"]) != 0)]
+    return sorted(c, key=lambda x: (-abs(float(x["ejecutado"]) - float(x["presupuesto"])), x["placa"]))[:n]
+
+
+def _top_sobre(nodos: list[dict], n: int = 10) -> list[dict]:
+    """Las `n` placas que más se pasaron de su presupuesto (ejecutado − presupuesto > 0), de mayor a menor exceso. Una placa sin
+    presupuesto y con ejecución cuenta como sobre ejecutada por todo lo ejecutado. No entra «SIN PLACA IDENTIFICADA» (no es un vehículo)."""
+    c = [x for x in nodos if x["placa"] != L.SIN_PLACA and float(x["ejecutado"]) - float(x["presupuesto"]) > 0.5]
+    return sorted(c, key=lambda x: (-(float(x["ejecutado"]) - float(x["presupuesto"])), x["placa"]))[:n]
+
+
+N_CONCEPTOS_TOP = 3
+
+
+def _partir_conceptos(h: pd.DataFrame, k: int = N_CONCEPTOS_TOP) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Conceptos de una placa -> (los `k` de mayor ejecución, el resto). Entre los dos están TODOS los conceptos de la placa: lo que suman
+    (presupuesto y ejecución) es lo mismo que suma la placa."""
+    principales = h[h["ejecutado"] > 0.5].sort_values(["ejecutado", "presupuesto"], ascending=False).head(k)
+    return principales, h.drop(principales.index)
+
+
+def _bloques_placa_top3(S, nodos: list[dict], grupos: dict, embebe: bool, abrir: set) -> list[str]:
+    """Placa -> sus 3 conceptos de mayor ejecución (cada uno abre en sus movimientos) + «Otros», que junta el resto y se abre en los
+    conceptos que contiene. Así la tabla no se alarga y los renglones siguen sumando el total de la placa."""
+    bloques = []
+    for n in nodos:
+        principales, resto = _partir_conceptos(n["hijos"])
+        hijos = []
+        for r in principales.to_dict("records"):
+            nietos = _filas_mov(grupos.get((n["placa"], r["concepto"])), 2, S.multi) if embebe else []
+            hijos.append(_bloque(_fila(r["concepto"], _celdas(r), 1, "", _orig_distinto(r.get("texto_original"), r["concepto"])),
+                                 nietos, 1 in abrir))
+        if len(resto):
+            t = L.con_metricas(pd.DataFrame({"presupuesto": [float(resto["presupuesto"].sum())], "ejecutado": [float(resto["ejecutado"].sum())],
+                                             "movimientos": [int(resto["movimientos"].sum())]})).iloc[0]
+            comp = [_fila(r["concepto"], _celdas(r), 2) for r in resto.to_dict("records")]
+            hijos.append(_bloque(_fila("Otros", _celdas(t), 1, _tags(_pl(len(resto), "concepto"))), comp, False))
+        etiqueta = _tags(str(n.get("tipo") or "")[:36], S.emp_placa.get(n["placa"]) if S.multi else "")
+        bloques.append(_bloque(_fila(n["placa"], _celdas(n), 0, etiqueta), hijos, 0 in abrir))
+    return bloques
+
+
+def _cuadra_top3(nodos: list[dict]) -> tuple[float, float]:
+    """Diferencia (presupuesto, ejecutado) entre cada placa y la suma de sus 3 conceptos principales + «Otros»: debe ser 0."""
+    dp = de = 0.0
+    for n in nodos:
+        p, r = _partir_conceptos(n["hijos"])
+        dp += float(n["presupuesto"]) - float(p["presupuesto"].sum()) - float(r["presupuesto"].sum())
+        de += float(n["ejecutado"]) - float(p["ejecutado"].sum()) - float(r["ejecutado"].sum())
+    return dp, de
+
+
+def _html_tipos(S, cats: list[dict], mp: pd.DataFrame, abrir: set) -> str:
+    """Árbol tipo de vehículo -> placa -> concepto de gasto -> movimiento. Los conceptos generales (sin placa) van como renglones
+    sueltos al final, así el total es el mismo de los indicadores."""
+    grupos = _agrupar(mp, ["placa", "concepto"])
+    embebe = len(mp) <= MAX_MOV_ARBOL
+    met = _df_categorias(cats, total=False).to_dict("records")
+    filas = [_encabezado_arbol("Tipo de vehículo / placa / concepto de gasto / movimiento")]
+    vistos = []
+    for c, t in sorted(zip(cats, met), key=lambda q: -q[0]["ejecutado"]):
+        if c["presupuesto"] == 0 and c["ejecutado"] == 0:
+            continue
+        vistos.append(c)
+        nodos = [n for n in sorted(c["nodos"], key=lambda n: (-float(n["ejecutado"]), -float(n["presupuesto"])))
+                 if n["presupuesto"] != 0 or n["ejecutado"] != 0]
+        hijos = _bloques_placa(S, nodos, grupos, embebe, 1, abrir, False, con_tipo=False) if nodos else []
+        sub = _pl(c["placas"], "placa") if c["placas"] else ("general" if c["general"] else "")
+        filas.append(_bloque(_fila(c["nombre"], _celdas(t), 0, _tags(sub)), hijos, 0 in abrir))
+    return _cierre(filas, sum(c["presupuesto"] for c in vistos), sum(c["ejecutado"] for c in vistos), int(sum(c["movimientos"] for c in vistos)))
+
+
+def _excel_hallazgos(R: dict, titulo: str) -> bytes:
+    """Excel con todos los hallazgos y, en «Intervenciones», la base de la que salen (una fila por placa + concepto + fecha)."""
+    from io import BytesIO
+    cob = R["cobertura"]
+    resumen = pd.DataFrame([
+        ("Periodo", titulo), ("Valor total de los movimientos de placas", cob["total"]), ("Analizado (concepto clasificado)", cob["analizado"]),
+        ("Pendiente de clasificación", cob["pendiente"]), ("Concepto OTROS", cob["otros"]), ("Sin placa identificada", cob["sin_placa"]),
+        ("Concilia (suma de partes = total)", "Sí" if cob["concilia"] else "NO"),
+        ("Conceptos rutinarios (fuera de reincidencia y repeticiones)", ", ".join(R["rutinarios"]) or "ninguno")], columns=["Concepto", "Valor"])
+    hojas = {"Resumen": resumen, "Alertas": R["alertas"], "Pareto sobrecosto": R["pareto"], "Frente a sus pares": R["frecuencia"], "Reincidencia": R["reincidencia"], "Repeticiones cortas": R["repeticiones"],
+             "Eventos atípicos": R["atipicos"], "Frente a su tipo": R["desproporcion"], "Concentración": R["concentracion"],
+             "Intervenciones": R["intervenciones"]}
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="dd/mm/yyyy") as xw:
+        for nombre, d in hojas.items():
+            d = d.copy()
+            for c in d.columns:
+                if str(d[c].dtype).startswith("datetime"):
+                    d[c] = d[c].dt.date
+            d.to_excel(xw, sheet_name=nombre[:31], index=False)
+            ws = xw.sheets[nombre[:31]]
+            for i, c in enumerate(d.columns):
+                ws.set_column(i, i, 60 if c in ("mensaje", "detalle", "texto") else max(12, min(32, len(str(c)) + 4)))
+    return buf.getvalue()
+
+
+def _sistema(concepto: str) -> str:
+    """Sistema al que pertenece un concepto: su primer tramo, antes de « - », «;», «(», «/» o «,» (p. ej. «FRENOS (bandas, válvulas)» -> «Frenos»).
+    Es una agrupación por NOMBRE, no una clasificación técnica: depende de cómo estén escritos los conceptos en el catálogo."""
+    t = re.split(r" - |;|\(|/|,", str(concepto))[0].strip()
+    return t.capitalize() if t else "Sin sistema"
+
+
+def _señales_placa(R: dict, placa: str, n: int = 3) -> str:
+    """Las señales de una placa en una línea corta, sin repetir el mismo sistema."""
+    s = [f"{_sistema(r.concepto)} ×{r.intervenciones} (típico {r.tipico:g})" for r in R["frecuencia"].query("placa == @placa").itertuples()]
+    s += [f"{_sistema(r.concepto)} atípico ({r.veces_mediana:.1f}× lo habitual)" for r in R["atipicos"].query("placa == @placa").itertuples()]
+    s += [f"gasto {r.veces_tipo:.1f}× su tipo" for r in R["desproporcion"].query("placa == @placa").itertuples()]
+    vistos = list(dict.fromkeys(s))
+    return " · ".join(vistos[:n]) + (f" · +{len(vistos) - n}" if len(vistos) > n else "")
+
+
+def _panel_placa(placa: str, tipo: str, iv: pd.DataFrame, R: dict, tipos: dict):
+    """Ficha de la placa elegida: cifras, sus señales frente a sus pares, comparativo por concepto contra lo típico de su tipo y movimientos."""
+    import flota_hallazgos as H
+    d = iv[iv["placa"] == placa]
+    if d.empty:
+        st.caption("La placa no tiene intervenciones clasificadas.")
+        return
+    señales = [("Frecuencia", f"{r.concepto}: {r.intervenciones} intervenciones; lo típico en {tipo.lower()} es {r.tipico:g}")
+               for r in R["frecuencia"].query("placa == @placa").itertuples()]
+    señales += [("Gasto atípico", f"{r.concepto}: {E.pesos(r.valor)}, {r.veces_mediana:.1f}× lo habitual del concepto") for r in R["atipicos"].query("placa == @placa").itertuples()]
+    señales += [("Gasto vs su tipo", f"{r.veces_tipo:.1f}× la mediana de las placas {tipo.lower()}") for r in R["desproporcion"].query("placa == @placa").itertuples()]
+    st.html(f'<div style="display:flex;gap:28px;align-items:baseline;flex-wrap:wrap;margin:.2rem 0 .4rem"><span style="font-size:1.15rem;font-weight:600;color:{E.NAVY}">'
+            f'{escape(placa)}</span><span style="color:#667085">{escape(tipo)}</span><span><b>{E.pesos(float(d["valor"].sum()))}</b> clasificado</span>'
+            f'<span><b>{len(d)}</b> intervenciones</span></div>')
+    if señales:
+        st.html("".join(f'<div style="margin:.15rem 0"><span class="mt-tag" style="background:#fdeaea;color:#8a1f1f">{escape(k)}</span> {escape(v)}</div>'
+                        for k, v in señales) + '<div style="color:#667085;font-size:.8rem;margin-top:.3rem">Patrones observados frente a sus pares; la causa se confirma con el taller.</div>')
+    else:
+        st.caption("Sin señales: comportamiento dentro de lo habitual de su tipo.")
+    if len(d[d["fecha"].notna()]) >= 2:
+        st.plotly_chart(_fig_placa_tiempo(d, R["atipicos"][R["atipicos"]["placa"] == placa]), width="stretch", config={"displayModeBar": False},
+                        key=f"mt_nov_tiempo_{placa}")
+    cmp_ = H.comparativo_placa(iv, tipos, placa)
+    if len(cmp_):
+        st.markdown("**Frente a lo típico de su tipo**")
+        st.dataframe(cmp_.head(12), hide_index=True, width="stretch", height=min(380, 60 + 35 * min(len(cmp_), 12)),
+                     column_config={"concepto": "Concepto", "intervenciones": st.column_config.NumberColumn("Esta placa", format="%d"),
+                                    "tipico": st.column_config.NumberColumn("Típico del tipo", format="%.1f", help="Mediana de intervenciones entre las placas del tipo que tuvieron el concepto; vacío si hay menos de 3 placas para comparar."),
+                                    "pares": st.column_config.NumberColumn("Placas comparadas", format="%d"),
+                                    "veces": st.column_config.NumberColumn("Veces lo típico", format="%.1f×"),
+                                    "costo": st.column_config.NumberColumn("Costo", format="accounting")})
+    with st.expander("Movimientos de la placa", icon=":material/list:"):
+        mv = d.sort_values("fecha", ascending=False)[["fecha", "concepto", "valor", "tercero", "texto"]]
+        st.dataframe(mv, hide_index=True, width="stretch", height=min(320, 60 + 35 * len(mv)),
+                     column_config={"fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"), "concepto": "Concepto",
+                                    "valor": st.column_config.NumberColumn("Valor", format="accounting"), "tercero": "Proveedor", "texto": "Detalle"})
+
+
+COLOR_CLASE = {"A": "#d03b3b", "B": "#e8892c", "C": "#9aa7b8"}
+
+
+def _html_clases(par: pd.DataFrame, corte: float, n_con_gasto: int) -> str:
+    """Tres tarjetas A/B/C: cuántas placas, cuánto sobrecosto y qué % del total concentra cada clase."""
+    nombres = {"A": f"Concentran el {corte * 100:.0f}%", "B": "Siguiente 15%" if corte >= .8 else "Siguiente tramo", "C": "El resto"}
+    tot = float(par["sobrecosto"].sum())
+    celdas = []
+    for k in "ABC":
+        x = par[par["clase"] == k]
+        pct = float(x["sobrecosto"].sum()) / tot * 100 if tot else 0.0
+        celdas.append(f'<div style="border:1px solid #e3e8f0;border-radius:10px;padding:.6rem .8rem;background:#fff">'
+                      f'<span style="display:inline-block;width:22px;height:22px;border-radius:5px;background:{COLOR_CLASE[k]};color:#fff;text-align:center;line-height:22px;'
+                      f'font-weight:600;margin-right:.4rem">{k}</span><b>{nombres[k]}</b>'
+                      f'<div style="font-size:1.35rem;font-weight:600;margin-top:.3rem;color:{E.NAVY}">{_pl(len(x), "placa")}</div>'
+                      f'<div style="color:#667085;font-size:.85rem">{E.pesos(float(x["sobrecosto"].sum()))} de sobrecosto · {pct:.0f}%</div>'
+                      f'<div style="height:6px;background:#e9eef5;border-radius:99px;margin-top:.45rem"><div style="height:100%;width:{pct:.0f}%;background:{COLOR_CLASE[k]};border-radius:99px"></div></div></div>')
+    return '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.7rem;margin:.3rem 0 .6rem">' + "".join(celdas) + "</div>"
+
+
+def _fig_pareto(par: pd.DataFrame, corte: float, sel: str, señales: dict, max_filas: int = 15):
+    """Barras = sobrecosto de cada placa (color = clase); en medio, el % acumulado con el corte de la clase A; a la derecha, tres columnas de puntos
+    con las señales de cada placa (Frec.: repite un concepto más que sus pares; Atíp.: tiene un gasto atípico; Tipo: gasta mucho más que su tipo)."""
+    d = par.head(max_filas)
+    f = go.Figure()
+    f.add_bar(y=d["placa"], x=d["sobrecosto"] / 1e6, orientation="h", xaxis="x", yaxis="y", name="Sobrecosto",
+              marker=dict(color=[COLOR_CLASE[c] for c in d["clase"]], opacity=[1 if (not sel or p == sel) else .35 for p in d["placa"]],
+                          line=dict(width=[2.5 if p == sel else 0 for p in d["placa"]], color=E.NAVY)),
+              text=[f"${v / 1e6:,.1f} M · {t}" for v, t in zip(d["sobrecosto"], d["tipo"].str.title())], textposition="outside", cliponaxis=False,
+              hovertemplate="<b>%{y}</b><br>$%{x:,.1f} M sobre lo típico de su tipo<extra></extra>")
+    f.add_scatter(y=d["placa"], x=d["acumulado"] * 100, xaxis="x2", yaxis="y", mode="lines+markers", name="% acumulado",
+                  line=dict(color=E.NAVY, width=1.5), marker=dict(size=9, color="#ffffff", line=dict(color=E.NAVY, width=2)),
+                  hovertemplate="<b>%{y}</b><br>%{x:.0f}% acumulado<extra></extra>")
+    f.add_shape(type="line", xref="x2", yref="paper", x0=corte * 100, x1=corte * 100, y0=0, y1=1, line=dict(color="#9aa7b8", width=1.5, dash="dash"))
+    sig = [("Frec.", "Repite un concepto más que las de su tipo", "frec"), ("Atíp.", "Tiene un gasto atípico", "atip"), ("Tipo", "Gasta mucho más que su tipo", "tipo")]
+    on_x, on_y, on_t, off_x, off_y = [], [], [], [], []
+    for p in d["placa"]:
+        for nombre, desc, k in sig:
+            if p in señales.get(k, set()):
+                on_x.append(nombre); on_y.append(p); on_t.append(desc)
+            else:
+                off_x.append(nombre); off_y.append(p)
+    f.add_scatter(x=off_x, y=off_y, xaxis="x3", yaxis="y", mode="markers", hoverinfo="skip", marker=dict(size=7, color="#e3e8f0"))
+    f.add_scatter(x=on_x, y=on_y, xaxis="x3", yaxis="y", mode="markers", marker=dict(size=12, color="#d03b3b"), text=on_t,
+                  hovertemplate="<b>%{y}</b><br>%{text}<extra></extra>")
+    f.update_layout(showlegend=False, bargap=.35,
+                    xaxis=dict(domain=[0, .5], visible=False, rangemode="tozero"),
+                    xaxis2=dict(domain=[.55, .76], range=[0, 105], ticksuffix="%", showgrid=False, anchor="y"),
+                    xaxis3=dict(domain=[.82, 1], type="category", categoryorder="array", categoryarray=[n for n, _, _ in sig], side="top",
+                                showgrid=False, anchor="y"),
+                    yaxis=dict(autorange="reversed", showgrid=False, type="category", automargin=True))
+    f = estilo_grafico(f, max(260, 32 * len(d) + 80))
+    f.update_layout(margin=dict(t=34))
+    return f
+
+
+VERIFICAR_VECES = 20        # un gasto de más de tantas veces lo habitual es más probable que sea un error de registro que un hallazgo
+
+
+def _fig_comparacion(at: pd.DataFrame, n: int = 8, minimo: float = 0.0):
+    """Gastos atípicos como comparación: en cada fila, la mediana del concepto (punto gris) y el gasto real (punto rojo), en escala logarítmica
+    para que un valor extremo no aplaste a los demás. Ordenados por cuánto exceden lo habitual en pesos; los de más de VERIFICAR_VECES van aparte."""
+    d = at.copy()
+    d["exceso"] = d["valor"] - d["mediana_concepto"]
+    d = d[d["valor"] >= minimo].sort_values("exceso", ascending=False).head(n)
+    if d.empty:
+        return None
+    et = [f"{r.placa} · {_sistema(r.concepto)} ({pd.Timestamp(r.fecha):%d/%m})" for r in d.itertuples()]
+    lx, ly = [], []
+    for e, m, v in zip(et, d["mediana_concepto"], d["valor"]):
+        lx += [m / 1e6, v / 1e6, None]
+        ly += [e, e, None]
+    raro = (d["veces_mediana"] >= VERIFICAR_VECES).tolist()
+    f = go.Figure()
+    f.add_scatter(x=lx, y=ly, mode="lines", line=dict(color="#9aa7b8", width=2), hoverinfo="skip", showlegend=False)
+    f.add_scatter(x=d["mediana_concepto"] / 1e6, y=et, mode="markers", name="Lo habitual (mediana del concepto)", marker=dict(size=10, color=E.COLOR_OTROS),
+                  hovertemplate="<b>%{y}</b><br>Mediana del concepto: $%{x:,.2f} M<extra></extra>")
+    f.add_scatter(x=d["valor"] / 1e6, y=et, mode="markers+text", name="Este gasto",
+                  marker=dict(size=12, color=["#ffffff" if r else "#d03b3b" for r in raro], line=dict(width=[2.5 if r else 0 for r in raro], color="#e8892c")),
+                  text=[f"${v / 1e6:,.1f} M · {k:.0f}×" + (" · verificar" if r else "") if k >= 10 else f"${v / 1e6:,.1f} M · {k:.1f}×"
+                        for v, k, r in zip(d["valor"], d["veces_mediana"], raro)], textposition="middle right", cliponaxis=False,
+                  hovertemplate="<b>%{y}</b><br>$%{x:,.2f} M<extra></extra>")
+    lo, hi = float(min(d["mediana_concepto"].min(), d["valor"].min())) / 1e6, float(d["valor"].max()) / 1e6
+    ticks = [t for t in (0.01, 0.1, 1, 10, 100, 1000) if lo / 3 <= t <= hi * 3]
+    f.update_xaxes(type="log", tickvals=ticks, ticktext=[f"${t:g} M".replace(".", ",") for t in ticks], range=[math.log10(lo / 2), math.log10(hi * 6)])
+    f.update_yaxes(autorange="reversed", showgrid=False, type="category", automargin=True)
+    f.update_layout(showlegend=True, legend=dict(orientation="h", y=-.18))
+    return estilo_grafico(f, max(220, 38 * len(d) + 90))
+
+
+def _fig_placa_tiempo(d: pd.DataFrame, at_p: pd.DataFrame):
+    """Intervenciones de UNA placa por fecha y valor (son pocas, así que se leen bien); los atípicos, en rojo."""
+    d = d[d["fecha"].notna() & (d["valor"] > 0)]
+    marca = set(zip(at_p["placa"], at_p["concepto"], at_p["fecha"]))
+    es_at = [(p, c, f_) in marca for p, c, f_ in zip(d["placa"], d["concepto"], d["fecha"])]
+    f = go.Figure()
+    for flag, nombre, color, tam in [(False, "Habitual", E.COLOR_OTROS, 9), (True, "Atípico", "#d03b3b", 12)]:
+        x = d[[e == flag for e in es_at]]
+        if x.empty:
+            continue
+        f.add_scatter(x=x["fecha"], y=x["valor"] / 1e6, mode="markers", name=nombre, marker=dict(size=tam, color=color),
+                      text=x["concepto"].map(_sistema), hovertemplate="<b>%{text}</b><br>%{x|%d/%m/%Y}<br>$%{y:,.2f} M<extra></extra>")
+    f.update_yaxes(title="Valor ($ M)", rangemode="tozero")
+    f.update_layout(showlegend=True, legend=dict(orientation="h", y=-.25))
+    return estilo_grafico(f, 250)
+
+
+N_REVISAR = 10
+
+
+def _novedades(S, mp: pd.DataFrame):
+    """Placas que se salen de lo normal FRENTE A LAS DE SU MISMO TIPO: repiten un concepto más que sus pares, tienen un gasto atípico o gastan
+    mucho más que la mediana de su tipo. Usa SOLO movimientos con concepto clasificado del periodo seleccionado."""
+    import flota_hallazgos as H
+    tipos = {n["placa"]: (_categoria_placa(S, n) if _categoria_placa(S, n) != SIN_CONCEPTO else "") for n in L.arbol_placas(S.vistas)}
+    with st.container(key="mt_card_novedades"):
+        titulo_tarjeta("Placas que se salen de lo normal", f"{S.escenario} · {S.hasta}. Cada placa se compara con las de su mismo tipo de vehículo, "
+                       "solo con gastos de concepto clasificado.")
+        with st.expander("Ajustar criterios", icon=":material/tune:"):
+            minimo = st.selectbox("Mínimo de intervenciones del mismo concepto para compararlo", [2, 3, 4, 5], index=1, key="mt_nov_min",
+                                  format_func=lambda x: f"{x} intervenciones",
+                                  help="Además debe ser al menos el doble de lo típico de su tipo (mediana de las placas del tipo que tuvieron el concepto).")
+            val_min = st.number_input("Valor mínimo de un gasto atípico ($)", min_value=0, value=0, step=500000, key="mt_nov_min_valor",
+                                      help="Oculta del gráfico de atípicos los gastos menores a este valor (0 = sin mínimo). Sirve para dejar fuera lo que no pesa en pesos.")
+        R = H.analizar(mp, tipos, L.PENDIENTE, CONCEPTO_OTROS, L.SIN_PLACA, minimo=minimo)
+        cob, iv = R["cobertura"], R["intervenciones"].copy()
+        if cob["total"] <= 0 or iv.empty:
+            st.caption("Aún no hay movimientos con concepto clasificado en este periodo para analizar.")
+            return
+        if not cob["concilia"]:
+            st.error("La base del análisis no concilia con los movimientos de origen: revisa antes de usar estos hallazgos.")
+        sin_analizar = cob["pendiente"] + cob["otros"] + cob["sin_placa"]
+        cubre = cob["analizado"] / cob["total"]
+        if cubre < 0.7:
+            st.html(f'<div style="border-left:4px solid #e8892c;background:#fff7ed;border-radius:0 8px 8px 0;padding:.45rem .9rem;margin:.2rem 0 .5rem">'
+                    f'Este análisis cubre el <b>{cubre * 100:.0f}%</b> del gasto de placas ({E.pesos(cob["analizado"])} de {E.pesos(cob["total"])}). '
+                    f'Quedan {E.pesos(cob["pendiente"])} pendientes de clasificar, {E.pesos(cob["otros"])} en «OTROS» y {E.pesos(cob["sin_placa"])} sin placa: '
+                    'las conclusiones son sobre la parte clasificada.</div>')
+        al = R["alertas"]
+        señales = {"frec": set(R["frecuencia"]["placa"]), "atip": set(R["atipicos"]["placa"]), "tipo": set(R["desproporcion"]["placa"])}
+        sel_p = st.session_state.get("mt_nov_placa", "")
+        sel_p = sel_p if sel_p in set(iv["placa"]) else ""
+
+        # 1) dónde se concentra el sobrecosto frente a su tipo (Pareto A/B/C) y qué señales tiene cada placa
+        par = R["pareto"].copy()
+        if par.empty:
+            st.caption("No hay placas por encima de lo típico de su tipo (o no hay tipos con suficientes placas para comparar).")
+        else:
+            corte = st.slider("Corte de la clase A (% del sobrecosto)", 50, 95, 80, 5, key="mt_nov_corte",
+                              help="La clase A reúne las placas que, ordenadas de mayor a menor, explican ese % del sobrecosto. B llega al 95% y C es el resto.") / 100
+            par["clase"] = H.clase_pareto(par, corte)
+            nA = int((par["clase"] == "A").sum())
+            st.html(_html_clases(par, corte, iv["placa"].nunique()))
+            st.plotly_chart(_fig_pareto(par, corte, sel_p, señales), width="stretch", config={"displayModeBar": False}, key="mt_nov_pareto")
+            st.html(f'<div><b style="color:{COLOR_CLASE["A"]}">{corte * 100:.0f}%</b> del sobrecosto lo explican <b>{_pl(nA, "placa")}</b> de '
+                    f'{iv["placa"].nunique()} con gasto clasificado. <span style="color:#667085">Sobrecosto = gasto clasificado de la placa menos la mediana de las '
+                    f'de su tipo (solo si es positivo); no es ejecución menos presupuesto. Puntos rojos: Frec. = repite un concepto más que las de su tipo; '
+                    f'Atíp. = tiene un gasto atípico; Tipo = gasta mucho más que su tipo.</span></div>')
+
+        # 2) selector de placa -> ficha
+        orden = list(dict.fromkeys(list(par["placa"]) + list(al["placa"]) + list(R["atipicos"]["placa"])))
+        if orden:
+            etiqueta = {p_: f"{p_} · {tipos.get(p_, '') or 'sin tipo'}" for p_ in orden}
+            st.selectbox("Ver la ficha de una placa", ["", *orden], key="mt_nov_placa", format_func=lambda x: "Elegir placa…" if x == "" else etiqueta[x])
+
+        # 3) gastos atípicos: cuánto se alejan de lo habitual
+        st.markdown("**Gastos atípicos**")
+        fig_c = _fig_comparacion(R["atipicos"], 8, float(val_min)) if len(R["atipicos"]) else None
+        if fig_c is None:
+            st.caption("Ningún gasto se sale de lo habitual de su concepto con los criterios actuales."
+                       + (" Prueba bajando el valor mínimo." if val_min and len(R["atipicos"]) else ""))
+        else:
+            n_at, n_mostrados = len(R["atipicos"][R["atipicos"]["valor"] >= val_min]), min(8, len(R["atipicos"][R["atipicos"]["valor"] >= val_min]))
+            st.caption(f"{_pl(n_at, 'intervención', 'intervenciones')} muy por encima de lo habitual de su concepto"
+                       + (f"; se muestran las {n_mostrados} que más lo exceden en pesos" if n_at > n_mostrados else "")
+                       + f". Escala logarítmica: cada marca es 10 veces la anterior. Más de {VERIFICAR_VECES}× conviene verificar si es un error de registro. "
+                       "Son observaciones; no implican una falla.")
+            st.plotly_chart(fig_c, width="stretch", config={"displayModeBar": False}, key="mt_nov_comp")
+            if len(R["atipicos"]) and S.es_admin:
+                st.caption("La lista completa de atípicos está en el Excel de hallazgos.")
+
+        if sel_p:
+            with st.container(border=True):
+                _panel_placa(sel_p, tipos.get(sel_p, ""), iv, R, tipos)
+        st.caption(f"Base: {E.pesos(cob['analizado'])} clasificados ({_pl(len(iv), 'intervención', 'intervenciones')}); fuera del análisis {E.pesos(sin_analizar)} "
+                   f"({sin_analizar / cob['total'] * 100:.0f}% del total). Una intervención = placa + concepto + fecha. El tipo «lo típico» solo se calcula "
+                   f"con {H.MIN_PLACAS_TIPO} o más placas del tipo.")
+        if S.es_admin:
+            st.download_button("Descargar hallazgos (Excel)", lambda: _excel_hallazgos(R, str(S.hasta)),
+                               "hallazgos_flota_" + str(S.hasta).replace(" ", "_").replace("–", "-") + ".xlsx", icon=":material/download:",
+                               key="mt_dl_hallazgos", help="Resumen, hallazgos y la base de intervenciones de la que salen, para verificar cada cifra.")
+
+
 def _tab_flota(S):
     """Flota y Equipo de transporte. TODOS los perfiles ven la tabla por concepto de gasto (concepto -> movimientos), los indicadores,
     los conceptos generales y el gráfico, con los datos que su perfil puede ver (cada gerencia, solo lo suyo). Solo el administrador
     tiene además la carga mensual de SISPO, el filtro/vista por placa, la auditoría y la reclasificación."""
-    if S.es_admin:
-        _sispo_panel(S)                                 # carga mensual del SISPO: arriba y abierto, es lo primero que se usa
+    if S.es_admin and _tecnico():
+        _sispo_panel(S)                                 # estado del SISPO aplicado: es técnico, vive en Administración
     v = S.vistas
     ppc = v["por_placa_concepto"]
     opciones = sorted(set(ppc["concepto"]))
@@ -1405,7 +1801,7 @@ def _tab_flota(S):
     t_cats = _df_categorias(cats)
     tot = t_cats.iloc[-1] if len(t_cats) else dict(presupuesto=0.0, ejecutado=0.0, movimientos=0)
     _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), int(tot["movimientos"]), S.hasta,
-          f"Escenario {S.escenario}" + (f" · placa {S.placa}" if S.placa else ""))
+          _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
     mp, mg = _movs(S, L.AMB_PLACAS), _movs(S, L.AMB_GEN)
     pend = mp[mp["concepto"] == L.PENDIENTE]
     if not pend.empty:
@@ -1416,14 +1812,9 @@ def _tab_flota(S):
     if S.placa:
         st.info(f"Con la placa **{S.placa}** seleccionada no se muestran los conceptos generales: son gastos de la operación y no "
                 "se atribuyen a ninguna placa.", icon=":material/info:")
-    # una vista guardada en la sesión que ya no existe («Por concepto presupuestal») se descarta antes de crear el control
-    if st.session_state.get("mt_vista_placas") not in ("Por placa", "Por concepto de gasto", None):
-        del st.session_state["mt_vista_placas"]
-    if S.es_admin:
-        vista = st.segmented_control("Vista", ["Por concepto de gasto", "Por placa"], default="Por concepto de gasto",
-                                     key="mt_vista_placas") or "Por concepto de gasto"
-    else:                                               # el resto de perfiles ve la vista por concepto de gasto (sin nivel de placa)
-        vista = "Por concepto de gasto"
+    # El administrador ve solo «Por placa» en la página; el detalle por concepto de gasto (con sus descargas) queda en Administración y para
+    # los perfiles sin nivel de placa.
+    vista = "Por placa" if (S.es_admin and not _tecnico()) else "Por concepto de gasto"
     m = mp[mp["concepto"].isin(conc_f)] if conc_f else mp
     # conceptos de gasto con filtros aplicados, sin los que no tienen presupuesto, ejecución ni movimientos (todo en 0: no dicen nada).
     # Alimenta la tabla por concepto de gasto y el gráfico.
@@ -1432,16 +1823,7 @@ def _tab_flota(S):
         t = t[t["concepto"].isin(conc_f)]
     if est_f:
         t = t[t["estado"].isin(est_f)]
-    if vista == "Por placa":
-        with st.container(key="mt_card_placa"):
-            titulo_tarjeta("Presupuesto y ejecución por placa", f"{S.escenario} · ejecutado {S.hasta} · placa → concepto de gasto → movimiento")
-            abrir = _toggle_abrir(S, "mt_abrir_placas", "Desplegar conceptos", hondo=2)
-            _aviso_arbol(m)
-            st.html(_html_placa_concepto(S, nodos, m, abrir, False, "Placa / concepto de gasto / movimiento"))
-            st.caption("Cada placa se abre en sus conceptos de gasto y en los movimientos que los componen (fecha, documento, proveedor y "
-                       "texto original; el valor va en «Ejecutado»). Las placas sin ejecución se reúnen en «Otras placas sin ejecución». "
-                       "«SIN PLACA IDENTIFICADA» reúne lo ejecutado cuyo texto no trae una placa del listado oficial.")
-    else:
+    if vista != "Por placa":                           # la tarjeta «Presupuesto y ejecución por placa» ya no se muestra en la página
         with st.container(key="mt_card_conc"):
             titulo_tarjeta("Presupuesto y ejecución por concepto de gasto",
                            f"{S.escenario} · ejecutado {S.hasta}" + (f" · solo la placa {S.placa}" if S.placa else " · todas las placas")
@@ -1458,7 +1840,8 @@ def _tab_flota(S):
             if len(g_gen):
                 md = pd.concat([md, mg[mg["concepto"].isin(set(g_gen["concepto"]))]], ignore_index=True)
             nombre_xl = "movimientos_por_concepto_de_gasto_" + str(S.hasta).replace(" ", "_") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
-            st.download_button(f"Descargar movimientos ({len(md):,})".replace(",", "."), lambda: _excel_movs_concepto(
+            if _tecnico():
+              st.download_button(f"Descargar movimientos ({len(md):,})".replace(",", "."), lambda: _excel_movs_concepto(
                                    pd.concat([t.assign(ambito=L.AMB_PLACAS), g_gen.assign(ambito=L.AMB_GEN)], ignore_index=True), md), nombre_xl,
                                icon=":material/download:", key="mt_dl_mov_concepto", disabled=md.empty,
                                help="Un renglón por movimiento, con su concepto de gasto, placa, documento, proveedor y texto: una hoja con todos, "
@@ -1467,24 +1850,13 @@ def _tab_flota(S):
             st.caption("Cada concepto de gasto se abre en los movimientos clasificados en él (la placa de cada uno va como etiqueta"
                        + ("; para ver el detalle por placa usa la vista «Por placa»" if S.es_admin else "") + "). «Pendiente» = movimientos "
                        "sin concepto asignado.")
-    nombre_inf = "ejecucion_vs_presupuesto_por_mes_" + str(S.hasta).replace(" ", "_").replace("–", "-") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
-    st.download_button("Descargar informe ejecución vs presupuesto por mes", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
-                       nombre_inf, icon=":material/download:", key="mt_dl_informe_meses", disabled=t.empty and g_gen.empty,
-                       help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
-                            ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
-                            "No trae el acumulado. Respeta los filtros de concepto, estado y placa.")
-    if S.es_admin:                                      # trae detalle de SISPO de todas las gerencias: solo administrador
-        opc_mes = [0, *range(S.m0, S.hasta_mes + 1)]
-        mes_inf = st.selectbox("Mes del informe reclasificado", opc_mes, index=len(opc_mes) - 1, key="mt_mes_informe_recl",
-                               format_func=lambda x: "Todos los meses (columna por mes)" if x == 0 else MESES_L[x - 1].capitalize(),
-                               help="Un mes: solo la ejecución de ese mes y su presupuesto (el de placa y concepto se prorratea; el Resumen usa el "
-                                    "presupuesto mensual real). «Todos los meses»: el informe completo con una columna por mes.")
-        st.download_button("Descargar informe reclasificado (OTROS como concepto)", lambda: _excel_informe_reclasificado(S, mes_inf),
-                           "ejecucion_reclasificada_" + (f"{MESES_L[mes_inf - 1]}_{S.cfg['anio']}" if mes_inf else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx", icon=":material/download:",
-                           key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
-                           help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» "
-                                "(sin presupuesto), saldo y % de avance con fórmulas, barras de avance y negativos en rojo, más las hojas "
-                                "«Resumen», «Reclasificación» y «Pendientes por referencia». Solo cambia el Excel: la pantalla no se modifica.")
+    if _tecnico():
+        nombre_inf = "ejecucion_vs_presupuesto_por_mes_" + str(S.hasta).replace(" ", "_").replace("–", "-") + (f"_{S.placa}" if S.placa else "") + ".xlsx"
+        st.download_button("Descargar informe de placas (ejecución vs presupuesto por mes)", lambda: _excel_informe_meses(S, t, g_gen, m, mg, conc_f, est_f),
+                           nombre_inf, icon=":material/download:", key="mt_dl_informe_meses", disabled=t.empty and g_gen.empty,
+                           help="Las tablas de esta página (por concepto de gasto" + (", por placa y por placa y concepto" if S.es_admin else "") +
+                                ") con presupuesto, ejecución de CADA mes por separado (p. ej. septiembre y octubre), variación y % de ejecución. "
+                                "No trae el acumulado. Respeta los filtros de concepto, estado y placa.")
     if len(g_gen):                                      # los conceptos generales no tienen placa: se ven aparte, así nada queda fuera de la pestaña
         with st.expander(f"Conceptos generales, sin placa ({len(g_gen)})", icon=":material/category:"):
             _aviso_arbol(mg)
@@ -1497,11 +1869,56 @@ def _tab_flota(S):
         dp, de = tot["presupuesto"] - esperado["presupuesto"], tot["ejecutado"] - esperado["ejecutado"]
         if abs(dp) >= 1 or abs(de) >= 1:
             st.error(f"Los indicadores no coinciden con Placas + Generales: presupuesto {E.pesos(dp)}, ejecutado {E.pesos(de)}.")
-    with st.container(key="mt_card_graf_placas"):
-        titulo_tarjeta("Conceptos de gasto que más pesan", "Presupuesto vs ejecutado (millones de pesos)")
-        _barras_ppto_ejec(t[["concepto", "presupuesto", "ejecutado"]],
-                          "Los 12 conceptos de gasto con mayor presupuesto o ejecución" + (f" (placa {S.placa})." if S.placa else "."),
-                          con_pendiente=True)
+    opc_mes = [0, *range(L.desde_mes(S.cfg), S.hasta_mes + 1)]
+    with st.container(key="mt_card_tipo_veh"):
+        titulo_tarjeta("Las 10 placas con mayor sobre ejecución",
+                       "Sobre ejecución = ejecutado − presupuesto (solo placas que se pasaron), de mayor a menor. Cada placa se abre en sus 3 conceptos "
+                       "de mayor ejecución y «Otros» (el resto, que se abre en sus conceptos); cada concepto, en sus movimientos.")
+        mes_sel = st.selectbox("Mes", opc_mes, index=len(opc_mes) - 1 if len(opc_mes) > 1 else 0, key="mt_mes_informe_recl",
+                               format_func=lambda x: f"Periodo seleccionado ({S.hasta})" if x == 0 else f"{MESES_L[x - 1].capitalize()} {S.cfg['anio']}",
+                               help="Un mes: la ejecución de ese mes contra su presupuesto (el de cada placa y concepto se prorratea con el peso del mes en el "
+                                    "presupuesto mensual de Flota). Este Top 10, la tabla por tipo de vehículo y el Excel usan el mismo mes y las mismas cifras.")
+        S_m, mp_m = _vista_mes(S, mes_sel)
+        nodos_m, g_m, cats_m = _flota_datos(S_m, conc_f, est_f)
+        g_m = _sin_ceros(g_m)
+        cats_m = _categorias(S_m, nodos_m, g_m)
+        top = _top_sobre(nodos_m)
+        if top:
+            placas_top = {x["placa"] for x in top}
+            mov_top = mp_m[mp_m["placa"].isin(placas_top)]
+            abrir = _toggle_abrir(S, "mt_abrir_top_sobre", "Desplegar conceptos", hondo=2)
+            filas = [_encabezado_arbol("Placa / concepto de gasto / movimiento")] + _bloques_placa_top3(
+                S_m, top, _agrupar(mov_top, ["placa", "concepto"]), len(mov_top) <= MAX_MOV_ARBOL, abrir)
+            tp, te, tm = _totales(top)
+            st.html(_cierre(filas, tp, te, tm))
+            dp_, de_ = _cuadra_top3(top)
+            if abs(dp_) >= 1 or abs(de_) >= 1:
+                st.error(f"Los 3 conceptos principales + «Otros» no suman el total de las placas: presupuesto {E.pesos(dp_)}, ejecutado {E.pesos(de_)}.")
+            tot_sobre = sum(float(x["ejecutado"]) - float(x["presupuesto"]) for x in nodos_m
+                            if x["placa"] != L.SIN_PLACA and float(x["ejecutado"]) - float(x["presupuesto"]) > 0.5)
+            st.caption(f"{_pl(len(top), 'placa')} de {sum(1 for x in nodos_m if x['placa'] != L.SIN_PLACA and float(x['ejecutado']) - float(x['presupuesto']) > 0.5)} "
+                       f"sobre ejecutadas: el total es el de estas placas, no el de toda la flota. Su sobre ejecución suma "
+                       f"{E.pesos(sum(float(x['ejecutado']) - float(x['presupuesto']) for x in top))} de {E.pesos(tot_sobre)} en toda la flota. "
+                       + ("Sin presupuesto cargado para el mes: la sobre ejecución es igual a lo ejecutado. " if not any(float(x["presupuesto"]) for x in top) else ""))
+        else:
+            st.caption("Ninguna placa supera su presupuesto en este periodo (o aún no hay presupuesto ni ejecución por placa).")
+        if S.es_admin:                                  # trae detalle de SISPO de todas las gerencias: solo administrador
+            st.download_button("Descargar informe reclasificado (Excel)", lambda: _excel_informe_reclasificado(S, mes_sel),
+                               "ejecucion_reclasificada_" + (f"{MESES_L[mes_sel - 1]}_{S.cfg['anio']}" if mes_sel else str(S.hasta).replace(" ", "_").replace("–", "-")) + ".xlsx",
+                               icon=":material/download:", key="mt_dl_informe_reclasificado", disabled=S.mov_todos.empty,
+                               help="El informe por mes, sin filtros, con todo lo que no quedó en un concepto del presupuesto como «OTROS» (sin presupuesto), "
+                                    "saldo y % de avance con fórmulas, y las hojas «Resumen», «Reclasificación» y «Pendientes por referencia». Usa el mes elegido arriba.")
+    with st.container(key="mt_card_tipos"):
+        titulo_tarjeta("Ejecución por tipo de vehículo",
+                       f"{S_m.escenario} · ejecutado {S_m.hasta}. Cada tipo se abre en sus placas y cada placa, en sus conceptos de gasto "
+                       "(y cada concepto, en sus movimientos). Usa el mes elegido arriba.")
+        if any(c["presupuesto"] != 0 or c["ejecutado"] != 0 for c in cats_m):
+            abrir_t = _toggle_abrir(S, "mt_abrir_tipos", "Desplegar placas", hondo=3)
+            st.html(_html_tipos(S_m, cats_m, mp_m, abrir_t))
+            _participacion([(c["nombre"], c["ejecutado"]) for c in cats_m if c["ejecutado"] > 0], "Participación de cada tipo de vehículo en lo ejecutado")
+        else:
+            st.caption("Aún no hay presupuesto ni ejecución por tipo de vehículo.")
+    _novedades(S, mp)
     _auditoria(S, pd.concat([m, mg]) if not (S.placa or conc_f) else m, "flota", "mantenimiento_flota")
 
 
@@ -1541,7 +1958,7 @@ def _ts_concepto(S, concepto: str, k: str):
     con = [n for n in nodos if n["presupuesto"] > 0]
     sin = [n for n in nodos if n["presupuesto"] <= 0]
     tp, te, tm = _totales(nodos)
-    _kpis(tp, te, tm, S.hasta, f"Escenario {S.escenario}" + (f" · placa {S.placa}" if S.placa else ""))
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
 
     resumen = _resumen_grupos(nodos, lambda n: GRUPO_CON if n["presupuesto"] > 0 else GRUPO_SIN, total=True)
     orden = {GRUPO_CON: 0, GRUPO_SIN: 1, "Total": 2}
@@ -1594,8 +2011,8 @@ def _sispo_cargar_maestro(ctx, m: pd.DataFrame, reemplazar: bool, archivo: str):
         for i in range(0, len(m), 200):
             parte = list(m["codigo"].iloc[i:i + 200])
             ctx.con.execute("DELETE FROM mtto_sispo_ref WHERE codigo IN (" + ",".join("?" * len(parte)) + ")", tuple(parte))
-    _insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha)",
-                        [(r.codigo, r.articulo, r.concepto, ctx.usuario, ahora_txt) for r in m.itertuples()])
+    _insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha, categoria, bodega)",
+                        [(r.codigo, r.articulo, r.concepto, ctx.usuario, ahora_txt, r.categoria, r.bodega) for r in m.itertuples()])
     ctx.con.commit()
     ctx.registrar_carga(ctx.usuario, "Base maestra SISPO", archivo, f"{len(m)} referencias" + (" (reemplazo total)" if reemplazar else ""))
 
@@ -1624,7 +2041,7 @@ def _sispo_guardar_lineas(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.
 def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFrame, sap: pd.DataFrame, conc: dict, archivo: str,
                    huella: str, huella_m: str, generico: str):
     """Aplica (o reprocesa) la reclasificación de UNA cuenta de UN periodo. Idempotente: reemplaza lo aplicado antes para esa
-    compañía, periodo y cuenta, sin tocar las otras cuentas. Solo se ejecuta si la conciliación cuadra al centavo y si todo lo
+    compañía, periodo y cuenta, sin tocar las otras cuentas. Solo se ejecuta si la conciliación cuadra (tolerancia de redondeo de $1) y si todo lo
     que se va a guardar es de esa cuenta; las validaciones se repiten aquí, no solo en la pantalla."""
     _exigir_admin(ctx)
     if not conc["cuadra"]:
@@ -1639,7 +2056,7 @@ def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFra
     for t in ("mtto_sispo_reemplazados", "mtto_sispo_periodo"):
         cond, par = _cond_cuenta("cuenta", cuenta)
         ctx.con.execute(f"DELETE FROM {t} WHERE empresa=? AND periodo=? AND {cond}", (empresa, int(periodo), *par))
-    guardar = lin.assign(fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"), cuenta_nombre=cuenta, valor_sap=-lin["costo_con_iva"])
+    guardar = lin.assign(fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"), cuenta_nombre=cuenta, valor_sap=L.valor_sap_ajustado(lin, sap))
     _sispo_guardar_lineas(ctx, empresa, periodo, cuenta, guardar)
     vacia = pd.Series("", index=sap.index)
     col = lambda c: (sap[c] if c in sap else vacia).fillna("")
@@ -1787,13 +2204,19 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
 def admin_base_maestra(ctx):
     """Carga de la base maestra de referencias y conceptos (se usa desde Administración)."""
     _exigir_admin(ctx)
-    maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
+    maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha, categoria FROM mtto_sispo_ref")
     if maestro.empty:
-        st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Codigo Articulo», «Articulo» y «CONCEPTO ASIGNADO».",
+        st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Bodega», «Articulo», «Texto», «Clasificación» y «ELEMENTO».",
                    icon=":material/warning:")
     else:
-        st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} conceptos · última actualización "
+        st.info(f"Base vigente: {len(maestro):,} referencias · {maestro['concepto'].nunique()} elementos · última actualización "
                 f"{maestro['fecha'].max()}.".replace(",", "."), icon=":material/database:")
+        if "categoria" in maestro and maestro["categoria"].fillna("").ne("").any():
+            res = (maestro.assign(categoria=maestro["categoria"].replace("", "(sin clasificación)"))
+                   .groupby("categoria").agg(Elementos=("concepto", "nunique"), Referencias=("codigo", "count")).reset_index()
+                   .rename(columns={"categoria": "Clasificación"}).sort_values("Referencias", ascending=False))
+            with st.expander("Referencias por clasificación"):
+                st.dataframe(res, hide_index=True, width="stretch")
     up_m = st.file_uploader("Base maestra (.xlsx): adjúntala la primera vez o cuando quieras actualizarla", type=["xlsx"],
                             key="mt_sispo_up_maestro")
     if up_m:
@@ -1839,9 +2262,9 @@ def _sispo_panel(S):
             (st.success if resultado[0] == "ok" else st.error)(resultado[1], icon=":material/check_circle:" if resultado[0] == "ok" else ":material/error:")
         st.caption("Reemplaza el movimiento genérico «Salida de inventario <mes>» de SAP por el detalle de SISPO: una línea por referencia "
                    "y placa, con el concepto de la base maestra. Se hace CUENTA POR CUENTA (" + "; ".join(L.SISPO_CUENTAS) + "): cada "
-                   "salida de SISPO solo se asigna a la cuenta de su propio «Nombre Cta» y reemplaza únicamente los genéricos de SAP "
+                   "salida de SISPO solo se asigna a la cuenta de su propio número («CUENTA») y reemplaza únicamente los genéricos de SAP "
                    "de esa misma clase de coste. Cada mes se usa el SISPO de ESE mes, cargado en Administración. Una cuenta solo "
-                   "se aplica si su valor total de SISPO coincide al centavo con lo que SAP tiene como genérico (se compara solo por valor, "
+                   "se aplica si su valor total de SISPO coincide con lo que SAP tiene como genérico (tolerancia de redondeo: hasta $1) (se compara solo por valor, "
                    "no por centro de coste); las que no cuadran quedan sin tocar y se informan.")
         maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
         st.markdown("**1. Base maestra de referencias y conceptos**")
@@ -1894,7 +2317,7 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
         return None
     try:
         PO._asegurar_tablas(S.ctx)
-        llave = ("ops", getattr(up, "name", ""), len(up.getvalue()),
+        llave = ("ops", getattr(up, "name", ""), len(up.getvalue()), _huella_codigo(PO),      # la huella evita reusar un análisis hecho con reglas anteriores
                  tuple(S.ctx.leer("SELECT codigo, item FROM oper_item_map").itertuples(index=False, name=None)).__hash__(),
                  tuple(S.ctx.leer("SELECT item FROM oper_ppto")["item"]).__hash__())
         memo = st.session_state.get("_mt_sispo_ops_memo")
@@ -1915,7 +2338,7 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
             "Cantidad": st.column_config.NumberColumn(format="localized"), "Valor": st.column_config.NumberColumn(format="accounting")})
         st.dataframe(pd.DataFrame(a_ops["embudo"], columns=["Filtro de Operaciones (acumulado)", "Filas que quedan"]), hide_index=True, width="stretch",
                      column_config={"Filas que quedan": st.column_config.NumberColumn(format="%d")})
-        st.caption("Operaciones usa solo las salidas de sus 5 centros de costo, grupos 5 y 7 (o ítems del presupuesto) y cuentas ÚTILES, PAPELERÍA Y OTROS u "
+        st.caption("Operaciones usa toda la cuenta OTROS (cualquier centro de costo, salvo «Staf Mantenimiento») y la Papelería de sus centros autorizados (ALDC: 5; ALSM: 4), grupos 5 y 7 (o ítems del presupuesto), cuentas ÚTILES, PAPELERÍA Y OTROS u "
                    "OTROS, sin Staf Mantenimiento. Papelería va en cantidades. El reparto solo se aplica en Operaciones cuando la cuenta OTROS cuadra al "
                    "centavo con SAP (se ve en la tabla de validación de arriba).")
         if a_ops["huerfanos"]:
@@ -1928,6 +2351,205 @@ def _sispo_operaciones(S, up, empresa: str, periodo) -> dict | None:
     for b in a_ops["bloqueos"]:
         st.error(f"Operaciones no se guardará: {b}", icon=":material/block:")
     return dict(PO=PO, a=a_ops, estado=estado, bloqueos=a_ops["bloqueos"])
+
+
+def _huella_codigo(PO) -> str:
+    """Huella del código que clasifica el SISPO de Operaciones: si cambian las reglas, el análisis guardado en la sesión deja de valer."""
+    import hashlib
+    try:
+        return hashlib.md5(open(PO.OS.__file__, "rb").read()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _sispo_evaluar(S, a: dict, empresa: str, periodo, maestro: pd.DataFrame) -> dict:
+    """Todo lo que hay que saber ANTES de aplicar un SISPO, sin dibujar nada: bloqueos del archivo, conciliación por cuenta (con la
+    revisión por sub-rubro y la validación contra el archivo original), pendientes y qué cuentas se aplican o ya están aplicadas. Lo usan
+    la pantalla de Mantenimiento y la aplicación automática al guardar el SISPO en Administración: así las dos aplican lo mismo."""
+    ctx, lin, info = S.ctx, a["lin"], a["info"]
+    bloqueos, periodos = [], a["periodos"]
+    inferida = a["empresa_probable"]
+    if inferida and inferida != empresa:
+        bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
+    if len(periodos) != 1:
+        bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, periodos)) or "ninguno") + ".")
+    elif periodos[0] // 100 != int(S.cfg["anio"]):
+        bloqueos.append(f"El periodo es de {periodos[0] // 100}, pero el escenario elegido arriba es de {S.cfg['anio']}: cámbialo para procesarlo.")
+    por = L.sispo_conciliar_cuentas(lin, S.sap_salidas, empresa, periodo)
+    for v in por.values():                      # si el genérico está en varios sub-rubros, cada uno debe quedar igual que en SAP
+        if v["estado"] == "Cuadra":
+            t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
+            if not t["cuadra"].all():
+                v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
+    bloqueos += L.sispo_validar_cuentas(lin, a["original"], por)
+    faltan_col = L.sispo_sin_columnas_clave(a["original"])
+    if faltan_col["sin_id"] or faltan_col["sin_codigo"]:         # el lector las tolera (para poder diagnosticar), pero aplicar exige ambas
+        nombres = " ni ".join(n for n, f in (("«IdKardex»", faltan_col["sin_id"]), ("«Codigo Articulo»", faltan_col["sin_codigo"])) if f)
+        bloqueos.append(f"El archivo no trae {nombres}: son obligatorias para aplicar (el IdKardex identifica cada salida y la referencia "
+                        "es lo que se cruza con la base maestra). Descarga el SISPO completo e inténtalo de nuevo.")
+    if info["con_mas_de_2_decimales"]:
+        bloqueos.append(f"{info['con_mas_de_2_decimales']} valores del SISPO traen más de 2 decimales: no se redondean, revisa el archivo.")
+    if info["repetidos"]:
+        bloqueos.append(f"{info['repetidos']} IdKardex aparecen repetidos: revisa el archivo para no duplicar movimientos.")
+    huella_m = L.sispo_huella_maestro(maestro[["codigo", "concepto"]])
+    previo = ctx.leer("SELECT cuenta, huella, huella_maestro, fecha, usuario, estado FROM mtto_sispo_periodo WHERE empresa=? AND periodo=?",
+                      (empresa, int(periodo or 0)))
+    previo = {(L.cuenta_de(r.cuenta) or L.SISPO_CUENTA): r for r in previo.itertuples()}
+    por_aplicar, plan = [], []
+    for cta, v in por.items():
+        if v["estado"] != "Cuadra":
+            continue
+        h, p0 = L.sispo_huella(v["lin"]), previo.get(cta)
+        if p0 is not None and p0.huella == h and p0.huella_maestro == huella_m and p0.estado != ESTADO_APLICACION_SIN_SAP_HEREDADA:
+            plan.append((cta, "Ya aplicada con este mismo archivo y base maestra: no hay nada que cambiar", f"{p0.fecha} · {p0.usuario}"))
+        else:
+            por_aplicar.append((cta, h))
+            accion = "Aplicar" if p0 is None else (
+                "Reprocesar: la aplicación anterior fue sin conciliar con SAP; se reemplaza (no se duplica)"
+                if p0.estado == ESTADO_APLICACION_SIN_SAP_HEREDADA else "Reprocesar: reemplaza lo aplicado antes (no se duplica)")
+            plan.append((cta, accion, "" if p0 is None else f"{p0.fecha} · {p0.usuario}"))
+    return dict(por=por, bloqueos=bloqueos, n_pend_cta={c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()},
+                reg=info["por_cuenta"].set_index("cuenta")["registros"], huella_m=huella_m, por_aplicar=por_aplicar, plan=plan)
+
+
+def _sispo_ejecutar(ctx, ev: dict, empresa: str, periodo: int, archivo: str, ops: dict | None, con_mtto: bool = True) -> tuple[list, str | None]:
+    """Aplica lo evaluado: las cuentas que cuadran en Mantenimiento (si `con_mtto`) y, si hay algo que cambiar, Operaciones con el mismo archivo.
+    Devuelve (lo que se aplicó, falla de Operaciones o None). Es idempotente: reaplicar el mismo archivo no duplica."""
+    hechas = []
+    if con_mtto:
+        for cta, h in ev["por_aplicar"]:
+            v = ev["por"][cta]
+            gen = " / ".join(sorted({str(t) for t in v["sap"]["texto"]}))
+            _sispo_aplicar(ctx, empresa, periodo, cta, v["lin"], v["sap"], v["conc"], archivo, h, ev["huella_m"], gen)
+            hechas.append(cta)
+    falla_ops = None
+    if ops and ops["estado"] != "igual" and not ops["bloqueos"]:
+        try:
+            n_ops = ops["PO"].sispo_guardar(ctx, empresa, periodo, ops["a"], archivo)
+            leido = ctx.leer("SELECT n_lineas FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
+            if leido.empty:                                  # comprobación de lectura: que de verdad quedó en la base
+                falla_ops = "se ejecutó el guardado pero el periodo no aparece en la tabla de Operaciones."
+            else:
+                hechas.append(f"Operaciones ({n_ops} líneas, verificado en la base)")
+        except Exception as e:
+            falla_ops = str(e)
+    return hechas, falla_ops
+
+
+def datos_placas(ctx, empresa: str, anio: int, mes: int):
+    """Para la presentación: la flota de UN mes por placa y por concepto, con los mismos cálculos de la pantalla de Flota (mismo
+    SISPO aplicado, reclasificaciones y presupuesto del mes prorrateado). Devuelve (vistas, escenario) o (None, motivo)."""
+    esc = next((n for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio) and c["meses"][0] <= int(mes) <= c["meses"][1]), None)
+    if esc is None:
+        return None, f"no hay un escenario presupuestal de Flota que cubra {MESES_L[int(mes) - 1]} de {anio}"
+    leer = ctx.leer
+    _asegurar_tablas(ctx)
+    cfg = dict(L.ESCENARIOS[esc], escenario=esc, desde=int(mes))
+    asig = asignacion.mapa(leer)
+    datos_e = {e: _datos_empresa(ctx, e, cfg, asig) for e in EMPRESAS}
+    d = datos_e[empresa]
+    if not (d.ppto_all["es_global"] != 2).any():
+        return None, f"no hay presupuesto de flota cargado para {esc}"
+    oficial = leer("SELECT placa, numero_interno, tipo FROM mtto_placas")
+    ppto_u = _ppto_del_mes(d, cfg, int(mes), asig, None)[0]
+    ppto_todo = pd.concat([x.ppto_all for x in datos_e.values()], ignore_index=True)
+    catalogo = L.catalogo_conceptos(ppto_todo)
+    tipos = L.tipos_concepto(ppto_todo)
+    reglas_db = leer("SELECT orden, patron, proveedor, concepto, confianza, observacion, activa FROM mtto_reglas ORDER BY orden")
+    reglas = L.asegurar_regla_lavado(
+        L.asegurar_reglas_ts(reglas_db if not reglas_db.empty else L.reglas_iniciales(catalogo), catalogo), catalogo)
+    manual = _normalizar_llaves(leer("SELECT empresa, llave, concepto, texto_tipo, tercero, origen, placa FROM mtto_clasif_manual"))
+    excluidos = _normalizar_llaves(leer("SELECT empresa, llave, fecha_mov, documento, tercero, texto, valor, concepto, placa, motivo, "
+                                        "usuario, fecha FROM mtto_excluidos"))
+    p0, p1 = int(cfg["anio"]) * 100 + 1, int(cfg["anio"]) * 100 + 12
+    lin_sispo = leer("SELECT * FROM mtto_sispo_lineas WHERE periodo >= ? AND periodo <= ?", (p0, p1))
+    rep_sispo = leer("SELECT empresa, periodo, cuenta, llave, gerencia, cc, codigo, sub_rubro, sub_rubro_sap, valor "
+                     "FROM mtto_sispo_reemplazados WHERE periodo >= ? AND periodo <= ?", (p0, p1))
+    her = leer("SELECT empresa, periodo, cuenta FROM mtto_sispo_periodo WHERE estado=?", (ESTADO_APLICACION_SIN_SAP_HEREDADA,))
+    if len(her) and len(lin_sispo):                     # igual que la pantalla: lo aplicado sin conciliar con SAP no entra
+        k_her = {(r.empresa, int(r.periodo), L.cuenta_de(r.cuenta) or L.SISPO_CUENTA) for r in her.itertuples()}
+        k_lin = [(e, int(p_), L.cuenta_de(c) or L.SISPO_CUENTA) for e, p_, c in zip(lin_sispo["empresa"], lin_sispo["periodo"], lin_sispo["cuenta_nombre"])]
+        lin_sispo = lin_sispo[[k not in k_her for k in k_lin]]
+        if len(rep_sispo):
+            k_rep = [(e, int(p_), L.cuenta_de(c) or L.SISPO_CUENTA) for e, p_, c in zip(rep_sispo["empresa"], rep_sispo["periodo"], rep_sispo["cuenta"])]
+            rep_sispo = rep_sispo[[k not in k_her for k in k_rep]]
+    sispo_flota = L.sispo_de_cuentas(lin_sispo, rep_sispo, [L.SISPO_CUENTA])
+    _, mov_todos, _ = _movimientos_maestro(datos_e, cfg, int(mes), oficial, reglas, manual, catalogo, tipos, excluidos,
+                                           pool_sap=_pool_sap(datos_e), sispo=sispo_flota)
+    return L.calcular(ppto_u, mov_todos[mov_todos["empresa"] == empresa], oficial, None, tipos), esc
+
+
+def _S_sispo(ctx, anio: int):
+    """Lo mínimo de la pantalla de Mantenimiento que necesita aplicar un SISPO (presupuesto y catálogo, placas oficiales y los genéricos de SAP
+    de las dos compañías), armado sin abrir la pantalla. None si el año no es de ningún escenario."""
+    cfg = next((dict(c, escenario=n) for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio)), None)
+    if cfg is None:
+        return None
+    asig = asignacion.mapa(ctx.leer)
+    datos_e = {e: _datos_empresa(ctx, e, cfg, asig) for e in EMPRESAS}
+    ppto_todo = pd.concat([d.ppto_all for d in datos_e.values()], ignore_index=True)
+    oficial = ctx.leer("SELECT placa, numero_interno, tipo FROM mtto_placas")
+    return SimpleNamespace(ctx=ctx, sel=list(EMPRESAS), cfg=cfg, catalogo=L.catalogo_conceptos(ppto_todo),
+                           registro_placas=oficial[["placa", "numero_interno"]], sap_salidas=_pool_salidas(datos_e, asig))
+
+
+def aplicar_sispo_guardado(ctx, empresa: str, periodo: int) -> dict:
+    """Al guardar el SISPO en Administración: lo aplica de una vez en Mantenimiento y Operaciones, sin pasar por las pantallas. Hace lo mismo que
+    el botón «Aplicar reclasificación» (mismas conciliaciones y validaciones): una cuenta que no cuadra con SAP no se toca y se informa; las
+    salidas sin concepto quedan como PENDIENTE DE CLASIFICACIÓN. Nunca lanza: devuelve {'ok': [...], 'avisos': [...], 'errores': [...]}."""
+    import operaciones as PO
+    import sispo_fuente
+    res = dict(ok=[], avisos=[], errores=[])
+    try:
+        _exigir_admin(ctx)
+        _asegurar_tablas(ctx)
+        maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
+        if maestro.empty:
+            res["errores"].append("Mantenimiento: falta la base maestra de referencias (Administración → Mantenimiento y Operaciones → Base maestra); "
+                                  "no se aplicó.")
+        up = sispo_fuente.abrir(ctx.leer, empresa, int(periodo))
+        S = _S_sispo(ctx, int(periodo) // 100)
+        if S is None:
+            res["errores"].append(f"No hay escenario presupuestal para {int(periodo) // 100}; no se aplicó.")
+        if res["errores"] or up is None:
+            return res
+        d = L.sispo_leer(up)
+        lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
+        lin = L.sispo_placas(lin, S.registro_placas)
+        lin = L.sispo_cruzar_cuentas(lin, maestro[["codigo", "articulo", "concepto"]], _catalogos_cuentas(S))
+        a = dict(info=info, periodos=L.sispo_periodos(lin), empresa_probable=L.sispo_empresa_probable(lin) if len(lin) else None, original=d,
+                 lin=lin)
+        ev = _sispo_evaluar(S, a, empresa, int(periodo), maestro)
+        if ev["bloqueos"]:
+            res["errores"] += [f"Mantenimiento y Operaciones: {b}" for b in ev["bloqueos"]]
+            return res
+        ops = None
+        try:
+            a_ops = PO.sispo_analizar(ctx, up)
+            ops = dict(PO=PO, a=a_ops, estado=PO.sispo_estado(ctx, empresa, int(periodo), a_ops), bloqueos=a_ops["bloqueos"])
+            res["errores"] += [f"Operaciones no se guardó: {b}" for b in a_ops["bloqueos"]]
+        except Exception as e:
+            res["errores"].append(f"Operaciones: no pude preparar el SISPO ({e}).")
+        hechas, falla_ops = _sispo_ejecutar(ctx, ev, empresa, int(periodo), getattr(up, "name", "SISPO"), ops)
+        res["ok"] += hechas
+        if falla_ops:
+            res["errores"].append(f"Operaciones NO se guardó: {falla_ops}")
+        for cta, v in ev["por"].items():
+            if v["estado"] in ("No cuadra", "No cuadra por sub-rubro", "Sin genérico en SAP"):
+                c = v["conc"]
+                res["avisos"].append(f"{cta}: {v['estado'].lower()} (SAP {_pesos2(c['sap_c'] / 100)} contra SISPO {_pesos2(-c['sispo_c'] / 100)}); "
+                                     "no se aplicó y el genérico de SAP queda como está.")
+            elif v.get("activos_excluidos"):
+                ae = v["activos_excluidos"]
+                res["avisos"].append(f"{cta}: solo cuadró sin el grupo [6] - ACTIVOS FIJOS; se excluyeron {ae['n']} salidas.")
+        pend = sum(ev["n_pend_cta"][c] for c, _ in ev["por_aplicar"])
+        if pend:
+            res["avisos"].append(f"{pend} salidas quedaron como PENDIENTE DE CLASIFICACIÓN (referencias que no están en la base maestra).")
+        if not ev["por_aplicar"] and not hechas:
+            res["avisos"].append("Mantenimiento: no había cuentas nuevas que aplicar (ya estaban aplicadas con este mismo archivo, o ninguna cuadra).")
+    except Exception as e:
+        res["errores"].append(f"No pude aplicar el SISPO automáticamente: {e}. Se puede hacer a mano en Mantenimiento.")
+    return res
 
 
 def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
@@ -1943,28 +2565,22 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     empresa = c_e.selectbox("Compañía del SISPO", list(EMPRESAS), index=list(EMPRESAS).index(inferida) if inferida else
                             list(EMPRESAS).index(S.sel[0]), key="mt_sispo_empresa",
                             help="Se propone según «EmpresaAgencia» del archivo; si no coincide, la aplicación no deja continuar.")
-    bloqueos = []
-    if inferida and inferida != empresa:
-        bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
     if len(periodos) != 1:
-        bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, periodos)) or "ninguno") + ".")
         periodo = None
     else:
         periodo = periodos[0]
         c_p.metric("Periodo (cierre)", f"{MESES_L[periodo % 100 - 1].capitalize()} {periodo // 100}")
-        if periodo // 100 != int(S.cfg["anio"]):
-            bloqueos.append(f"El periodo es de {periodo // 100}, pero el escenario elegido arriba es de {S.cfg['anio']}: cámbialo para procesarlo.")
-
-    # ---- UNA conciliación por cuenta con la misma función (la regla es la de Flota)
-    por = L.sispo_conciliar_cuentas(lin, S.sap_salidas, empresa, periodo)
-    for v in por.values():                      # si el genérico está en varios sub-rubros, cada uno debe quedar igual que en SAP
-        if v["estado"] == "Cuadra":
-            t = L.sispo_cuadre_destinos(v["lin"], v["sap"])
-            if (t["diferencia_c"] != 0).any():
-                v["estado"], v["destinos"] = "No cuadra por sub-rubro", t
-    problemas = L.sispo_validar_cuentas(lin, a["original"], por)
-    n_pend_cta = {c: int((v["lin"]["concepto"] == L.PENDIENTE).sum()) for c, v in por.items()}
-    reg = info["por_cuenta"].set_index("cuenta")["registros"]
+    ev = _sispo_evaluar(S, a, empresa, periodo, maestro)         # conciliación por cuenta + validaciones (la misma que aplica al guardar)
+    por, bloqueos, n_pend_cta, reg = ev["por"], list(ev["bloqueos"]), ev["n_pend_cta"], ev["reg"]
+    for cta, v in por.items():
+        if v.get("activos_excluidos"):
+            ae = v["activos_excluidos"]
+            st.info(f"{cta}: no cuadraba con SAP incluyendo el grupo [6] - ACTIVOS FIJOS; sin él sí. Se excluyen {ae['n']} salidas por "
+                    f"{_pesos2(-ae['centavos'] / 100)}.", icon=":material/info:")
+    for cta in L.SAP_PREVALECE.get(empresa, ()):
+        st.info(f"{cta} ({L.CODIGOS_CUENTA[cta]}) en {empresa}: no se concilia ni se reemplaza con SISPO; se conserva el desagregado de SAP "
+                f"(sus movimientos «Salida de inventario» quedan como vienen, con su centro de costo y su «Denominación del objeto»).",
+                icon=":material/info:")
 
     st.markdown("**3. Validación antes de aplicar**")
     filas = []
@@ -1982,7 +2598,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
         "Valor SISPO": st.column_config.NumberColumn(format="accounting"), "Valor SAP": st.column_config.NumberColumn(format="accounting"),
         "Diferencia (SAP + SISPO)": st.column_config.NumberColumn(format="accounting")})
     st.caption("SAP carga estas salidas con signo positivo (costo) y SISPO las trae negativas (salida de inventario): cada cuenta concilia "
-               "SAP contra −SISPO, en centavos exactos. Los valores quedan con el signo de SAP. El TOTAL suma todas las cuentas, "
+               "SAP contra −SISPO, con tolerancia de redondeo de hasta $1. Los valores quedan con el signo de SAP. El TOTAL suma todas las cuentas, "
                "incluso las que no se pueden aplicar.")
     st.dataframe(pd.DataFrame([
         ("Total de registros SISPO", f"{info['total']:,}".replace(",", ".")),
@@ -2016,18 +2632,6 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
             st.warning(f"{cta}: SISPO trae {int(reg.get(cta, 0))} registros pero ninguno con costo negativo"
                        + (f", y SAP tiene {_pesos2(v['conc']['sap_c'] / 100)} como genérico sin detalle. No se aplica." if v["conc"]["n_sap"] else ". No hay nada que reclasificar."),
                        icon=":material/warning:")
-    for p_ in problemas:
-        bloqueos.append(p_)
-    faltan_col = L.sispo_sin_columnas_clave(a["original"])
-    if faltan_col["sin_id"] or faltan_col["sin_codigo"]:         # el lector las tolera (para poder diagnosticar), pero aplicar exige ambas
-        nombres = " ni ".join(n for n, f in (("«IdKardex»", faltan_col["sin_id"]), ("«Codigo Articulo»", faltan_col["sin_codigo"])) if f)
-        bloqueos.append(f"El archivo no trae {nombres}: son obligatorias para aplicar (el IdKardex identifica cada salida y la referencia "
-                        "es lo que se cruza con la base maestra). Descarga el SISPO completo e inténtalo de nuevo.")
-    if info["con_mas_de_2_decimales"]:
-        bloqueos.append(f"{info['con_mas_de_2_decimales']} valores del SISPO traen más de 2 decimales: no se redondean, revisa el archivo.")
-    if info["repetidos"]:
-        bloqueos.append(f"{info['repetidos']} IdKardex aparecen repetidos: revisa el archivo para no duplicar movimientos.")
-
     with st.expander("Distribución de valores por cuenta y concepto", icon=":material/stacked_bar_chart:", expanded=True):
         st.dataframe(L.sispo_distribucion(lin, por_cuenta=True), hide_index=True, width="stretch", column_config={
             "cuenta": "Cuenta", "concepto": "Concepto", "lineas": st.column_config.NumberColumn("Salidas", format="%d"),
@@ -2053,23 +2657,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
 
     # ---- aplicar
     st.markdown("**4. Aplicar**")
-    huella_m = L.sispo_huella_maestro(maestro[["codigo", "concepto"]])
-    previo = ctx.leer("SELECT cuenta, huella, huella_maestro, fecha, usuario, estado FROM mtto_sispo_periodo WHERE empresa=? AND periodo=?",
-                      (empresa, int(periodo or 0)))
-    previo = {(L.cuenta_de(r.cuenta) or L.SISPO_CUENTA): r for r in previo.itertuples()}
-    por_aplicar, plan = [], []
-    for cta, v in por.items():
-        if v["estado"] != "Cuadra":
-            continue
-        h, p0 = L.sispo_huella(v["lin"]), previo.get(cta)
-        if p0 is not None and p0.huella == h and p0.huella_maestro == huella_m and p0.estado != ESTADO_APLICACION_SIN_SAP_HEREDADA:
-            plan.append((cta, "Ya aplicada con este mismo archivo y base maestra: no hay nada que cambiar", f"{p0.fecha} · {p0.usuario}"))
-        else:
-            por_aplicar.append((cta, h))
-            accion = "Aplicar" if p0 is None else (
-                "Reprocesar: la aplicación anterior fue sin conciliar con SAP; se reemplaza (no se duplica)"
-                if p0.estado == ESTADO_APLICACION_SIN_SAP_HEREDADA else "Reprocesar: reemplaza lo aplicado antes (no se duplica)")
-            plan.append((cta, accion, "" if p0 is None else f"{p0.fecha} · {p0.usuario}"))
+    por_aplicar, plan = ev["por_aplicar"], ev["plan"]
     if plan:
         st.dataframe(pd.DataFrame(plan, columns=["Cuenta", "Acción", "Aplicada antes"]), hide_index=True, width="stretch")
     else:
@@ -2086,24 +2674,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
     etiqueta = (f"Aplicar reclasificación ({n_mtto} cuenta{'s' if n_mtto != 1 else ''}" + (" + Operaciones)" if ops_hacer else ")"))
     listo = (bool(por_aplicar) and ok_pend) or ops_hacer
     if st.button(etiqueta, key="mt_sispo_aplicar", type="primary", icon=":material/done_all:", disabled=bool(bloqueos) or not listo):
-        hechas = []
-        if ok_pend:                                          # sin la confirmación de pendientes no se toca Mantenimiento
-            for cta, h in por_aplicar:
-                v = por[cta]
-                gen = " / ".join(sorted({str(t) for t in v["sap"]["texto"]}))
-                _sispo_aplicar(ctx, empresa, periodo, cta, v["lin"], v["sap"], v["conc"], archivo, h, huella_m, gen)
-                hechas.append(cta)
-        falla_ops = None
-        if ops_hacer:
-            try:
-                n_ops = ops["PO"].sispo_guardar(ctx, empresa, periodo, ops["a"], archivo)
-                leido = ctx.leer("SELECT n_lineas FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
-                if leido.empty:                                  # comprobación de lectura: que de verdad quedó en la base
-                    falla_ops = "se ejecutó el guardado pero el periodo no aparece en la tabla de Operaciones."
-                else:
-                    hechas.append(f"Operaciones ({n_ops} líneas, verificado en la base)")
-            except Exception as e:
-                falla_ops = str(e)
+        hechas, falla_ops = _sispo_ejecutar(ctx, ev, empresa, periodo, archivo, ops if ops_hacer else None, con_mtto=ok_pend)
         if falla_ops:
             st.session_state["_mt_sispo_msg"] = ("error", ("Aplicado en Mantenimiento: " + ("; ".join(hechas) if hechas else "nada nuevo")
                                                            + f". Operaciones NO se guardó: {falla_ops}"))
@@ -2179,6 +2750,61 @@ def _sispo_periodos(S, maestro: pd.DataFrame):
 
 
 # ================================================================== rubro completo: Mantenimiento y Contenedores
+def _detallar_genericos(S, ejec: pd.DataFrame, empresa: str) -> pd.DataFrame:
+    """Solo para el archivo de ejecución: los genéricos «Salida de inventario…» de SAP que todavía siguen en `ejec` (porque SISPO no se
+    aplicó en Mantenimiento, o se aplicó solo a una parte de los centros de costo) se cambian por el detalle del SISPO GUARDADO en
+    Administración, línea por línea. No exige que el SISPO esté aplicado ni clasificado: una referencia sin concepto sale como
+    «PENDIENTE DE CLASIFICACIÓN» y una sin placa, como «SIN PLACA IDENTIFICADA»; el archivo trae el detalle de todos modos.
+    Un centro de costo solo se reemplaza si SISPO y SAP suman lo mismo (diferencia de redondeo de hasta $1, que se lleva a la línea de
+    mayor valor): así el total nunca cambia. Lo que no cuadra o no tiene SISPO guardado queda como SAP, y se avisa aparte."""
+    import sispo_fuente
+    if "llave" not in ejec:
+        ejec = ejec.assign(llave=L.llave_movimiento(ejec.assign(empresa=empresa)))
+    es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+    gen = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)]
+    if gen.empty:
+        return ejec
+    anio, maestro = int(S.cfg["anio"]), None
+    for m in sorted(pd.to_numeric(gen["mes"], errors="coerce").dropna().astype(int).unique()):
+        per = anio * 100 + int(m)
+        up = sispo_fuente.abrir(S.ctx.leer, empresa, per)
+        if up is None:
+            continue
+        lin, _ = L.sispo_filtrar(L.sispo_leer(up), L.SISPO_CUENTAS)
+        if lin.empty:
+            continue
+        p = lin["fecha"].dt.strftime("%Y%m").fillna("")
+        if "cierre" in lin:
+            p = lin["cierre"].where(lin["cierre"].str.fullmatch(r"\d{6}"), p)
+        lin = lin[p == str(per)].copy()
+        es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+        lin = lin[~("Kardex " + lin["id_kardex"].astype(str)).isin(set(ejec.loc[es_sp, "documento"].astype(str)))]   # nada se cuenta dos veces
+        rep = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)
+                   & (pd.to_numeric(ejec["mes"], errors="coerce") == m)].copy()
+        rep = rep.assign(empresa=empresa, cuenta=L.cuenta_sap(rep))
+        rep = rep[rep["cuenta"].notna()]
+        if lin.empty or rep.empty:
+            continue
+        if "gerencia" not in rep:
+            rep["gerencia"] = ""
+        kl = pd.Series(list(zip(lin["cuenta"], lin["cc_codigo"].fillna("").astype(str).str.strip().str.upper())), index=lin.index)
+        kr = pd.Series(list(zip(rep["cuenta"], rep["cc"].fillna("").astype(str).str.strip().str.upper())), index=rep.index)
+        v = pd.Series([-L.centavos(x) for x in lin["costo_con_iva"]], index=lin.index, dtype="int64")
+        sap_c = pd.Series([L.centavos(x) for x in pd.to_numeric(rep["valor"], errors="coerce").fillna(0.0)], index=rep.index).groupby(kr).sum()
+        for k, objetivo in sap_c.items():
+            idx = kl.index[kl == k]
+            d = int(objetivo) - int(v[idx].sum()) if len(idx) else 0
+            if d and L.cuadra_c(d):
+                v[v[idx].abs().idxmax()] += d
+        if maestro is None:
+            maestro = S.ctx.leer("SELECT codigo, articulo, concepto, fecha, categoria FROM mtto_sispo_ref")
+        lin = L.sispo_cruzar_cuentas(L.sispo_placas(lin, S.registro_placas), maestro, _catalogos_cuentas(S))
+        lin = lin.assign(empresa=empresa, periodo=per, cuenta_nombre=lin["cuenta"], valor_sap=v / 100,
+                         fecha_mov=lin["fecha"].dt.strftime("%Y-%m-%d %H:%M:%S"))
+        ejec = L.sispo_superponer(ejec, lin, rep, empresa, parcial=True)
+    return ejec
+
+
 def _rubro(S, empresa: str, detalle_flota: bool = False):
     """Presupuesto y ejecución (sin raw) de todos los sub-rubros del rubro de la flota para UNA compañía: es la fuente común de
     la pestaña Mantenimiento, de Contenedores y del soporte de ejecución. Respeta la gerencia de quien consulta y excluye los
@@ -2203,6 +2829,8 @@ def _rubro(S, empresa: str, detalle_flota: bool = False):
                 ejec = L.sispo_superponer(ejec, *fuente, empresa, parcial=True)
         else:                                           # cuentas reclasificadas con SISPO (Maquinaria, Reparaciones locativas…): detalle en vez del genérico
             ejec = L.sispo_superponer(ejec, *S.sispo_otras, empresa)
+    if detalle_flota and len(ejec):                      # lo que SISPO aún no reemplazó: se detalla con el SISPO guardado, aunque no esté clasificado
+        ejec = _detallar_genericos(S, ejec, empresa)
     if not S.ver_todo:                                       # quien no ve todo, solo lo suyo
         ppto = ppto[asignacion.columna(ppto, S.asig) == S.ctx.usuario] if len(ppto) else ppto
         ejec = _con_gerencia(ejec, S.asig)
@@ -2210,6 +2838,10 @@ def _rubro(S, empresa: str, detalle_flota: bool = False):
     if len(ejec):
         ejec["llave"] = L.llave_movimiento(ejec.assign(empresa=empresa))
         ejec = ejec[~ejec["llave"].isin(set(S.excluidos["llave"]))]
+    if empresa in L.EMPRESAS_SIN_CONTENEDORES:                # SM no tiene Contenedores: nada de eso entra a su Mantenimiento ni a su soporte
+        ec_, pc_ = L.es_contenedor(ejec["sub_rubro"]) if len(ejec) else pd.Series(dtype=bool), L.es_contenedor(ppto["sub_rubro"]) if len(ppto) else pd.Series(dtype=bool)
+        S.contenedores_omitidos[empresa] = (int(pc_.sum()), int(ec_.sum()), float(ejec.loc[ec_, "valor"].sum()) if len(ejec) else 0.0)
+        ppto, ejec = (ppto[~pc_] if len(ppto) else ppto), (ejec[~ec_] if len(ejec) else ejec)
     S.rubro_cache[ck] = (ppto, ejec)
     return S.rubro_cache[ck]
 
@@ -2226,6 +2858,37 @@ def _fila_total_df(t: pd.DataFrame, col: str, nombre: str = "Total") -> pd.DataF
     base.loc[len(base)] = {col: nombre, "presupuesto": base["presupuesto"].sum(), "ejecutado": base["ejecutado"].sum(),
                            "movimientos": int(base["movimientos"].sum())}
     return L.con_metricas(base)[[col, "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]]
+
+
+def _conciliacion_ts(S):
+    """Tecnomecánica y SOAT contra SAP (columna «BASE GASTOS EXPLOTACIO»): (resumen, detalle) del período elegido. La diferencia debe ser $0;
+    si no, se descompone en causas y lo que quede sin explicar se señala. Nada se ajusta para forzar la coincidencia."""
+    rep_ = S.sispo_flota[1]
+    llaves_rep = set(rep_["llave"]) if len(rep_) else set()
+    pool = S.sap_pool[S.sap_pool["empresa"].isin(S.sel)] if len(S.sap_pool) else S.sap_pool
+    return L.conciliar_ts(pool, S.mov_todos[S.mov_todos["empresa"].isin(S.sel)], S.mov_excl, llaves_rep, L.desde_mes(S.cfg), S.hasta_mes)
+
+
+def _mostrar_conciliacion_ts(S):
+    resumen, detalle = _conciliacion_ts(S)
+    titulo_tarjeta("Tecnomecánica y SOAT · SAP vs ejecución", f"{S.hasta} · SAP = columna «BASE GASTOS EXPLOTACIO» · la diferencia debe ser $0")
+    if resumen.empty:
+        st.info("No hay movimientos de SAP en el período.")
+        return
+    nc = st.column_config.NumberColumn
+    st.dataframe(resumen, hide_index=True, width="stretch", column_config={
+        "empresa": "Compañía", "concepto": "Concepto", "movimientos_sap": nc("Mov. SAP", format="%d"), "total_sap": nc("Total SAP", format="accounting"),
+        "movimientos_ejecucion": nc("Mov. ejecución", format="%d"), "total_ejecucion": nc("Total ejecución", format="accounting"),
+        "diferencia": nc("Diferencia", format="accounting"), "perdidos": nc("No llegaron", format="%d"),
+        "excluidos_a_mano": nc("Excluidos a mano", format="%d"), "reemplazados_sispo": nc("Reemplazados SISPO", format="%d"),
+        "reclasificados_a_otro_concepto": nc("A otro concepto", format="%d"), "no_marcados_en_sap": nc("Solo por texto/mano", format="%d"),
+        "duplicados": nc("Duplicados", format="%d"), "pendientes": nc("Pendientes", format="%d"),
+        "sin_correspondencia_sispo": nc("Sin SISPO", format="%d"), "sin_explicar": nc("Sin explicar", format="accounting")})
+    st.caption("SISPO no trae SOAT ni Tecnomecánica (no son salidas de inventario): estos movimientos conservan su valor de SAP y no pasan por la "
+               "reclasificación de SISPO; «Sin SISPO» es informativo.")
+    if len(detalle):
+        cols = [c for c in ("motivo", "concepto_ts", "empresa", "fecha", "documento", "tercero", "texto", "valor") if c in detalle]
+        st.dataframe(detalle[cols], hide_index=True, width="stretch")
 
 
 def _control_staf(S):
@@ -2282,29 +2945,86 @@ def _control_staf(S):
                 st.dataframe(o_.head(60), hide_index=True, width="stretch", height=380)
 
 
-def _descarga_soporte(S):
-    """Soporte de ejecución (Excel) para cualquier usuario: presupuesto de todos los meses y ejecución acumulada en la primera
-    hoja; en las demás, los movimientos."""
+def _genericos_sin_reemplazar(S, empresa: str, mes: int) -> pd.DataFrame:
+    """Movimientos genéricos «Salida de inventario…» de SAP que SIGUEN en el soporte de `empresa` hasta `mes` (SISPO no los reemplazó), por
+    mes, cuenta y centro de coste, con el motivo. No sustituye nada: solo identifica las inconsistencias antes de descargar. Vacío = todo
+    lo que SAP tenía como salida de inventario ya está reemplazado por el detalle de SISPO."""
+    import sispo_fuente
+    cols = ["Mes", "Cuenta", "Centro de coste", "Movimientos SAP", "Valor SAP", "Motivo"]
+    ejec = _rubro(S, empresa, detalle_flota=True)[1]
+    if ejec.empty:
+        return pd.DataFrame(columns=cols)
+    es_sp = ejec["sispo"].fillna(False).astype(bool) if "sispo" in ejec else pd.Series(False, index=ejec.index)
+    gen = ejec[~es_sp & ejec["texto"].map(L.norm_texto).str.contains(L.SISPO_GENERICO, regex=False)
+               & (pd.to_numeric(ejec["mes"], errors="coerce") <= mes)].copy()
+    if gen.empty:
+        return pd.DataFrame(columns=cols)
+    gen["_cta"] = L.cuenta_sap(gen).fillna("(sin cuenta de SISPO)")
+    gen["_cc"] = gen["cc"].fillna("").astype(str).str.strip().str.upper() if "cc" in gen else ""
+    guardados = {(r.empresa, int(r.periodo)) for r in sispo_fuente.listar(S.ctx.leer).itertuples()}
+    aplicadas = {(int(r.periodo), L.cuenta_de(r.cuenta) or L.SISPO_CUENTA)
+                 for r in S.ctx.leer("SELECT periodo, cuenta FROM mtto_sispo_periodo WHERE empresa=?", (empresa,)).itertuples()}
+    filas = []
+    for (m_, cta, cc), g in gen.groupby([pd.to_numeric(gen["mes"]).astype(int), "_cta", "_cc"]):
+        per = int(S.cfg["anio"]) * 100 + int(m_)
+        if (empresa, per) not in guardados and not any(p == per for p, _ in aplicadas):
+            motivo = "No hay SISPO de este mes"
+        elif (per, cta) not in aplicadas:
+            motivo = "SISPO de la cuenta sin aplicar (no cuadra con SAP o falta aplicarlo)"
+        else:
+            motivo = "El centro de coste no cuadra entre SAP y SISPO (más de $1 de diferencia)"
+        filas.append((f"{MESES_L[int(m_) - 1].capitalize()} {S.cfg['anio']}", cta, cc, len(g), float(pd.to_numeric(g["valor"], errors="coerce").sum()), motivo))
+    return pd.DataFrame(filas, columns=cols)
+
+
+def _con_mes(S, mes: int):
+    """La misma vista de la página pero para otro período: `mes` = 0 es el acumulado (desde el inicio del escenario hasta el último mes con
+    ejecución); un número es solo ese mes. El presupuesto sigue siendo el del escenario; solo cambia el recorte de la ejecución."""
+    if mes == S.sel_mes:
+        return S
+    cfg = {k: v for k, v in S.cfg.items() if k != "desde"}
+    if mes:
+        cfg["desde"] = mes
+    hasta_mes = mes or S.ult
+    return SimpleNamespace(**{**vars(S), "cfg": cfg, "hasta_mes": hasta_mes, "sel_mes": mes,
+                              "hasta": texto_periodo(L.desde_mes(cfg), hasta_mes, cfg["anio"])})
+
+
+def _descarga_soporte(S0):
+    """«Archivo de ejecución» (Excel por compañía) del mes que se elija aquí: por defecto, el período de la página. Un mes = solo ese mes;
+    acumulado = desde el inicio del escenario hasta el último mes con ejecución. Es la única descarga de la página."""
+    m0, m1 = S0.cfg["meses"]
+    opciones = ["pagina", 0, *range(m0, m1 + 1)]
     with st.container(key="mt_card_soporte"):
-        titulo_tarjeta("Soporte de ejecución de mantenimiento", "Excel por compañía · «Presupuesto»: presupuesto de todos los meses y "
-                       "ejecución acumulada · demás hojas: movimientos")
-        c1, c2 = st.columns([1, 1.4], vertical_alignment="bottom")
-        mes_sop = c1.selectbox("Mes del soporte de ejecución", list(range(S.m0, S.m1 + 1)), index=S.ult - S.m0,
-                               key=f"mt_mes_soporte_{S.escenario}", format_func=lambda m: MESES_L[m - 1].capitalize(),
-                               help="La hoja «Presupuesto» acumula la ejecución desde el inicio del escenario hasta este "
-                                    "mes. Es independiente de «Ejecución hasta».")
-        todos = c2.radio("Movimientos de cada sub-rubro", ["Solo el mes elegido", "Todos los meses hasta el elegido"], horizontal=True,
-                         key=f"mt_detalle_soporte_{S.escenario}",
-                         help="«Todos los meses…» agrega a cada hoja de sub-rubro los movimientos de los meses anteriores (p. ej. septiembre y "
-                              "octubre) con una columna «Mes».") == "Todos los meses hasta el elegido"
+        titulo_tarjeta("Archivo de ejecución", "Excel por compañía · elige el mes del archivo")
+        c_mes, _ = st.columns([1, 2])
+        elegido = c_mes.selectbox("Mes del archivo", opciones, key=f"mt_mes_archivo_{S0.escenario}",
+                                  format_func=lambda m: f"Igual que la página ({S0.hasta})" if m == "pagina"
+                                  else (f"Acumulado a {MESES_L[S0.ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize()),
+                                  help="El archivo se genera con el mes elegido, sin cambiar lo que ves en la página.")
+        S = S0 if elegido == "pagina" else _con_mes(S0, elegido)
+        unico = L.desde_mes(S.cfg) > S.cfg["meses"][0]           # se eligió un solo mes
+        st.caption(f"Ejecución {S.hasta} · mismas cifras que la página para ese período.")
+        for e in S.sel:                                   # inconsistencias SAP vs SISPO: se avisan, no se corrigen solas
+            pend = _genericos_sin_reemplazar(S, e, S.hasta_mes)
+            if len(pend):
+                st.warning(f"{e}: {len(pend)} grupos de «Salida de inventario» de SAP siguen sin reemplazar por SISPO "
+                           f"({_pesos2(pend['Valor SAP'].sum())}); el archivo los trae tal como están en SAP. Detalle en Administración.",
+                           icon=":material/rule:")
         cols_dl = st.columns(len(S.sel))
         for cdl, e in zip(cols_dl, S.sel):
-            cdl.download_button(f"Descargar soporte de ejecución · {e}", lambda e=e: _soporte(S, e, mes_sop, todos),
-                                f"{mes_sop:02d}_{e}_Soporte_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
-                                key=f"mt_soporte_{e}",
-                                help="Hoja «Presupuesto»: presupuesto de todos los meses y ejecución acumulada hasta el mes elegido, "
-                                     "por sub-rubro. "
-                                     "Una hoja por sub-rubro con los movimientos de SAP.")
+            pe_, ee_ = _rubro(S, e)
+            if len(ee_) and not (pd.to_numeric(ee_["mes"], errors="coerce") >= L.desde_mes(S.cfg)).any():
+                ee_ = ee_.iloc[0:0]
+            vacio = pe_.empty and ee_.empty                   # sin presupuesto ni ejecución no se ofrece un archivo vacío
+            if vacio:
+                cdl.warning(f"{e}: sin presupuesto ni ejecución en {S.hasta}.", icon=":material/warning:")
+            cdl.download_button(f"Descargar archivo de ejecución · {e}", lambda e=e: _soporte(S, e, S.hasta_mes, not unico),
+                                f"{S.hasta_mes:02d}_{e}_Archivo_Ejecucion_mantenimiento.xlsx", icon=":material/download:",
+                                key=f"mt_soporte_{e}", disabled=vacio,
+                                help="Hoja «Resumen»: presupuesto de todos los meses y ejecución mes a mes, por sub-rubro. "
+                                     "Luego una hoja por sub-rubro (Contenedores, Flota y Equipo de transporte, Reparaciones locativas, Revisión técnico mecánica…) con los movimientos "
+                                     "que componen esa ejecución, con las salidas de inventario detalladas por SISPO (aunque no estén clasificadas).")
 
 
 def _tab_mantenimiento(S):
@@ -2315,15 +3035,24 @@ def _tab_mantenimiento(S):
         st.info("El rubro no tiene presupuesto ni ejecución en este escenario.")
         return
     tp, te, tm = float(t["presupuesto"].sum()), float(t["ejecutado"].sum()), int(t["movimientos"].sum())
-    _kpis(tp, te, tm, S.hasta, f"Escenario {S.escenario} · rubro completo")
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario} · rubro completo"))
     if S.placa:
         st.caption(f"El filtro de placa ({S.placa}) no cambia el rubro completo de esta pestaña; solo afecta la tabla de ámbitos de abajo.")
     with st.container(key="mt_card_rubro"):
-        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto del escenario completo · ejecutado {S.hasta}")
-        _tabla(_fila_total_df(t, "sub_rubro"), 40 + 35 * (len(t) + 1))
-    with st.container(key="mt_card_rubro_graf"):
-        titulo_tarjeta("Dónde se concentra el presupuesto", "Presupuesto vs ejecutado por sub-rubro (millones de pesos)")
-        _barras_ppto_ejec(t.rename(columns={"sub_rubro": "concepto"}), "Sub-rubros del rubro Reparación y Conservación.")
+        titulo_tarjeta("Presupuesto y ejecución por sub-rubro", f"{S.escenario} · presupuesto {'de ' + MESES_L[S.sel_mes - 1] if S.sel_mes else 'del escenario completo'} · ejecutado {S.hasta}"
+                       + (" · cada sub-rubro se abre por compañía" if S.multi else "") + ". Barra: relleno = ejecutado, marca = presupuesto.")
+        por_e = None
+        if S.multi:
+            por_e = {}
+            for e in S.sel:
+                pe_, ee_ = _rubro(S, e)
+                por_e[e] = L.tabla_subrubros(pe_, ee_, S.cfg, S.hasta_mes)
+        fs = _filas_visual(t, "sub_rubro", por_e)
+        if fs:
+            st.html(E.tabla_visual(fs, "Sub-rubro"))
+            _participacion([(f["nombre"], f["ejecutado"]) for f in fs], "Participación de cada sub-rubro en lo ejecutado")
+        with st.expander("Ver como tabla (con movimientos y estado)", icon=":material/table:"):
+            _tabla(_fila_total_df(t, "sub_rubro"), 40 + 35 * (len(t) + 1))
     if S.multi:
         filas = []
         for e in S.sel:
@@ -2338,12 +3067,12 @@ def _tab_mantenimiento(S):
     with st.container(key="mt_card_rubro_mes"):
         titulo_tarjeta("Mes a mes", "Presupuesto vs ejecutado del rubro (millones de pesos)")
         _grafico_ts_mensual(S, ppto, ejec)
-    _control_staf(S)
     _descarga_soporte(S)
-    with st.expander("Flota y Equipo de transporte por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
-        _tabla(S.vistas["resumen"], 190)
-        st.caption("Placas = presupuesto por vehículo. Generales = conceptos sin placa. Tecnomecánica y SOAT = presupuesto mensual por "
-                   "placa. El saldo es presupuesto − ejecutado.")
+
+
+def _subtitulo(sel) -> str:
+    cont = " · Contenedores" if any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel) else ""
+    return f"Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT{cont}: presupuesto vs ejecución · valores en pesos"
 
 
 def _tab_contenedores(S):
@@ -2357,8 +3086,8 @@ def _tab_contenedores(S):
         return
     t = L.tabla_mensual(pc, ec, S.cfg, S.hasta_mes, "Contenedores")
     tot = t[t["mes"] == 0].iloc[0]
-    n_mov = int(((ec["mes"] >= S.m0) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
-    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, f"Escenario {S.escenario}")
+    n_mov = int(((ec["mes"] >= L.desde_mes(S.cfg)) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
+    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, _sub_pres(S, f"Escenario {S.escenario}"))
     vista = t.assign(Mes=t["mes"].map(lambda m: "Total" if m == 0 else f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}"))
     with st.container(key="mt_card_cont_tabla"):
         titulo_tarjeta("Contenedores · presupuesto vs ejecutado", f"{S.escenario} · ejecutado {S.hasta}")
@@ -2430,15 +3159,30 @@ def _admin_placas(ctx):
                           "tipo": df[c_ti].str.strip() if c_ti else None})
         t = t[t["placa"] != ""]
         n_filas = len(t)
+        t = t.assign(numero_interno=t["numero_interno"].map(lambda x: "" if pd.isna(x) else L._como_texto(x).strip()))
+        incons = L.inconsistencias_maestro(t)           # antes de unificar: una placa con dos N° internos se conservaría solo con el primero
         t = t.groupby("placa", sort=False).agg("first").reset_index()
         ctx.con.execute("DELETE FROM mtto_placas")
         _insertar_por_lotes(ctx, "mtto_placas(placa, numero_interno, tipo)",
                             [(r.placa, r.numero_interno if pd.notna(r.numero_interno) else "",
                               r.tipo if pd.notna(r.tipo) else "") for r in t.itertuples(index=False)])
         ctx.con.commit()
-        ctx.registrar_carga(ctx.usuario, "Placas flota", f.name, f"{len(t)} placas únicas de {n_filas} filas")
+        ctx.registrar_carga(ctx.usuario, "Placas flota", f.name, f"{len(t)} placas únicas de {n_filas} filas"
+                            + (f"; {len(incons)} inconsistencias placa / N° interno" if len(incons) else ""))
+        st.session_state["mt_placas_incons"] = incons
         st.success(f"{len(t)} placas únicas guardadas ({n_filas - len(t)} filas repetidas unificadas).")
         st.rerun()
+    previa = st.session_state.get("mt_placas_incons")     # lo detectado al cargar (una placa con dos N° internos se guarda solo con el primero)
+    incons = L.inconsistencias_maestro(ctx.leer("SELECT placa, numero_interno FROM mtto_placas"))
+    if previa is not None and len(previa):
+        incons = pd.concat([incons, previa], ignore_index=True).drop_duplicates()
+    if incons.empty:
+        st.caption("Maestro de placas: cada N° interno corresponde a una sola placa y cada placa a un solo N° interno.")
+    else:
+        st.warning(f"El maestro tiene {len(incons)} inconsistencias entre PLACA y NÚMERO INTERNO. Mientras no se corrijan, esos N° internos "
+                   "NO se usan para asignar placa (los movimientos quedan pendientes de identificación).", icon=":material/warning:")
+        st.dataframe(incons.rename(columns={"problema": "Problema", "numero_interno": "N° interno", "placa": "Placa", "detalle": "Efecto"}),
+                     hide_index=True, width="stretch")
 
 
 def _admin_ppto_flota(ctx, empresa, oficial):
@@ -2611,13 +3355,15 @@ def _diagnostico(ppto: pd.DataFrame, ejec: pd.DataFrame):
 
 
 def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
-    """Excel «Soporte de ejecución de mantenimiento» de UNA compañía: hoja Presupuesto (presupuesto de todos los meses y ejecución
-    acumulada hasta el mes elegido, por sub-rubro) y una hoja por sub-rubro con los movimientos de SAP del mes elegido. Lo puede
+    """Excel «Archivo de ejecución de mantenimiento» de UNA compañía, con «Resumen» (presupuesto de todos los meses y ejecución
+    mes a mes hasta el mes elegido, por sub-rubro) y una hoja de movimientos por sub-rubro (los que componen esa ejecución). Lo puede
     descargar cualquier usuario (quien no ve todo recibe solo lo de su gerencia). Respeta los movimientos eliminados; no depende
     del filtro de placa (es el soporte del rubro completo)."""
     ctx, cfg = S.ctx, S.cfg                                  # lo puede descargar cualquier usuario; _rubro respeta su gerencia
     ppto, ejec = _rubro(S, empresa, detalle_flota=True)
     ejec = ejec.copy()
+    if len(ejec):
+        ejec = ejec[pd.to_numeric(ejec["mes"], errors="coerce") >= L.desde_mes(cfg)]      # un solo mes: nada de meses anteriores
     if len(ejec):
         crudo = ctx.leer("SELECT id, raw FROM ejecucion WHERE anio=? AND empresa=?", (int(cfg["anio"]), empresa))
         ejec = ejec.merge(crudo, on="id", how="left") if "id" in ejec else ejec.assign(raw="")
@@ -2626,7 +3372,7 @@ def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
         ejec = ejec.assign(raw="")
         num_cuenta = {}
     return L.exportar_soporte(ppto, ejec, dict(cfg, escenario=S.escenario), mes, "UPA" if S.escenario.startswith("UPA") else "PRESUPUESTO",
-                              detalle_meses=detalle_meses, num_cuenta=num_cuenta)
+                              detalle_meses=detalle_meses, num_cuenta=num_cuenta, sin_hoja=L.SUBRUBROS_SIN_HOJA_SOPORTE)
 
 
 def _excel_control(S, ts_mes: pd.DataFrame) -> bytes:
@@ -2648,8 +3394,9 @@ def _estado_cargas(S) -> pd.DataFrame:
 
 
 # ================================================================== pantalla principal
-def _mostrar(ctx):
+def _mostrar(ctx, tecnico: bool = False):
     leer, usuario, es_admin = ctx.leer, ctx.usuario, ctx.es_admin
+    st.session_state["_mt_tecnico"] = bool(tecnico and es_admin)
     ver_todo = getattr(ctx, "ver_todo", es_admin)
     _asegurar_tablas(ctx)
     zona_encabezado = st.container()
@@ -2687,19 +3434,32 @@ def _mostrar(ctx):
     pool_todo = pd.concat([d.pool for d in datos_e.values()], ignore_index=True)
     en_ventana = pool_todo[(pool_todo["mes"] >= m0) & (pool_todo["mes"] <= m1)]
     ult = int(en_ventana["mes"].max()) if not en_ventana.empty else m1
-    hasta_mes = c_hasta.selectbox("Ejecución hasta", list(range(m0, m1 + 1)), index=ult - m0, key=f"mt_hasta_{escenario}",
-                                  format_func=lambda m: MESES_L[m - 1].capitalize())
-    if m0 == hasta_mes:
+    sel_mes = c_hasta.selectbox("Período", [0, *range(m0, m1 + 1)], key=f"mt_mes_{escenario}",
+                                format_func=lambda m: f"Acumulado a {MESES_L[ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
+                                help="Un mes muestra y descarga SOLO ese mes (sin acumular): su presupuesto y su ejecución. El presupuesto por placa y concepto se carga para todo el escenario, así que se lleva al mes con el peso de ese mes en el presupuesto mensual de Flota. «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución, con el presupuesto del escenario completo.")
+    hasta_mes = sel_mes or ult
+    if sel_mes:                                         # un solo mes: todo el cálculo (movimientos, presupuesto, tablas, gráficos, Excel) usa ese mes
+        cfg = dict(cfg, desde=sel_mes)
+    if sel_mes:
+        hasta = f"{MESES_L[sel_mes - 1]} {cfg['anio']}"
+    elif m0 == hasta_mes:
         hasta = f"{MESES_L[hasta_mes - 1]} {cfg['anio']}"
     else:
         hasta = f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {cfg['anio']}"
 
-    ppto_emp = {e: d.ppto_all for e, d in datos_e.items()}
-    ppto_todo = pd.concat(list(ppto_emp.values()), ignore_index=True)
+    ppto_anual = {e: d.ppto_all for e, d in datos_e.items()}              # presupuesto del escenario completo (estructura y respaldo)
+    ppto_todo = pd.concat(list(ppto_anual.values()), ignore_index=True)
+    ppto_emp, sin_mensual = ppto_anual, []
+    if sel_mes:                                          # un mes: el presupuesto también es el de ese mes
+        ppto_emp = {}
+        for e, d in datos_e.items():
+            ppto_emp[e], f_ = _ppto_del_mes(d, cfg, sel_mes, asig, None if ver_todo else usuario)
+            if f_ is None and e in sel and len(d.ppto):
+                sin_mensual.append(e)
     if not (ppto_todo["es_global"] != 2).any():
         zona_encabezado.html(E.encabezado(
             "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
-            "Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT · Contenedores: presupuesto vs ejecución · valores en pesos", [(vista_emp, "filtro")]))
+            _subtitulo(sel), [(vista_emp, "filtro")]))
         st.warning(f"No hay presupuesto de flota cargado para **{escenario}** en ninguna compañía. El administrador lo carga en "
                    "Administración, pestaña «Mantenimiento y Operaciones».", icon=":material/warning:")
         return
@@ -2722,7 +3482,7 @@ def _mostrar(ctx):
         placa = None
     zona_encabezado.html(E.encabezado(
         "Mantenimiento" + ("" if ver_todo else f" · {usuario}"),
-        "Mantenimiento · Flota y Equipo de Transporte · Tecnomecánica y SOAT · Contenedores: presupuesto vs ejecución · valores en pesos",
+        _subtitulo(sel),
         [(vista_emp if not multi else f"Consolidado · {' + '.join(sel)}", "filtro")] + ([(f"Placa {placa}", "filtro")] if placa else [])))
     if placa:
         st.html(f'<div class="mt-filtro" style="display:inline-block;margin:.2rem 0 .6rem;padding:.35rem .8rem;border-radius:8px;'
@@ -2766,6 +3526,7 @@ def _mostrar(ctx):
     vistas = vistas_emp[sel[0]] if not multi else L.calcular(
         pd.concat([ppto_emp[e] for e in sel], ignore_index=True), mov_todos[mov_todos["empresa"].isin(sel)], oficial, placa, tipos)
     ppto_sel = pd.concat([ppto_emp[e] for e in sel], ignore_index=True)
+    ppto_sel_anual = pd.concat([ppto_anual[e] for e in sel], ignore_index=True)
     ppto_val = ppto_sel[(ppto_sel["es_global"] == 1) | (ppto_sel["placa"] == placa)] if placa else ppto_sel
 
     def alcance(df):                                    # mismo recorte que hace calcular(): compañías elegidas y placa
@@ -2790,6 +3551,15 @@ def _mostrar(ctx):
             valid.loc[len(valid)] = ["Consolidado = suma de las compañías", "✔ Correcto" if abs(dp) < 1 and abs(de) < 1 else "⚠ Revisar",
                                      f"Diferencia en presupuesto: {E.pesos(dp)}; en ejecución: {E.pesos(de)}. El Excel se arma por compañía."]
 
+    if es_admin and valid is not None:
+        rs_ts, _ = _conciliacion_ts(SimpleNamespace(sap_pool=pool_sap, sel=sel, mov_todos=mov_todos, mov_excl=mov_excl, sispo_flota=sispo_flota,
+                                                    cfg=cfg, hasta_mes=hasta_mes))
+        mala = rs_ts[(rs_ts["diferencia"].abs() >= 0.5) | (rs_ts["sin_explicar"].abs() >= 0.5) | (rs_ts["duplicados"] > 0)] if len(rs_ts) else rs_ts
+        valid.loc[len(valid)] = ["Tecnomecánica y SOAT = SAP (BASE GASTOS EXPLOTACIO)", "✔ Correcto" if mala.empty else "⚠ Revisar",
+                                 "SOAT y Tecnomecánica de la ejecución suman lo mismo que SAP, sin duplicados." if mala.empty else
+                                 "Diferencia vs SAP: " + "; ".join(f"{r.empresa} {r.concepto} {E.pesos(r.diferencia)}" for r in mala.itertuples())
+                                 + ". El detalle está en Administración → Revisión técnica → Conciliación de Tecnomecánica y SOAT."]
+
     ts_mes_sel = pd.concat([datos_e[e].ts_mes for e in sel], ignore_index=True)
     ts_scen = ts_mes_sel[(ts_mes_sel["anio"] == cfg["anio"]) & (ts_mes_sel["mes"] >= m0) & (ts_mes_sel["mes"] <= m1)]
     ts_per_sel = pd.concat([datos_e[e].ts_per for e in sel], ignore_index=True)
@@ -2800,13 +3570,13 @@ def _mostrar(ctx):
         if r.placa and str(r.tipo or "").strip():
             tipo_ppto.setdefault(r.placa, " ".join(str(r.tipo).split()))
     S = SimpleNamespace(
-        ctx=ctx, asig=asig, sap_pool=pool_sap, sap_salidas=sap_salidas, oficial=oficial, tipos=tipos, ppto_sel=ppto_sel, lin_sispo=sispo_flota[0], sispo_flota=sispo_flota, sispo_otras=sispo_otras, registro_placas=oficial[["placa", "numero_interno"]], ver_todo=ver_todo, sel=sel, multi=multi, escenario=escenario, cfg=cfg, m0=m0, m1=m1, hasta=hasta, hasta_mes=hasta_mes,
+        ctx=ctx, asig=asig, sap_pool=pool_sap, sap_salidas=sap_salidas, oficial=oficial, tipos=tipos, ppto_sel=ppto_sel, ppto_sel_anual=ppto_sel_anual, lin_sispo=sispo_flota[0], sispo_flota=sispo_flota, sispo_otras=sispo_otras, registro_placas=oficial[["placa", "numero_interno"]], ver_todo=ver_todo, sel=sel, multi=multi, escenario=escenario, cfg=cfg, m0=m0, m1=m1, hasta=hasta, hasta_mes=hasta_mes,
         placa=placa, vistas=vistas, vistas_emp=vistas_emp, catalogo=catalogo, placas_edit=placas_edit, manual=manual,
         es_admin=es_admin, ts_scen=ts_scen, ppto_mes=ppto_mes, datos_e=datos_e, mov_pre=mov_pre, mov_todos=mov_todos,
-        mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, tipo_ppto=tipo_ppto, ult=ult,
+        mov_excl=mov_excl, excluidos=excluidos, rubro_cache={}, contenedores_omitidos={}, tipo_ppto=tipo_ppto, ult=ult,
         emp_placa=_empresas_por_placa(ppto_sel, mov_todos[mov_todos["empresa"].isin(sel)]),
         ts_original=ts_per_sel.drop_duplicates("concepto").set_index("concepto")["texto_original"] if len(ts_per_sel) else {},
-        manual_prev={r.llave: (r.concepto or "", r.placa or "") for r in man.itertuples()})
+        manual_prev={r.llave: (r.concepto or "", r.placa or "") for r in man.itertuples()}, sel_mes=sel_mes)
 
     # ------------------------------------------------------------------ validación cruzada del rubro (administrador)
     if es_admin and not placa:
@@ -2822,8 +3592,8 @@ def _mostrar(ctx):
                                  "cargado en Presupuesto; Flota lee el detalle por placa cargado en Administración."]
 
     # ------------------------------------------------------------------ descargas y validaciones (solo administrador)
-    if es_admin:
-        with st.expander("Descargas y validaciones (administrador)", icon=":material/download:"):
+    if es_admin and _tecnico():
+        with st.expander("Descargas y validaciones (administrador)", icon=":material/download:", expanded=True):
             nombre = f"mantenimiento_{escenario.replace(' ', '_')}_{'consolidado' if multi else sel[0]}" + (f"_{placa}" if placa else "") + ".xlsx"
             st.download_button("Descargar Excel de control", lambda: _excel_control(S, ts_mes_sel), nombre,
                                icon=":material/download:", key="mt_excel",
@@ -2840,20 +3610,49 @@ def _mostrar(ctx):
                            "pero la ejecución sale en cero hasta que se cargue en el módulo de ejecución.", icon=":material/warning:")
             st.caption("El Excel se genera con las mismas tablas de la pantalla, por eso sus totales coinciden.")
 
+    if sin_mensual:
+        st.warning(f"{', '.join(sin_mensual)}: no hay presupuesto mensual de Flota cargado, así que el presupuesto por placa y concepto no se "
+                   f"puede llevar a {MESES_L[sel_mes - 1]}: se muestra el del escenario completo.", icon=":material/warning:")
     # ------------------------------------------------------------------ pestañas
-    nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT", "Contenedores"]
-    t_m, t_f, t_t, t_c = st.tabs(nombres_tabs)
-    with t_m:
-        _tab_mantenimiento(S)
-    with t_f:
-        _tab_flota(S)
-    with t_t:
-        _tab_ts(S)
-    with t_c:
-        _tab_contenedores(S)
+    con_cont = any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel)       # SM no tiene Contenedores: sin pestaña si solo se ve SM
+    nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])
+    if not _tecnico():
+        tabs_ = st.tabs(nombres_tabs)
+        with tabs_[0]:
+            _tab_mantenimiento(S)
+        with tabs_[1]:
+            _tab_flota(S)
+        with tabs_[2]:
+            _tab_ts(S)
+        if con_cont:
+            with tabs_[3]:
+                _tab_contenedores(S)
+    else:
+        with st.expander("Descargas de ejecución · Archivo de ejecución e informe de placas", icon=":material/download:", expanded=True):
+            _descarga_soporte(S)
+            st.caption("El informe de placas (ejecución vs presupuesto por mes, con hojas por concepto, por placa y por placa y concepto) "
+                       "está en «Detalle de Flota», más abajo.")
+        for e_, (np_, ne_, ve_) in S.contenedores_omitidos.items():
+            if np_ or ne_:
+                st.warning(f"{e_}: la compañía no tiene Contenedores; se dejaron fuera {np_} filas de presupuesto y {ne_} movimientos "
+                           f"({E.pesos(ve_)}) que venían marcados como Contenedores.", icon=":material/rule:")
+        with st.expander("Conciliación de Tecnomecánica y SOAT contra SAP", icon=":material/balance:"):
+            _mostrar_conciliacion_ts(S)
+        with st.expander("Control de Staf Mantenimiento y genéricos de SAP sin reemplazar", icon=":material/rule:"):
+            _control_staf(S)
+            for e_ in S.sel:
+                pend_ = _genericos_sin_reemplazar(S, e_, S.hasta_mes)
+                if len(pend_):
+                    st.warning(f"{e_}: {len(pend_)} grupos de «Salida de inventario» de SAP sin reemplazar por SISPO.", icon=":material/rule:")
+                    st.dataframe(pend_, hide_index=True, width="stretch", column_config={
+                        "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
+        with st.expander("Flota por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
+            _tabla(S.vistas["resumen"], 190)
+        with st.expander("Informe de placas y descargas de Flota", icon=":material/directions_car:", expanded=True):
+            _tab_flota(S)
 
-    # lo que sigue es solo del administrador (la lógica de cada función lo vuelve a exigir)
-    if es_admin:
+    # lo que sigue es técnico y solo del administrador: vive en Administración (la lógica de cada función lo vuelve a exigir)
+    if es_admin and _tecnico():
         _reclasificacion(S)
         _avanzado(S, reglas, bool(reglas_db.empty))
         with st.expander("¿Qué sub-rubros hay en la base?", icon=":material/search:"):
@@ -2897,6 +3696,20 @@ def _verificar_logica() -> bool:
     st.code(f"Módulo que había en memoria: {previo}\nTamaño del archivo junto a este módulo: "
             f"{os.path.getsize(ruta) if os.path.exists(ruta) else 'no existe'} bytes (el actual pesa 133.025)\n{detalle}")
     return False
+
+
+def admin_revision_tecnica(ctx):
+    """Administración: lo técnico de Mantenimiento (validaciones, estado de cargas, SISPO aplicado, reclasificación, reglas y descargas
+    de control). Usa los mismos cálculos que la página del módulo."""
+    if not ctx.es_admin:
+        return
+    try:
+        _mostrar(ctx, tecnico=True)
+    except Exception:
+        st.error("La revisión técnica de Mantenimiento tuvo un error. Copia este detalle y compártelo para corregirlo.")
+        st.code(traceback.format_exc())
+    finally:
+        st.session_state["_mt_tecnico"] = False
 
 
 def mostrar(ctx):
