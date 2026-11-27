@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS mtto_placas(placa TEXT, numero_interno TEXT, tipo TEX
 CREATE TABLE IF NOT EXISTS mtto_ppto(empresa TEXT, escenario TEXT, placa TEXT, numero_interno TEXT, tipo TEXT,
     concepto TEXT, orden INT, valor DOUBLE PRECISION, es_global INT, texto_original TEXT);
 CREATE TABLE IF NOT EXISTS mtto_ppto_ts(empresa TEXT, placa TEXT, concepto TEXT, anio INT, mes INT,
-    valor DOUBLE PRECISION, texto_original TEXT);
+    valor DOUBLE PRECISION, texto_original TEXT, version TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS mtto_clasif_manual(empresa TEXT, llave TEXT, concepto TEXT, texto_tipo TEXT, tercero TEXT,
     origen TEXT, usuario TEXT, fecha TEXT, placa TEXT);
 CREATE TABLE IF NOT EXISTS mtto_clasif_log(empresa TEXT, fecha TEXT, usuario TEXT, llave TEXT, texto TEXT,
@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS mtto_sispo_reemplazados(empresa TEXT, periodo INT, ll
     sub_rubro TEXT DEFAULT '', sub_rubro_sap TEXT DEFAULT '');
 """
 # columnas agregadas a tablas que ya existían en versiones anteriores del módulo
-MIGRACIONES = {"mtto_sispo_ref": {"categoria": "TEXT DEFAULT ''", "bodega": "TEXT DEFAULT ''"},   # base maestra: Clasificación y Bodega
+MIGRACIONES = {"mtto_ppto_ts": {"version": "TEXT DEFAULT ''"},
+               "mtto_sispo_ref": {"categoria": "TEXT DEFAULT ''", "bodega": "TEXT DEFAULT ''"},   # base maestra: Clasificación y Bodega
                "mtto_ppto": {"texto_original": "TEXT DEFAULT ''"}, "mtto_clasif_manual": {"placa": "TEXT DEFAULT ''"},
                "mtto_clasif_log": {"motivo": "TEXT DEFAULT ''"},
                # la reclasificación SISPO pasó de una cuenta (flota) a siete: lo ya aplicado queda como de la flota
@@ -72,7 +73,7 @@ PAGINA = 200                           # filas por página en la reclasificació
 
 # ================================================================== datos
 def _asegurar_tablas(ctx):
-    if not st.session_state.get("_mtto_tablas7"):
+    if not st.session_state.get("_mtto_tablas8"):
         ctx.con.crear_tablas(TABLAS)
         for tabla, cols in MIGRACIONES.items():
             existentes = ctx.con.columnas(tabla)
@@ -144,7 +145,8 @@ def _datos_empresa(ctx, empresa: str, cfg: dict, asig) -> SimpleNamespace:
     ppto_base, ejec = _base(ctx, empresa, cfg["anio"], version)
     ppto = leer("SELECT empresa, placa, numero_interno, tipo, concepto, orden, valor, es_global, texto_original FROM mtto_ppto "
                 "WHERE empresa=? AND escenario=?", (empresa, cfg["escenario"]))
-    ts_mes = leer("SELECT empresa, placa, concepto, anio, mes, valor, texto_original FROM mtto_ppto_ts WHERE empresa=?", (empresa,))
+    ts_mes = leer("SELECT empresa, placa, concepto, anio, mes, valor, texto_original, version FROM mtto_ppto_ts WHERE empresa=?", (empresa,))
+    ts_mes, _ = P.filtrar_escenario(ts_mes, cfg)               # solo la versión elegida de 2026 (el Inicial 2027 no tiene versiones)
     ts_per = L.ts_periodo(ts_mes, cfg).assign(empresa=empresa)
     pool = _universo(ejec, asig).assign(empresa=empresa)
     return SimpleNamespace(empresa=empresa, ppto_base=ppto_base, ejec=ejec, ppto=ppto, ts_mes=ts_mes, ts_per=ts_per,
@@ -3171,7 +3173,7 @@ def _hoja_sugerida(cfg: dict, hojas: list) -> str | None:
 
 def _admin_ppto_flota(ctx, empresa, oficial):
     exigir_admin(ctx)
-    st.markdown(f"**2. Presupuesto de la flota · {empresa}**  \nExcel con una hoja por presupuesto (Inicial, 4+8, 8+4 y Normal 2027; cada fila un "
+    st.markdown(f"**2. Presupuesto de la flota · {empresa}**  \nExcel con una hoja por presupuesto (Inicial, 4+8, 8+4 de 2026 e Inicial 2027; cada fila un "
                 "vehículo y cada columna un concepto; las filas sin placa son conceptos generales). Se transforma a "
                 "formato largo, conserva el texto original (encabezado y notas de celda) y solo se guarda si la suma "
                 f"coincide con el total del archivo. Reemplaza el escenario cargado para {empresa}.")
@@ -3262,13 +3264,15 @@ def _admin_ts(ctx, empresa, oficial):
     exigir_admin(ctx)
     st.divider()
     st.markdown(f"**4. Presupuesto de Tecnomecánica y SOAT · {empresa}**  \nExcel con una hoja por concepto (placa en filas, meses en "
-                "columnas, fila «TOTAL MES»). Se guardan todos los meses (el mismo archivo sirve para las tres versiones del presupuesto) y se "
-                "valida cada mes contra «TOTAL MES». Ojo: la columna TOTAL del archivo suma solo 2027. Reemplaza lo cargado "
-                f"de los conceptos que subas para {empresa}.")
+                "columnas, fila «TOTAL MES»). Cada archivo se guarda en el presupuesto que elijas (Inicial, 4+8 u 8+4 para 2026; los meses de 2027 "
+                "son el Inicial 2027) y se valida cada mes contra «TOTAL MES». Ojo: la columna TOTAL del archivo suma solo 2027. Reemplaza lo cargado "
+                f"de esos conceptos y años en ese presupuesto para {empresa}.")
     t = st.file_uploader("Tecnomecánica y SOAT (.xlsx)", type=["xlsx"], key=f"mt_up_ts_{empresa}")
     if not t:
         return
     xt = pd.ExcelFile(t)
+    version = st.selectbox("Presupuesto al que corresponde el archivo", list(P.VERSIONES), index=list(P.VERSIONES).index(version_elegida()),
+                           key=f"mt_ts_ver_{empresa}", format_func=P.etiqueta, help=P.AYUDA)
     elegidas = {}
     for concepto in L.CONCEPTOS_TS:
         opciones = ["(no cargar)"] + xt.sheet_names
@@ -3302,15 +3306,17 @@ def _admin_ts(ctx, empresa, oficial):
                    "solos): " + ", ".join(fuera))
     if ok and st.button(f"Guardar Tecnomecánica y SOAT · {empresa}", key=f"mt_guardar_ts_{empresa}", icon=":material/save:"):
         conceptos = list(info["hojas"])
-        ctx.con.execute("DELETE FROM mtto_ppto_ts WHERE empresa=? AND concepto IN (" + ",".join("?" * len(conceptos)) + ")",
-                        (empresa, *conceptos))
-        insertar_por_lotes(ctx, "mtto_ppto_ts(empresa, placa, concepto, anio, mes, valor, texto_original)",
-                            [(empresa, r.placa, r.concepto, int(r.anio), int(r.mes), float(r.valor), r.texto_original)
+        for anio in sorted(largo["anio"].unique()):
+            cond, par = P.condicion_version(P.version_fila(anio, version))
+            ctx.con.execute("DELETE FROM mtto_ppto_ts WHERE empresa=? AND anio=? AND concepto IN (" + ",".join("?" * len(conceptos)) + f") AND {cond}",
+                            (empresa, int(anio), *conceptos, *par))
+        insertar_por_lotes(ctx, "mtto_ppto_ts(empresa, placa, concepto, anio, mes, valor, texto_original, version)",
+                            [(empresa, r.placa, r.concepto, int(r.anio), int(r.mes), float(r.valor), r.texto_original, P.version_fila(r.anio, version))
                              for r in largo.itertuples(index=False)])
         ctx.con.commit()
         ctx.registrar_carga(ctx.usuario, "Presupuesto Tecnomecánica/SOAT", t.name,
-                            f"{empresa}: {len(largo)} filas, {E.pesos(largo['valor'].sum())}")
-        st.success(f"Presupuesto de Tecnomecánica y SOAT de {empresa} guardado.")
+                            f"{empresa} {P.etiqueta(version)}: {len(largo)} filas, {E.pesos(largo['valor'].sum())}")
+        st.success(f"Presupuesto {version} de Tecnomecánica y SOAT de {empresa} guardado.")
         st.rerun()
 
 
@@ -3397,7 +3403,7 @@ def _mostrar(ctx, tecnico: bool = False):
         vista_emp = c_emp.selectbox("Compañía", [TODAS, *EMPRESAS], key="mt_empresa",
                                     help="Consolidado = ALDC + ALSM. " + " · ".join(f"{e}: {EMPRESAS[e]}" for e in EMPRESAS))
         escenario = selector_escenario(c_esc, "mt_escenario", "Presupuesto",
-                                       help=P.AYUDA + " Normal 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
+                                       help=P.AYUDA + " Inicial 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
     cfg = dict(L.ESCENARIOS[escenario], escenario=escenario)
     sel = list(EMPRESAS) if vista_emp == TODAS else [vista_emp]
     multi = len(sel) > 1

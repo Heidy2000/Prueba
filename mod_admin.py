@@ -1284,17 +1284,17 @@ def _cargar_nomina(ctx):
                 version = st.selectbox("Presupuesto al que corresponde el archivo", list(presupuestos.VERSIONES),
                                        index=list(presupuestos.VERSIONES).index(version_elegida()), key=f"nom_ver_{archivo.name}",
                                        format_func=presupuestos.etiqueta, help=presupuestos.AYUDA)
-                sin_version = " OR version IS NULL OR version=''" if version == presupuestos.V84 else ""       # lo cargado antes de las versiones era el 8+4
+                def _cond(a):
+                    return presupuestos.condicion_version(presupuestos.version_fila(a, version))
                 ya_pp = [int(a) for a in res.index
-                         if not leer(f"SELECT 1 FROM nomina_ppto WHERE empresa=? AND anio=? AND (version=?{sin_version}) LIMIT 1",
-                                     (emp, int(a), version)).empty]
+                         if not leer(f"SELECT 1 FROM nomina_ppto WHERE empresa=? AND anio=? AND {_cond(a)[0]} LIMIT 1", (emp, int(a), *_cond(a)[1])).empty]
                 if ya_pp:
                     st.caption(f"Reemplaza el presupuesto {version} de nómina de {emp} ya cargado para "
                                + ", ".join(map(str, ya_pp)) + ".")
                 if st.button(f"Cargar presupuesto {version} de nómina de {emp}", type="primary", key="nom_ok_ppto"):
                     for a in res.index:
-                        con.execute(f"DELETE FROM nomina_ppto WHERE empresa=? AND anio=? AND (version=?{sin_version})", (emp, int(a), version))
-                    con.anexar(d.assign(empresa=emp, version=version), "nomina_ppto")
+                        con.execute(f"DELETE FROM nomina_ppto WHERE empresa=? AND anio=? AND {_cond(a)[0]}", (emp, int(a), *_cond(a)[1]))
+                    con.anexar(d.assign(empresa=emp, version=[presupuestos.version_fila(a, version) for a in d["anio"]]), "nomina_ppto")
                     con.commit()
                     ctx.registrar_carga(usuario, "Nómina presupuesto", archivo.name,
                                         f"{emp} {version} · {len(res)} años · {E.millones(d['valor'].sum())}")

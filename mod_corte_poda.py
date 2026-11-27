@@ -177,10 +177,10 @@ def admin_cargas(ctx):
                     version = st.selectbox("Presupuesto al que corresponde el libro", list(P.VERSIONES), index=list(P.VERSIONES).index(version_elegida()),
                                            key="cp_ver_ppto", format_func=P.etiqueta, help=P.AYUDA)
                     if st.button(f"Guardar presupuesto · {P.etiqueta(version)}", type="primary", key="cp_g_ppto"):
-                        sin_version = " OR version IS NULL OR version=''" if version == P.V84 else ""      # lo cargado antes de las versiones era el 8+4
                         for anio in d["anio"].unique():
-                            con.execute(f"DELETE FROM cp_ppto WHERE anio=? AND (version=?{sin_version})", (int(anio), version))
-                        d2 = d.assign(archivo=f.name, version=version)
+                            cond, par = P.condicion_version(P.version_fila(anio, version))
+                            con.execute(f"DELETE FROM cp_ppto WHERE anio=? AND {cond}", (int(anio), *par))
+                        d2 = d.assign(archivo=f.name, version=[P.version_fila(a, version) for a in d["anio"]])
                         con.anexar(d2, "cp_ppto"); con.commit()
                         ctx.registrar_carga(ctx.usuario, "Corte y poda · presupuesto", f.name, f"{len(d)} meses")
                         st.success("Presupuesto guardado.")

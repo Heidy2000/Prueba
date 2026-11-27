@@ -44,9 +44,9 @@ def preparar(leer, anio: int, empresa: str | None = None, version: str | None = 
 def mostrar(ctx):
     leer = ctx.leer
     zona_encabezado = st.container()
-    anios = sorted(set(leer("SELECT DISTINCT anio FROM nomina_ppto")["anio"])
-                   | set(leer("SELECT DISTINCT anio FROM nomina_ejec")["anio"]), reverse=True)
-    if not anios:
+    hay = pd.concat([leer("SELECT DISTINCT COALESCE(empresa, 'ALDC') empresa, anio FROM nomina_ppto"),
+                     leer("SELECT DISTINCT COALESCE(empresa, 'ALDC') empresa, anio FROM nomina_ejec")], ignore_index=True).drop_duplicates()
+    if hay.empty:
         zona_encabezado.html(E.encabezado("Nómina", "Presupuesto de personal vs nómina ejecutada", []))
         st.info("Aún no hay información de nómina. Financiera la carga en Administración → Nómina.")
         return
@@ -54,20 +54,24 @@ def mostrar(ctx):
     # ------------------------------------------------------------ filtros del informe
     with st.container(key="card_filtros"):
         st.html('<div class="nf-ftit">Filtros del informe</div>')
-        c = st.columns([0.7, 1.2, 0.9, 1.1, 1.9], vertical_alignment="bottom")
-        con_ejec = leer("SELECT DISTINCT anio FROM nomina_ejec")["anio"].tolist()
-        anio = c[0].selectbox("Año", anios, index=anios.index(max(con_ejec)) if con_ejec else 0, key="nm_anio")
-        versiones = P.versiones_guardadas(leer("SELECT DISTINCT version FROM nomina_ppto WHERE anio=?", (int(anio),)))
-        version = selector_presupuesto(c[3], versiones, "nm_version", "Comparar contra") if versiones else version_elegida()
-        ppto, ejec, pers = preparar(leer, int(anio), version=version)
+        c = st.columns([0.8, 0.7, 1.2, 0.9, 1.1, 1.5], vertical_alignment="bottom")
+        empresas = [e for e in EMPRESAS if e in set(hay["empresa"])] or sorted(set(hay["empresa"]))
+        empresa = c[0].selectbox("Compañía", empresas, key="nm_empresa", help=" · ".join(f"{e}: {EMPRESAS.get(e, e)}" for e in empresas))
+        anios = sorted(hay.loc[hay["empresa"] == empresa, "anio"].unique(), reverse=True)
+        con_ejec = leer("SELECT DISTINCT anio FROM nomina_ejec WHERE COALESCE(empresa, 'ALDC')=?", (empresa,))["anio"].tolist()
+        anio = c[1].selectbox("Año", anios, index=anios.index(max(con_ejec)) if con_ejec else 0, key=f"nm_anio_{empresa}")
+        versiones = P.versiones_guardadas(leer("SELECT DISTINCT version FROM nomina_ppto WHERE anio=? AND COALESCE(empresa, 'ALDC')=?",
+                                               (int(anio), empresa)))
+        version = selector_presupuesto(c[4], versiones, "nm_version", "Comparar contra") if versiones else version_elegida()
+        ppto, ejec, pers = preparar(leer, int(anio), empresa, version)
         if versiones and ppto.attrs.get("version_usada") != version:
             st.caption(P.nota_version(ppto.attrs.get("version_usada"), version))
         meses_ej = sorted(ejec["mes"].unique()) if not ejec.empty else []
         meses_pp = sorted(ppto["mes"].unique()) if not ppto.empty else [1]
         ult = int(max(meses_ej)) if meses_ej else int(max(meses_pp))
-        per = selector_periodo(c[1], c[2], ult, "nm")
+        per = selector_periodo(c[2], c[3], ult, f"nm_{empresa}")
         areas = sorted(set(ppto["area"]) | set(ejec["area"]))
-        areas_f = c[4].multiselect("Área", areas, placeholder="Todas las áreas", key="nm_area")
+        areas_f = c[5].multiselect("Área", areas, placeholder="Todas las áreas", key="nm_area")
         c2 = st.columns([2.2, 1.3], vertical_alignment="bottom")
         if areas_f:
             ppto, ejec = ppto[ppto["area"].isin(areas_f)], ejec[ejec["area"].isin(areas_f)]
@@ -101,7 +105,7 @@ def mostrar(ctx):
     sin = ej_per.loc[ej_per["comun"] == nomina.SIN_PPTO, "valor"].sum()
     if sin:
         chips.append((f"Sin homologar: {E.millones(sin)}", "warn"))
-    zona_encabezado.html(E.encabezado(f"Nómina {anio}", "Presupuesto de personal por cargo vs nómina de SAP · "
+    zona_encabezado.html(E.encabezado(f"Nómina {empresa} {anio}", "Presupuesto de personal por cargo vs nómina de SAP · "
                                       "cifras en millones de pesos", chips))
     if not hay_ppto_periodo and not ej_per.empty:
         st.warning("No hay presupuesto de nómina para el periodo elegido.")

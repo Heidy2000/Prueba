@@ -164,11 +164,11 @@ def selector_presupuesto(contenedor, versiones, key: str, label: str = "Presupue
 
 
 def selector_escenario(contenedor, key: str, label: str = "Presupuesto", help: str = "") -> str:
-    """Selector del escenario de Mantenimiento y Operaciones: las tres versiones de 2026 y «Normal 2027». Sigue la versión compartida;
-    elegir una versión la comparte con los demás módulos y elegir «Normal 2027» no la cambia."""
+    """Selector del escenario de Mantenimiento y Operaciones: las tres versiones de 2026 y «Inicial 2027». Sigue la versión compartida;
+    elegir una versión la comparte con los demás módulos y elegir «Inicial 2027» no la cambia."""
     nombres = list(P.ESCENARIOS)
     _sincronizar(key, nombres, P.escenario_de_version, P.escenario_de_version(P.DEFECTO))
-    e = contenedor.selectbox(label, nombres, key=key, help=help or (P.AYUDA + " Normal 2027: presupuesto del año siguiente."),
+    e = contenedor.selectbox(label, nombres, key=key, help=help or (P.AYUDA + " Inicial 2027: presupuesto del año siguiente."),
                              on_change=_al_elegir, args=(key, P.version_de_escenario))
     st.session_state.setdefault(P.CLAVE_VERSION, P.version_de_escenario(e) or P.DEFECTO)
     return e

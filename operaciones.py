@@ -880,8 +880,8 @@ def _guardar_presupuesto(ctx, empresa: str, largo: pd.DataFrame, archivo: str, v
     for hoja, g in largo.groupby("hoja"):
         for anio in sorted(g["anio"].unique()):
             v = P.version_fila(anio, version)
-            sin_version = " OR version IS NULL OR version=''" if v in (P.V84, "") else ""      # lo guardado sin versión era el UPA (8+4) o el año siguiente
-            ctx.con.execute(f"DELETE FROM oper_ppto WHERE empresa=? AND hoja=? AND anio=? AND (version=?{sin_version})", (empresa, hoja, int(anio), v))
+            cond, par = P.condicion_version(v)
+            ctx.con.execute(f"DELETE FROM oper_ppto WHERE empresa=? AND hoja=? AND anio=? AND {cond}", (empresa, hoja, int(anio), *par))
         insertar_por_lotes(ctx, "oper_ppto(empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor, version)",
                             [(empresa, hoja, r.item, int(r.orden), int(r.anio), int(r.mes), a_db(r.cantidad), a_db(r.costo_unit), float(r.valor),
                               P.version_fila(r.anio, version)) for r in g.itertuples(index=False)], lote=80)
@@ -1722,7 +1722,7 @@ def _mostrar(ctx, tecnico: bool = False):
         vista_emp = c_emp.selectbox("Compañía", [TODAS, *EMPRESAS], key="op_empresa",
                                     help="Consolidado = ALDC + ALSM. " + " · ".join(f"{e}: {EMPRESAS[e]}" for e in EMPRESAS))
         escenario = selector_escenario(c_esc, "op_escenario", "Presupuesto",
-                                       help=P.AYUDA + " Normal 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
+                                       help=P.AYUDA + " Inicial 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
     cfg = dict(L.ESCENARIOS[escenario], escenario=escenario)
     sel = list(EMPRESAS) if vista_emp == TODAS else [vista_emp]
     m0, m1 = cfg["meses"]
