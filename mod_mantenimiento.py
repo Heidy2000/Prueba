@@ -3609,7 +3609,7 @@ def _mostrar(ctx, tecnico: bool = False):
                    f"puede llevar a {MESES_L[sel_mes - 1]}: se muestra el presupuesto total.", icon=":material/warning:")
     # ------------------------------------------------------------------ pestañas
     con_cont = any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel)       # SM no tiene Contenedores: sin pestaña si solo se ve SM
-    nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])
+    nombres_tabs = ["Resumen", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])
     if not _tecnico():
         tabs_ = st.tabs(nombres_tabs)
         with tabs_[0]:
