@@ -895,6 +895,14 @@ def tabla_visual(filas: list[dict], columna: str = "Concepto", formato=None, tot
     return f'<div class="tv notranslate" translate="no">{cab}{cuerpo}{pie}{leyenda}</div>'
 
 
+def tabla_barras(df: pd.DataFrame, columna: str, col_nombre: str, formato=None, **kw) -> str:
+    """`tabla_visual` desde un DataFrame con columnas `presupuesto` y `ejecutado` (una fila por concepto; el total lo agrega la tabla). Un valor
+    vacío (mes sin ejecución cargada) cuenta como 0. Un solo código para que todas las tablas de presupuesto vs ejecución lleven la misma barra."""
+    filas = [dict(nombre=str(r[col_nombre]), presupuesto=0.0 if pd.isna(r["presupuesto"]) else float(r["presupuesto"]),
+                  ejecutado=0.0 if pd.isna(r["ejecutado"]) else float(r["ejecutado"])) for _, r in df.iterrows()]
+    return tabla_visual(filas, columna, formato=formato, **kw)
+
+
 def segmentos_top(pares: list[tuple], n: int = 7, resto: str = "Otros") -> list[tuple]:
     """Para `barra_segmentada`: los `n` mayores valores positivos y el resto agrupado en un solo tramo gris."""
     x = sorted([(a, float(b)) for a, b in pares if b and b > 0], key=lambda t: -t[1])

@@ -369,13 +369,19 @@ def mostrar(ctx):
     cfg_cols["% m²"] = st.column_config.NumberColumn(format="percent")
     with st.container(key="card_cp_corte"):
         titulo_tarjeta("Corte de césped (área)", "Ejecución valorizada = m² ejecutados × tarifa del mes. Mes sin ejecución cargada queda vacío.")
-        st.dataframe(corte, hide_index=True, width="stretch", column_config=cfg_cols)
+        st.html(E.tabla_barras(pd.DataFrame({"Mes": mes_txt, "presupuesto": t["valor_corte_mta"].to_numpy(), "ejecutado": t["corte_ej_mta"].to_numpy()}), "Mes", "Mes"))
+        st.caption("Barra: relleno = corte ejecutado ($), marca = corte presupuestado del mes.")
+        with st.expander("Ver como tabla (m², tarifa y %)", icon=":material/table:"):
+            st.dataframe(corte, hide_index=True, width="stretch", column_config=cfg_cols)
     if MOSTRAR_PODA:
         cfg_p = {c: st.column_config.NumberColumn(format="%.0f") for c in poda.columns[1:] if c != "% árboles"}
         cfg_p["% árboles"] = st.column_config.NumberColumn(format="percent")
         with st.container(key="card_cp_poda"):
             titulo_tarjeta("Poda de árboles", "Valor por árbol = valor mensual de poda ÷ árboles del presupuesto; sin árboles presupuestados no se valoriza.")
-            st.dataframe(poda, hide_index=True, width="stretch", column_config=cfg_p)
+            st.html(E.tabla_barras(pd.DataFrame({"Mes": mes_txt, "presupuesto": t["valor_poda_mta"].to_numpy(), "ejecutado": t["poda_ej_mta"].to_numpy()}), "Mes", "Mes"))
+            st.caption("Barra: relleno = poda ejecutada ($), marca = poda presupuestada del mes.")
+            with st.expander("Ver como tabla (árboles y %)", icon=":material/table:"):
+                st.dataframe(poda, hide_index=True, width="stretch", column_config=cfg_p)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf) as w:
         corte.to_excel(w, sheet_name="Corte", index=False)

@@ -571,7 +571,11 @@ def _tab_hoja(S, hoja: str):
         titulo_tarjeta(f"{hoja} · presupuesto vs ejecución", f"{S.escenario} · ejecutado {S.hasta} · variación = ejecutado − presupuesto"
                        + (" · EN CANTIDADES (unidades): estas referencias tienen costo cero" if S.cant else ""))
         vista = t[["Mes", "presupuesto", "ejecutado", "variacion", "pct", "ppto_acum", "ejec_acum", "pct_acum"]]
-        st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config=_columnas_mes(S))
+        al_corte = t[(t["mes"] > 0) & t["ejecutado"].notna()]                     # los meses sin ejecución aún no se comparan; el total es «al corte»
+        st.html(E.tabla_barras(al_corte, "Mes", "Mes", formato=E._uni if S.cant else None, etiqueta_total="Total al corte"))
+        st.caption("Barra: relleno = lo ejecutado, marca = lo presupuestado del mes. Solo los meses hasta el corte." + (" Valores en unidades." if S.cant else ""))
+        with st.expander("Ver como tabla (con variación y acumulados)", icon=":material/table:"):
+            st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config=_columnas_mes(S))
     _graficos_mes(S, t, hoja)
     it = _items(S, hoja)
     with st.container(key=f"op_card_items_{hoja}"):
@@ -859,6 +863,7 @@ def _tab_resumen(S):
                 nc = st.column_config.NumberColumn
                 vp = pd.DataFrame([dict(presupuesto_esc=c["presupuesto_esc"], presupuesto=c["presupuesto"], ejecutado=c["ejecutado"],
                                         variacion=c["variacion"], pct=c["pct"], saldo=c["saldo"], estado=c["estado"], movimientos=c["movimientos"])])
+                st.html(E.tabla_barras(pd.DataFrame([dict(n="Papelería", presupuesto=c["presupuesto"], ejecutado=c["ejecutado"])]), "Hoja", "n", formato=E._uni))
                 st.dataframe(_estilo(vp, "variacion"), hide_index=True, width="stretch", column_config={
                     "presupuesto_esc": nc("Cantidad presupuestada (total)", format="localized"),
                     "presupuesto": nc("Cantidad presupuestada al corte", format="localized"), "ejecutado": nc("Cantidad ejecutada", format="localized"),

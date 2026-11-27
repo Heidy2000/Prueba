@@ -342,6 +342,13 @@ def _tabla(df: pd.DataFrame, alto=380):
     st.dataframe(df, hide_index=True, width="stretch", height=alto, column_config=_config())
 
 
+def _tabla_barras(df: pd.DataFrame, columna: str, col_nombre: str, alto=380):
+    """Tabla con la barra de ejecución vs presupuesto; la tabla numérica (estado, movimientos) queda en un desplegable."""
+    st.html(E.tabla_barras(df[~df[col_nombre].astype(str).str.startswith("Total")], columna, col_nombre))     # el total lo suma la tabla
+    with st.expander("Ver como tabla", icon=":material/table:"):
+        _tabla(df, alto)
+
+
 def _tecnico() -> bool:
     """True solo cuando la vista se pinta desde Administración (`admin_revision_tecnica`): ahí viven las descargas, validaciones y
     herramientas técnicas. En la página del módulo no se muestran."""
@@ -1923,7 +1930,7 @@ def _tab_ts(S):
     with st.container(key="mt_card_ts_res"):
         titulo_tarjeta("Tecnomecánica y SOAT por separado",
                        f"{S.escenario} · ejecutado {S.hasta}" + (f" · placa {S.placa}" if S.placa else " · todas las placas"))
-        _tabla(t, 120)
+        _tabla_barras(t, "Concepto", "concepto", 120)
     t_tec, t_soat = st.tabs(["Tecnomecánica", "SOAT"])
     with t_tec:
         _ts_concepto(S, L.CONCEPTO_TECNO, "tec")
@@ -1949,7 +1956,7 @@ def _ts_concepto(S, concepto: str, k: str):
     with st.container(key=f"mt_card_ts_grupos_{k}"):
         titulo_tarjeta(f"{concepto.capitalize() if concepto != L.CONCEPTO_SOAT else 'SOAT'}: vehículos con y sin presupuesto asignado",
                        f"{S.escenario} · ejecutado {S.hasta} · «{GRUPO_SIN}» = placas sin presupuesto de este concepto (con o sin ejecución)")
-        _tabla(resumen[["grupo", "placas", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]], 40 + 35 * len(resumen))
+        _tabla_barras(resumen[["grupo", "placas", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]], "Grupo", "grupo", 40 + 35 * len(resumen))
     e = _movs(S, L.AMB_TS)
     e = e[e["concepto"] == concepto]
     if S.es_admin:
@@ -3037,7 +3044,9 @@ def _tab_mantenimiento(S):
         with st.container(key="mt_card_rubro_emp"):
             titulo_tarjeta("Por compañía", f"{S.escenario} · ejecutado {S.hasta}")
             tc = _fila_total_df(pd.DataFrame(filas), "empresa", "Consolidado")
-            _tabla(tc, 40 + 35 * len(tc))
+            st.html(E.tabla_barras(tc[tc["empresa"] != "Consolidado"], "Compañía", "empresa", etiqueta_total="Consolidado"))
+            with st.expander("Ver como tabla", icon=":material/table:"):
+                _tabla(tc, 40 + 35 * len(tc))
     with st.container(key="mt_card_rubro_mes"):
         titulo_tarjeta("Mes a mes", "Presupuesto vs ejecutado del rubro (millones de pesos)")
         _grafico_ts_mensual(S, ppto, ejec)
@@ -3645,7 +3654,7 @@ def _mostrar(ctx, tecnico: bool = False):
                     st.dataframe(pend_, hide_index=True, width="stretch", column_config={
                         "Movimientos SAP": st.column_config.NumberColumn(format="%d"), "Valor SAP": st.column_config.NumberColumn(format="accounting")})
         with st.expander("Flota por ámbito (Placas · Generales · Tecnomecánica y SOAT)", icon=":material/table:"):
-            _tabla(S.vistas["resumen"], 190)
+            _tabla_barras(S.vistas["resumen"], "Ámbito", "ambito", 190)
         with st.expander("Informe de placas y descargas de Flota", icon=":material/directions_car:", expanded=True):
             _tab_flota(S)
 
