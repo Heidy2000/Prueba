@@ -1,5 +1,4 @@
 """Módulo Administración (solo Financiera): carga de archivos, dueños, historial y respaldo."""
-import io
 from datetime import datetime
 
 import pandas as pd
@@ -11,15 +10,11 @@ import cartera
 import nomina
 import clasificador
 import datos
+import dotacion
 import eeff
 import flujo
 import estilo as E
 import lineas
-import logica_m as L
-import mod_mantenimiento
-import operaciones
-import sispo_fuente
-import sispo_oper
 from ui import ADMIN, EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, ahora, empresa_de_nombre, titulo_tarjeta
 
 
@@ -44,6 +39,117 @@ def _empresa_adm(ctx) -> str:
         or list(EMPRESAS)[0]
     ctx.empresa = e
     return e
+
+
+def _facturacion_manual(ctx, empresa: str, anio: int, mes: int):
+    """Digitación de la facturación del servicio de aseo del mes (por componente y total) para las diapositivas de facturación."""
+    import presentacion as P
+    con, leer = ctx.con, ctx.leer
+    if not st.session_state.get("_fact_tabla"):
+        con.execute(P.FACT_DDL)
+        con.commit()
+        st.session_state["_fact_tabla"] = True
+    with st.expander(f"Facturación del servicio de aseo · {MESES_L[mes - 1]} {anio}", icon=":material/edit_note:"):
+        st.caption("Digita en pesos lo facturado en el mes por componente (con intereses) y la facturación total. Alimenta las dos "
+                   "diapositivas «Facturación servicio de aseo»; lo que guardes de un mes reemplaza lo anterior de ese mes.")
+        hay = leer("SELECT DISTINCT mes FROM facturacion_mes WHERE empresa=? AND anio=? ORDER BY mes", (empresa, anio))["mes"].tolist()
+        if hay:
+            st.caption("Meses con datos: " + ", ".join(MESES_L[int(m_) - 1] for m_ in hay) + ".")
+        ya = leer("SELECT componente, valor FROM facturacion_mes WHERE empresa=? AND anio=? AND mes=?", (empresa, anio, mes))
+        previo = dict(zip(ya["componente"], ya["valor"]))
+        filas = [*P.FACT_COMPONENTES, P.FACT_TOTAL]
+        df = pd.DataFrame({"Concepto": filas, "Valor ($)": [previo.get(c) for c in filas]})
+        ed = st.data_editor(df, hide_index=True, disabled=["Concepto"], width="stretch", key=f"pr_fact_{empresa}_{anio}_{mes}",
+                            column_config={"Valor ($)": st.column_config.NumberColumn(format="accounting", step=1000.0)})
+        vals = {r["Concepto"]: r["Valor ($)"] for _, r in ed.iterrows() if pd.notna(r["Valor ($)"])}
+        suma = sum(v for c, v in vals.items() if c != P.FACT_TOTAL)
+        tot = vals.get(P.FACT_TOTAL)
+        st.caption(f"Suma de componentes: ${suma:,.0f}".replace(",", ".")
+                   + (f" · {suma / tot * 100:.1f}% de la facturación total".replace(".", ",") if tot else ""))
+        if tot and suma > tot * 1.0001:
+            st.warning("Los componentes suman más que la facturación total: revisa los valores.", icon=":material/warning:")
+        hist = P.FACT_HISTORICO.get((empresa, anio))
+        if hist:
+            faltan = [m_ for m_ in range(1, len(hist["total"]) + 1) if m_ not in hay]
+            if faltan and st.button(f"Precargar {', '.join(MESES[m_ - 1].lower() for m_ in faltan)} de {anio} (de la presentación)",
+                                    key=f"pr_fact_hist_{empresa}_{anio}", icon=":material/history:",
+                                    help="Carga los valores de esos meses tomados de la presentación enviada. No toca los meses ya digitados."):
+                hoy = ahora().strftime("%Y-%m-%d %H:%M")
+                filas_h = []
+                for m_ in faltan:
+                    for c_, vs in hist["componentes_millones"].items():
+                        filas_h.append(dict(empresa=empresa, anio=anio, mes=m_, componente=c_, valor=vs[m_ - 1] * 1e6, actualizado=hoy))
+                    filas_h.append(dict(empresa=empresa, anio=anio, mes=m_, componente=P.FACT_TOTAL, valor=hist["total"][m_ - 1], actualizado=hoy))
+                con.anexar(pd.DataFrame(filas_h), "facturacion_mes")
+                con.commit()
+                ctx.registrar_carga(ctx.usuario, "Facturación servicio de aseo", "presentación", f"precarga {anio} · {empresa}")
+                st.success("Precargados los meses de la presentación. Desde ahora solo digitas el mes nuevo.")
+                st.rerun()
+        if st.button(f"Guardar facturación de {MESES_L[mes - 1]} {anio}", type="primary", key=f"pr_fact_g_{empresa}_{anio}_{mes}",
+                     disabled=not vals):
+            con.execute("DELETE FROM facturacion_mes WHERE empresa=? AND anio=? AND mes=?", (empresa, anio, mes))
+            con.anexar(pd.DataFrame([dict(empresa=empresa, anio=anio, mes=mes, componente=c, valor=float(v),
+                                          actualizado=ahora().strftime("%Y-%m-%d %H:%M")) for c, v in vals.items()]),
+                       "facturacion_mes")
+            con.commit()
+            ctx.registrar_carga(ctx.usuario, "Facturación servicio de aseo", "manual", f"{MESES_L[mes - 1]} {anio} · {empresa}")
+            st.success(f"Guardada la facturación de {MESES_L[mes - 1]} {anio}.")
+            st.rerun()
+
+
+def _presentacion(ctx):
+    """Descarga la presentación financiera del mes en PowerPoint, con el fondo y la letra de la presentación de la
+    compañía: presupuesto, nómina, flujo de caja, combustible, balance y estado de resultados."""
+    import presentacion
+    leer = ctx.leer
+    with st.container(key="card_presentacion"):
+        titulo_tarjeta("Presentación financiera del mes",
+                       "PowerPoint con el mismo fondo y la misma letra de la presentación de la compañía. Abre con un "
+                       "resumen del mes y sigue con cada tema en diapositivas aparte, con su titular, tarjetas de "
+                       "resumen y gráficas de variaciones (verde a favor, rojo en contra). Las tablas, las gráficas "
+                       "y los "
+                       "comentarios quedan editables en PowerPoint.")
+        c = st.columns([1.3, .7, 1, 1.1], vertical_alignment="bottom")
+        empresa = c[0].selectbox("Compañía", list(EMPRESAS), key="pr_empresa",
+                                 format_func=lambda e: f"{e} · {EMPRESAS[e]}")
+        anios = sorted(set(leer("SELECT DISTINCT anio FROM ejecucion WHERE empresa=?", (empresa,))["anio"])
+                       | set(leer("SELECT DISTINCT anio FROM eeff WHERE empresa=?", (empresa,))["anio"])
+                       | set(leer("SELECT DISTINCT anio FROM flujo_lineas WHERE empresa=?", (empresa,))["anio"]),
+                       reverse=True) or [datetime.now().year]
+        anio = int(c[1].selectbox("Año", anios, key=f"pr_anio_{empresa}"))
+        ult = leer("SELECT MAX(mes) m FROM ejecucion WHERE anio=? AND empresa=? AND codigo<>''", (anio, empresa))["m"][0]
+        ult = int(ult) if pd.notna(ult) else datetime.now().month
+        mes = c[2].selectbox("Mes", list(range(1, 13)), index=ult - 1, key=f"pr_mes_{empresa}_{anio}",
+                             format_func=lambda m: MESES_L[m - 1].capitalize())
+        versiones = leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?",
+                         (anio, empresa))["version"].tolist()
+        orden_v = {"Inicial": 0, "4+8": 1, "8+4": 2}
+        versiones = sorted(versiones, key=lambda v: (orden_v.get(v, 9), v)) or ["Inicial"]
+        version = c[3].selectbox("Presupuesto", versiones, index=len(versiones) - 1, key=f"pr_ver_{empresa}_{anio}",
+                                 format_func=lambda v: f"Presupuesto {v}")
+        _facturacion_manual(ctx, empresa, anio, mes)
+        secciones = st.pills("Diapositivas", presentacion.SECCIONES, selection_mode="multi",
+                             default=presentacion.SECCIONES, key="pr_secciones")
+        clave = (empresa, anio, mes, version, tuple(secciones or ()))
+        if st.button("Preparar presentación", type="primary", icon=":material/slideshow:", key="pr_generar",
+                     disabled=not secciones):
+            with st.spinner("Armando las diapositivas…"):
+                contenido, avisos = presentacion.generar(leer, empresa, anio, mes, version, secciones, ctx=ctx)
+            st.session_state["pr_listo"] = (clave, contenido, avisos)
+        listo = st.session_state.get("pr_listo")
+        if listo and listo[0] == clave:
+            _, contenido, avisos = listo
+            for a in avisos:
+                st.warning(a, icon=":material/warning:")
+            if contenido:
+                st.download_button("Descargar PowerPoint", contenido,
+                                   file_name=presentacion.nombre_archivo(empresa, anio, mes),
+                                   mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                   icon=":material/download:", key="pr_bajar")
+                st.caption("Los comentarios se redactan solos con las mayores variaciones del mes: revísalos y "
+                           "ajústalos en PowerPoint antes de presentar. Incluye cifras de nómina por área y cargo.")
+            else:
+                st.info("No hay información de ese mes para armar las diapositivas elegidas.")
 
 
 def _aviso_empresa(ctx, nombre_archivo: str):
@@ -1114,9 +1220,13 @@ def _cargar_nomina(ctx):
     con, leer, usuario = ctx.con, ctx.leer, ctx.usuario
     with st.container(key="card_adm_nom"):
         titulo_tarjeta("Nómina · archivos",
-                       "Sube los archivos tal como los tienes. Presupuesto: reemplaza los años que trae (hojas "
-                       "'3.0 Personal 2026', '… 2027'). Ejecución: reemplaza el mes que trae (no duplica si lo "
-                       "vuelves a subir). Centros de coste: la relación centro de coste → área.")
+                       "Elige la compañía y sube los archivos tal como los tienes. Presupuesto: reemplaza los años que "
+                       "trae (hojas '3.0 Personal 2026', '… 2027') de esa compañía. Ejecución: eliges el mes que estás "
+                       "cargando y reemplaza ese mes de esa compañía (no duplica si lo vuelves a subir). Centros de "
+                       "coste: la relación centro de coste → área (común a las dos compañías).")
+        ce, _ = st.columns([1, 2.5])
+        emp = ce.selectbox("Compañía que estás cargando", list(EMPRESAS), key="nom_empresa",
+                           format_func=lambda e: f"{e} · {EMPRESAS[e]}")
         c1, c2, c3 = st.columns(3)
         fp = c1.file_uploader("Presupuesto detalle nómina", type=["xlsx", "xlsm"], key="nom_ppto")
         fe = c2.file_uploader("Ejecución nómina (SAP)", type=["xlsx", "xlsm"], key="nom_ejec")
@@ -1155,30 +1265,51 @@ def _cargar_nomina(ctx):
                                "+ bonificación extralegal + % seg. × (salario + bonificación + horas) + % vacaciones × "
                                "(salario + bonificación) + % prestacional × (salario + bonificación + horas + "
                                "transporte)) × personas del mes.")
-                if st.button("Cargar presupuesto de nómina", type="primary", key="nom_ok_ppto"):
+                ya_pp = [int(a) for a in res.index
+                         if not leer("SELECT 1 FROM nomina_ppto WHERE empresa=? AND anio=? LIMIT 1",
+                                     (emp, int(a))).empty]
+                if ya_pp:
+                    st.caption(f"Reemplaza el presupuesto de nómina de {emp} ya cargado para "
+                               + ", ".join(map(str, ya_pp)) + ".")
+                if st.button(f"Cargar presupuesto de nómina de {emp}", type="primary", key="nom_ok_ppto"):
                     for a in res.index:
-                        con.execute("DELETE FROM nomina_ppto WHERE anio=?", (int(a),))
-                    con.anexar(d, "nomina_ppto")
+                        con.execute("DELETE FROM nomina_ppto WHERE empresa=? AND anio=?", (emp, int(a)))
+                    con.anexar(d.assign(empresa=emp), "nomina_ppto")
                     con.commit()
                     ctx.registrar_carga(usuario, "Nómina presupuesto", archivo.name,
-                                        f"{len(res)} años · {E.millones(d['valor'].sum())}")
+                                        f"{emp} · {len(res)} años · {E.millones(d['valor'].sum())}")
                     st.success("Presupuesto de nómina cargado.")
                     st.rerun()
             elif tipo == "ejec":
-                per = sorted(set(zip(d["anio"], d["mes"])))
-                txt = ", ".join(f"{MESES[m-1]} {a}" for a, m in per)
-                ya = [p for p in per if not leer("SELECT 1 FROM nomina_ejec WHERE anio=? AND mes=? LIMIT 1",
-                                                  (int(p[0]), int(p[1]))).empty]
-                st.markdown(f"**{archivo.name}:** {txt} · {d['empleado_id'].nunique():,} personas · "
+                # mes que trae el archivo (el más frecuente); el que manda es el que elige quien carga
+                a_arch, m_arch = (int(d["anio"].mode().iloc[0]), int(d["mes"].mode().iloc[0])) if len(d) else (0, 0)
+                sin_fecha = a_arch < 2000
+                hoy = ahora()
+                a_def, m_def = (hoy.year, hoy.month) if sin_fecha else (a_arch, m_arch)
+                anios_op = list(range(a_def - 2, a_def + 2))
+                cm1, cm2, cm3 = st.columns([0.7, 1, 2.3], vertical_alignment="bottom")
+                a_sel = cm1.selectbox("Año", anios_op, index=anios_op.index(a_def), key=f"nom_ej_anio_{archivo.name}")
+                m_sel = cm2.selectbox("Mes que estás cargando", list(range(1, 13)), index=m_def - 1,
+                                      key=f"nom_ej_mes_{archivo.name}", format_func=lambda m: MESES_L[m - 1].capitalize())
+                if sin_fecha:
+                    cm3.warning("El archivo no trae la fecha del periodo: se carga en el mes que elijas.",
+                                icon=":material/event:")
+                elif (a_sel, m_sel) != (a_arch, m_arch):
+                    cm3.warning(f"El archivo es de {MESES_L[m_arch - 1]} {a_arch}; se cargará como "
+                                f"{MESES_L[m_sel - 1]} {a_sel}.", icon=":material/warning:")
+                d = d.assign(anio=a_sel, mes=m_sel, empresa=emp)
+                txt = f"{MESES[m_sel - 1]} {a_sel}"
+                ya = not leer("SELECT 1 FROM nomina_ejec WHERE empresa=? AND anio=? AND mes=? LIMIT 1",
+                              (emp, a_sel, m_sel)).empty
+                st.markdown(f"**{archivo.name}:** {emp} · {txt} · {d['empleado_id'].nunique():,} personas · "
                             .replace(",", ".") + f"{d['cargo'].nunique()} cargos · {E.millones(d['valor'].sum())}"
-                            + (" · **reemplaza lo ya cargado de ese mes**" if ya else ""))
-                if st.button("Cargar ejecución de nómina", type="primary", key="nom_ok_ejec"):
-                    for a, m in per:
-                        con.execute("DELETE FROM nomina_ejec WHERE anio=? AND mes=?", (int(a), int(m)))
+                            + (f" · **reemplaza lo ya cargado de {emp} en {txt}**" if ya else ""))
+                if st.button(f"Cargar ejecución de nómina de {emp} · {txt}", type="primary", key="nom_ok_ejec"):
+                    con.execute("DELETE FROM nomina_ejec WHERE empresa=? AND anio=? AND mes=?", (emp, a_sel, m_sel))
                     con.anexar(d, "nomina_ejec")
                     con.commit()
                     ctx.registrar_carga(usuario, "Nómina ejecución", archivo.name,
-                                        f"{txt} · {E.millones(d['valor'].sum())}")
+                                        f"{emp} · {txt} · {E.millones(d['valor'].sum())}")
                     st.success("Ejecución de nómina cargada.")
                     st.rerun()
             else:
@@ -1196,6 +1327,24 @@ def _cargar_nomina(ctx):
         if not sin.empty:
             st.warning("Centros de coste de la nómina sin área en la relación: " + ", ".join(sin["cc"])
                        + ". Agrégalos al archivo de centros de coste y vuelve a subirlo.")
+        # qué hay cargado de cada compañía
+        hay = leer("SELECT empresa, anio, mes, COUNT(DISTINCT empleado_id) personas, SUM(valor) valor FROM nomina_ejec "
+                   "GROUP BY empresa, anio, mes ORDER BY empresa, anio, mes")
+        hp = leer("SELECT empresa, anio, SUM(valor) valor FROM nomina_ppto GROUP BY empresa, anio ORDER BY empresa, anio")
+        if not hay.empty or not hp.empty:
+            st.markdown("**Cargado por compañía**")
+            lineas = []
+            for e_ in sorted(set(hay["empresa"].fillna("ALDC")) | set(hp["empresa"].fillna("ALDC"))):
+                ej_e = hay[hay["empresa"].fillna("ALDC") == e_]
+                pp_e = hp[hp["empresa"].fillna("ALDC") == e_]
+                partes = []
+                if not pp_e.empty:
+                    partes.append("presupuesto " + ", ".join(str(int(a)) for a in pp_e["anio"]))
+                if not ej_e.empty:
+                    por_anio = ej_e.groupby("anio")["mes"].apply(lambda m: ", ".join(MESES[int(x) - 1] for x in m))
+                    partes.append("ejecución " + "; ".join(f"{int(a)}: {t}" for a, t in por_anio.items()))
+                lineas.append(f"- **{e_}:** " + " · ".join(partes))
+            st.markdown("\n".join(lineas))
 
 
 AUTO = "(sugerencia automática)"
@@ -1501,7 +1650,40 @@ def _flujo_revisar(ctx):
         filtro = c2.segmented_control("Ver", ["Pendientes", "Para revisar", "Todos"], default="Pendientes",
                                       key="fl_rev_filtro") or "Pendientes"
         buscar = c3.text_input("Buscar", placeholder="Tercero, texto, documento…", key="fl_rev_buscar")
-        sel = mov[(mov["anio"] == per[0]) & (mov["mes"] == per[1])]
+        del_mes = mov[(mov["anio"] == per[0]) & (mov["mes"] == per[1])]
+
+        def _cargue(d=del_mes):
+            cu = leer("SELECT cuenta, nombre FROM flujo_cuentas WHERE empresa=?", (emp,))
+            return flujo.excel_cargue(flujo.estructura_cargue(d, dict(zip(cu["cuenta"], cu["nombre"]))))
+        # descargas de movimientos de caja (antes también estaban en el módulo Flujo de caja → Movimientos)
+        del_anio = mov[mov["anio"] == per[0]]
+
+        def _cargue_anio(d=del_anio):
+            cu = leer("SELECT cuenta, nombre FROM flujo_cuentas WHERE empresa=?", (emp,))
+            return flujo.excel_cargue(flujo.estructura_cargue(d, dict(zip(cu["cuenta"], cu["nombre"]))))
+
+        def _plano(d):
+            cols = [c for c in ["fecha", "anio", "mes", "concepto", "tercero", "texto", "documento", "cuenta", "valor",
+                                "origen"] if c in d.columns]
+            return a_excel(d.sort_values("fecha")[cols] if "fecha" in d.columns else d[cols])
+        dl1, dl2, dl3 = st.columns(3)
+        dl1.download_button(f"{MESES[per[1] - 1]} {per[0]} · estructura de cargue y clasificación",
+                            _cargue, f"flujo_caja_{emp}_{per[0]}{per[1]:02d}_journal.xlsx", key="fl_rev_cargue",
+                            icon=":material/download:", width="stretch",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            help="Todos los movimientos del mes con las columnas del reporte de SAP que se carga. "
+                                 "'Subrubro caja' trae la clasificación del panel; 'Modificacion manual', lo corregido "
+                                 "a mano. Si lo vuelves a cargar, entra como validado.")
+        dl2.download_button(f"Año {per[0]} · estructura de cargue y clasificación", _cargue_anio,
+                            f"flujo_caja_{emp}_{per[0]}_journal.xlsx", key="fl_rev_cargue_anio",
+                            icon=":material/download:", width="stretch",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            help="Todos los movimientos del año, con las mismas columnas del reporte de SAP.")
+        dl3.download_button(f"Movimientos de {MESES[per[1] - 1]} {per[0]} (lista simple)",
+                            lambda d=del_mes: _plano(d), f"movimientos_caja_{emp}_{per[0]}{per[1]:02d}.xlsx",
+                            key="fl_rev_plano", icon=":material/download:", width="stretch",
+                            help="Fecha, concepto, tercero, texto, documento, cuenta y valor de cada movimiento del mes.")
+        sel = del_mes
         if filtro == "Pendientes":
             sel = sel[sel["origen"] == "pendiente"]
         elif filtro == "Para revisar":
@@ -1876,6 +2058,405 @@ def _cargar_flujo(ctx):
             _flujo_terceros(ctx)
 
 
+# ------------------------------------------------------------------ dotación y EPP
+@st.cache_data(show_spinner=False, max_entries=3)
+def _leer_dotacion(contenido: bytes):
+    from io import BytesIO
+    return dotacion.leer_presupuesto(BytesIO(contenido))
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _leer_dotacion_otro(tipo: str, contenido: bytes):
+    from io import BytesIO
+    return dotacion.leer_ejecucion(BytesIO(contenido)) if tipo == "ejec" else dotacion.leer_cruce(BytesIO(contenido))
+
+
+def _datos_dotacion(leer, emp: str):
+    ppto = leer("SELECT * FROM dotacion_ppto WHERE empresa=?", (emp,))
+    ejec = leer("SELECT * FROM dotacion_ejec WHERE empresa=?", (emp,))
+    cruce = leer("SELECT articulo, concepto, origen FROM dotacion_cruce WHERE empresa=?", (emp,))
+    return ppto, ejec, cruce.fillna("")
+
+
+def _aviso_decisiones(leer, emp: str, anio: int | None = None):
+    ppto, ejec, cruce = _datos_dotacion(leer, emp)
+    if ejec.empty:
+        return
+    if anio:
+        ppto, ejec = ppto[ppto["anio"] == anio], ejec[ejec["anio"] == anio]
+    dec = dotacion.decisiones(ejec, cruce, ppto)
+    if not dec.empty:
+        st.warning(f"Hay {dec['articulo'].nunique()} artículos por decidir ({E.millones(dec['valor'].sum())} "
+                   "ejecutados): resuélvelos en la pestaña 'Cruce de artículos'.", icon=":material/rule:")
+
+
+def _cargar_dotacion_ejec(ctx):
+    con, leer, usuario, emp = ctx.con, ctx.leer, ctx.usuario, ctx.empresa
+    cargado = leer("SELECT anio, mes, COUNT(*) n, SUM(valor) v FROM dotacion_ejec WHERE empresa=? "
+                   "GROUP BY anio, mes ORDER BY anio, mes", (emp,))
+    with st.container(key="card_adm_dot_ej"):
+        titulo_tarjeta(f"Ejecución de dotación y EPP · {emp}",
+                       "Reporte de movimientos de almacén (kárdex) con las salidas: Cierre, Fecha Movimiento, Articulo, "
+                       "Cantidad Salida, Costo Total Con Iva… Puedes subir el mes o todo el año: los meses que traiga "
+                       "el archivo se reemplazan. Se compara con IVA, igual que el presupuesto.")
+        if not cargado.empty:
+            st.caption("Cargado: " + " · ".join(f"{MESES[int(r.mes) - 1]} {int(r.anio)}" for r in cargado.itertuples())
+                       + f" · total {E.millones(cargado['v'].sum())}")
+        f = st.file_uploader("Ejecución de dotación", type=["xlsx", "xlsm", "xls"], key="up_dot_ej",
+                             label_visibility="collapsed")
+        if f:
+            try:
+                ej, avisos = _leer_dotacion_otro("ejec", f.getvalue())
+            except Exception as err:
+                st.error(f"No pude leer el archivo: {err}")
+                ej = None
+            if ej is not None:
+                for a in avisos:
+                    st.warning(a)
+                _aviso_empresa(ctx, f.name)
+                periodos = sorted(set(zip(ej["anio"].astype(int), ej["mes"].astype(int))))
+                txt = ", ".join(f"{MESES[m - 1]} {a}" for a, m in periodos)
+                ppto, _, cruce = _datos_dotacion(leer, emp)
+                asig = dotacion.asignar(ej, cruce, ppto)
+                sin = asig[asig["estado"].isin(["sin_cruce", "sin_concepto"])]
+                st.html(E.kpis([
+                    dict(label="Salidas", valor=f"{len(ej):,}".replace(",", "."), sub=txt, icono="receipt",
+                         color=E.AZUL, fondo=E.AZUL_SUAVE),
+                    dict(label="Valor con IVA", valor=E.millones(ej["valor"].sum()),
+                         sub=f"Sin IVA {E.millones(ej['valor_sin_iva'].sum())}", icono="wallet", color=E.AZUL,
+                         fondo=E.AZUL_SUAVE),
+                    dict(label="Unidades entregadas", valor=f"{ej['cantidad'].sum():,.0f}".replace(",", "."),
+                         sub=f"{ej['articulo'].nunique()} artículos distintos", icono="check", color=E.VERDE,
+                         fondo=E.VERDE_SUAVE),
+                    dict(label="Sin cruce", valor=str(sin["articulo"].nunique()),
+                         sub=f"artículos · {E.millones(sin['valor'].sum())}", icono="calendar",
+                         color=E.ROJO if len(sin) else E.VERDE, fondo=E.ROJO_SUAVE if len(sin) else E.VERDE_SUAVE),
+                ]))
+                if cruce.empty:
+                    st.info("Aún no has cargado la tabla de cruce: sube primero la tabla en 'Cruce de artículos' o "
+                            "carga la ejecución y luego decide el cruce allí.", icon=":material/info:")
+                ya = [p for p in periodos if ((cargado["anio"] == p[0]) & (cargado["mes"] == p[1])).any()]
+                if ya:
+                    st.warning("Ya hay ejecución de " + ", ".join(f"{MESES[m - 1]} {a}" for a, m in ya)
+                               + ": se reemplaza por la de este archivo.", icon=":material/sync:")
+                if st.button(f"Cargar ejecución de {txt}", type="primary", key="dot_ej_ok"):
+                    for a, m in periodos:
+                        con.execute("DELETE FROM dotacion_ejec WHERE empresa=? AND anio=? AND mes=?", (emp, a, m))
+                    con.anexar(ej.assign(empresa=emp)[["empresa"] + dotacion.COLS_EJEC], "dotacion_ejec")
+                    con.commit()
+                    ctx.registrar_carga(usuario, "Ejecución dotación", f.name,
+                                        f"{emp} · {txt} · {E.millones(ej['valor'].sum())}")
+                    st.session_state["dot_ej_msg"] = "Ejecución de dotación cargada."
+                    st.rerun()
+        if st.session_state.get("dot_ej_msg"):
+            st.success(st.session_state.pop("dot_ej_msg"))
+        _aviso_decisiones(leer, emp)
+
+
+def _borrar_cruce(con, emp: str, claves: set):
+    """Borra del cruce los artículos con esas claves (el nombre puede variar en tildes, mayúsculas o espacios)."""
+    actual = con.leer("SELECT DISTINCT articulo FROM dotacion_cruce WHERE empresa=?", (emp,))["articulo"]
+    con.executemany("DELETE FROM dotacion_cruce WHERE empresa=? AND articulo=?",
+                    [(emp, a) for a in actual if dotacion.clave(a) in claves])
+
+
+def _guardar_cruce(con, emp: str, filas: list[tuple[str, str]], origen: str):
+    """Reemplaza el cruce de esos artículos (una sola fila por artículo)."""
+    _borrar_cruce(con, emp, {dotacion.clave(a) for a, _ in filas})
+    hoy = ahora().strftime("%Y-%m-%d %H:%M")
+    con.executemany("INSERT INTO dotacion_cruce(empresa, articulo, concepto, origen, actualizado) VALUES(?,?,?,?,?)",
+                    [(emp, a, c, origen, hoy) for a, c in filas])
+
+
+def _cruce_dotacion(ctx):
+    con, leer, usuario, emp = ctx.con, ctx.leer, ctx.usuario, ctx.empresa
+    ppto, ejec, cruce = _datos_dotacion(leer, emp)
+    with st.container(key="card_adm_dot_dec"):
+        titulo_tarjeta(f"Decisiones pendientes del cruce · {emp}",
+                       "Artículos de la ejecución que no cruzan con el presupuesto. Mientras no decidas, igual cuentan en "
+                       "el comparativo (como 'Sin cruce'). Elige el concepto del presupuesto al que corresponde cada uno, "
+                       "o 'No comparar' si no es dotación (repuestos, herramientas…), y guarda.")
+        if ejec.empty:
+            st.info("Aún no hay ejecución de dotación cargada.")
+        else:
+            anios = sorted(ejec["anio"].unique(), reverse=True)
+            anio = st.selectbox("Año", anios, key="dot_dec_anio")
+            pp_a, ej_a = ppto[ppto["anio"] == anio], ejec[ejec["anio"] == anio]
+            dec = dotacion.decisiones(ej_a, cruce, pp_a)
+            if dec.empty:
+                st.success("Todo lo ejecutado cruza con el presupuesto.", icon=":material/task_alt:")
+            else:
+                opciones = [dotacion.EXCLUIR] + sorted(pp_a["articulo"].unique())
+                actual = {}
+                for a, c in zip(cruce["articulo"], cruce["concepto"]):
+                    actual.setdefault(dotacion.clave(a), c)        # el que se está usando (el primero)
+                tabla = dec.groupby("articulo", sort=False).agg(
+                    tipo=("tipo", lambda x: " · ".join(dict.fromkeys(x))), detalle=("detalle", "first"),
+                    valor=("valor", "first"), accion=("accion", "first")).reset_index()
+                por_clave = {dotacion.clave(o): o for o in opciones}      # el concepto como está escrito en el ppto
+                tabla["concepto"] = [por_clave.get(dotacion.clave(actual.get(dotacion.clave(a)) or "")) or None
+                                     for a in tabla["articulo"]]
+                ed = st.data_editor(
+                    tabla[["articulo", "tipo", "detalle", "valor", "concepto"]], hide_index=True, width="stretch",
+                    key=f"dot_dec_ed_{anio}", disabled=["articulo", "tipo", "detalle", "valor"],
+                    column_config={
+                        "articulo": st.column_config.TextColumn("Artículo (ejecución)", width="medium"),
+                        "tipo": "Qué pasa", "detalle": st.column_config.TextColumn("Detalle", width="medium"),
+                        "valor": st.column_config.NumberColumn("Ejecutado", format="accounting"),
+                        "concepto": st.column_config.SelectboxColumn("Concepto del presupuesto", options=opciones,
+                                                                     width="large")})
+                if st.button("Guardar decisiones", type="primary", key="dot_dec_ok"):
+                    filas = [(a, c) for a, c in zip(ed["articulo"], ed["concepto"]) if isinstance(c, str) and c]
+                    _guardar_cruce(con, emp, filas, "manual")
+                    con.commit()
+                    ctx.registrar_carga(usuario, "Cruce dotación", "", f"{emp} · {len(filas)} artículos decididos")
+                    st.session_state["dot_dec_msg"] = f"{len(filas)} decisiones guardadas."
+                    st.rerun()
+        if st.session_state.get("dot_dec_msg"):
+            st.success(st.session_state.pop("dot_dec_msg"))
+
+    with st.container(key="card_adm_dot_cruce"):
+        titulo_tarjeta(f"Tabla de cruce · {emp}",
+                       "Homologa el nombre del artículo en la ejecución (ARTICULO) con el concepto del presupuesto "
+                       "(CONCEPTO PRESUPUESTO). Al subirla se agregan los artículos nuevos y se actualizan los que ya "
+                       "estaban; lo que decidiste a mano en la app se conserva salvo que la tabla traiga otro concepto.")
+        st.caption(f"{cruce['articulo'].nunique()} artículos en el cruce.")
+        f = st.file_uploader("Tabla de cruce", type=["xlsx", "xlsm", "xls"], key="up_dot_cruce",
+                             label_visibility="collapsed")
+        if f:
+            try:
+                tc = _leer_dotacion_otro("cruce", f.getvalue())
+            except Exception as err:
+                st.error(f"No pude leer el archivo: {err}")
+                tc = None
+            if tc is not None:
+                rep = tc.assign(k=tc["articulo"].map(dotacion.clave), kc=tc["concepto"].map(dotacion.clave))
+                dobles = rep.groupby("k").filter(lambda g: g["kc"].nunique() > 1)
+                st.write(f"**{tc['articulo'].nunique()} artículos** en la tabla · "
+                         f"{(tc['concepto'] == '').sum()} sin concepto · {dobles['k'].nunique()} con dos conceptos.")
+                if not dobles.empty:
+                    st.warning("Artículos con dos conceptos distintos en la tabla (se guardan ambos y te aparecerán como "
+                               "decisión pendiente): " + ", ".join(dobles["articulo"].unique()))
+                if st.button("Guardar tabla de cruce", type="primary", key="dot_cruce_ok"):
+                    _borrar_cruce(con, emp, set(rep["k"]))
+                    hoy = ahora().strftime("%Y-%m-%d %H:%M")
+                    con.anexar(tc.assign(empresa=emp, origen="tabla", actualizado=hoy)
+                               [["empresa", "articulo", "concepto", "origen", "actualizado"]], "dotacion_cruce")
+                    con.commit()
+                    ctx.registrar_carga(usuario, "Cruce dotación", f.name, f"{emp} · {len(tc)} filas")
+                    st.session_state["dot_cruce_msg"] = "Tabla de cruce guardada."
+                    st.rerun()
+        if st.session_state.get("dot_cruce_msg"):
+            st.success(st.session_state.pop("dot_cruce_msg"))
+        if not cruce.empty:
+            with st.expander("Ver toda la tabla de cruce"):
+                st.dataframe(cruce.rename(columns={"articulo": "Artículo", "concepto": "Concepto del presupuesto", "origen": "Origen"}),
+                             hide_index=True, width="stretch")
+                st.download_button("Descargar tabla de cruce", lambda d=cruce: a_excel(d),
+                                   f"cruce_dotacion_{emp}.xlsx", icon=":material/download:", key="dot_cruce_dl")
+
+
+def _cargar_dotacion(ctx):
+    con, leer, usuario, emp = ctx.con, ctx.leer, ctx.usuario, ctx.empresa
+    cargado = leer("SELECT anio, COUNT(DISTINCT articulo) articulos, SUM(valor) valor FROM dotacion_ppto "
+                   "WHERE empresa=? GROUP BY anio ORDER BY anio", (emp,))
+    with st.container(key="card_adm_dot"):
+        titulo_tarjeta(f"Presupuesto de dotación y EPP · {emp}",
+                       "Archivo de presupuesto por artículo (ej. PRESUPUESTO 2026 - 2027 DOTACION.xlsx): una hoja por "
+                       "año o parte del año, con el año en el nombre de la hoja (PPTO 2026 ENE - AGO, PPTO 2027…). "
+                       "Columnas: SUBRUBRO (Dotación, EPP´S, Actividades), Artículo, Precio unitario, Cantidad total y, "
+                       "por cada mes, Cant. y Valor. Reemplaza lo cargado de los años que traiga el archivo.")
+        if not cargado.empty:
+            st.caption("Cargado: " + " · ".join(f"{int(r.anio)}: {int(r.articulos)} artículos, {E.millones(r.valor)}"
+                                                  for r in cargado.itertuples()))
+        f = st.file_uploader("Presupuesto de dotación", type=["xlsx", "xlsm"], key="up_dot_ppto",
+                             label_visibility="collapsed")
+        if not f:
+            return
+        try:
+            p, avisos = _leer_dotacion(f.getvalue())
+        except Exception as err:
+            st.error(f"No pude leer el archivo: {err}")
+            return
+        for a in avisos:
+            st.warning(a)
+        if p.empty:
+            st.warning("El archivo no tiene artículos con cantidades o valores.")
+            return
+        _aviso_empresa(ctx, f.name)
+        anios = sorted(p["anio"].unique())
+        res = p.pivot_table(index="categoria", columns="anio", values="valor", aggfunc="sum").fillna(0)
+        res.loc["Total"] = res.sum()
+        st.html(E.kpis([dict(label=f"Presupuesto {a}", valor=E.millones(res.at["Total", a]),
+                             sub=f"{p[p['anio'] == a]['articulo'].nunique()} artículos · "
+                                 f"meses {p[p['anio'] == a]['mes'].min()}–{p[p['anio'] == a]['mes'].max()}",
+                             icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE) for a in anios]))
+        st.dataframe(res.rename(columns=str), width="stretch",
+                     column_config={str(a): st.column_config.NumberColumn(str(a), format="accounting") for a in anios})
+        ya = [a for a in anios if (cargado["anio"] == a).any()]
+        if ya:
+            st.warning(f"Ya hay presupuesto de dotación de {', '.join(map(str, ya))} para {emp}: se reemplaza.",
+                       icon=":material/sync:")
+        if st.button(f"Cargar presupuesto de dotación {', '.join(map(str, anios))}", type="primary", key="dot_ok"):
+            for a in anios:
+                con.execute("DELETE FROM dotacion_ppto WHERE empresa=? AND anio=?", (emp, int(a)))
+            con.anexar(p.assign(empresa=emp)[["empresa"] + dotacion.COLS_PPTO], "dotacion_ppto")
+            con.commit()
+            ctx.registrar_carga(usuario, "Presupuesto dotación", f.name,
+                                f"{emp} · " + ", ".join(f"{a}: {E.millones(res.at['Total', a])}" for a in anios))
+            st.session_state["dot_msg"] = "Presupuesto de dotación cargado."
+            st.rerun()
+    if st.session_state.get("dot_msg"):
+        st.success(st.session_state.pop("dot_msg"))
+
+
+def _guardar_contable(con, emp: str, tipo: str, pares: list[tuple[str, str | None]]):
+    """Clasificación de registros contables de dotación: tipo 'patron' (tercero + texto, sirve para los meses
+    siguientes) o 'registro' (un registro puntual). concepto None = quitar la clasificación."""
+    hoy = ahora().strftime("%Y-%m-%d %H:%M")
+    for llave, concepto in pares:
+        con.execute("DELETE FROM dotacion_contable WHERE empresa=? AND tipo=? AND llave=?", (emp, tipo, llave))
+        if concepto:
+            con.execute("INSERT INTO dotacion_contable(empresa, tipo, llave, concepto, actualizado) VALUES(?,?,?,?,?)",
+                        (emp, tipo, llave, concepto, hoy))
+
+
+def _contable_dotacion(ctx):
+    """Registros contables de los rubros 3.1 Dotación y EPP y 3.1 Actividades de Seguridad en el Trabajo que no pasan
+    por el almacén: se clasifican en un concepto del presupuesto de dotación y se suman al módulo."""
+    con, leer, usuario, emp = ctx.con, ctx.leer, ctx.usuario, ctx.empresa
+    with st.container(key="card_adm_dot_cont"):
+        titulo_tarjeta(f"Ejecución contable de dotación · {emp}",
+                       "Viene de la ejecución del presupuesto (hoja BASE de SAP que se carga en Administración → "
+                       "Presupuesto), rubros 3.1 Dotación y EPP y 3.1 Actividades de Seguridad en el Trabajo. Las "
+                       "'Salidas de inventario' ya están en el kárdex y no se suman; el resto (exámenes médicos, "
+                       "purificadores, compras directas…) se clasifica aquí en un concepto del presupuesto de dotación.")
+        anios = leer("SELECT DISTINCT anio FROM ejecucion WHERE empresa=? AND codigo='3.1' ORDER BY anio DESC",
+                     (emp,))["anio"].tolist()
+        if not anios:
+            st.info("Aún no hay ejecución del presupuesto cargada para esta compañía.")
+            return
+        anio = st.selectbox("Año", anios, key="dot_cont_anio")
+        sap = leer("SELECT anio, mes, fecha, codigo, sub_rubro, cc_nombre, documento, tercero, texto, valor, clave "
+                   "FROM ejecucion WHERE empresa=? AND anio=? AND codigo='3.1'", (emp, int(anio)))
+        clasif = leer("SELECT tipo, llave, concepto FROM dotacion_contable WHERE empresa=?", (emp,)).fillna("")
+        ppto = leer("SELECT * FROM dotacion_ppto WHERE empresa=? AND anio=?", (emp, int(anio)))
+        directos, inv = dotacion.contables(sap, clasif, ppto)
+        rubro = sap[sap["sub_rubro"].map(dotacion.es_rubro_dotacion)]
+        if rubro.empty:
+            st.info("La ejecución de este año no trae registros de los rubros 3.1 de dotación ni de seguridad en el "
+                    "trabajo.")
+            return
+        por_o = directos.groupby("origen")["valor"].sum() if not directos.empty else pd.Series(dtype=float)
+        st.html(E.kpis([
+            dict(label="Rubros 3.1 en la ejecución", valor=E.millones(rubro["valor"].sum()),
+                 sub=f"{len(rubro)} registros", icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
+            dict(label="Salidas de inventario", valor=E.millones(inv["valor"].sum()),
+                 sub="Ya están en el kárdex: no se suman", icono="check", color=E.AZUL, fondo=E.AZUL_SUAVE),
+            dict(label="Directos al costo clasificados", valor=E.millones(
+                por_o.get(dotacion.ORIGEN_MANUAL, 0.0) + por_o.get(dotacion.ORIGEN_DIRECTO, 0.0)),
+                 sub=f"A mano {E.millones(por_o.get(dotacion.ORIGEN_MANUAL, 0.0))} · sugeridos "
+                     f"{E.millones(por_o.get(dotacion.ORIGEN_DIRECTO, 0.0))}", icono="wallet", color=E.VERDE,
+                 fondo=E.VERDE_SUAVE),
+            dict(label="Sin clasificar", valor=E.millones(por_o.get(dotacion.ORIGEN_PEND, 0.0)),
+                 sub="Suman en 'Sin cruce / sin clasificar'", icono="alert",
+                 color=E.ROJO if por_o.get(dotacion.ORIGEN_PEND, 0.0) else E.VERDE,
+                 fondo=E.ROJO_SUAVE if por_o.get(dotacion.ORIGEN_PEND, 0.0) else E.VERDE_SUAVE),
+        ]))
+        if directos.empty:
+            st.success("Todos los registros de estos rubros son salidas de inventario.")
+            return
+        opciones = [dotacion.EXCLUIR] + sorted(ppto["articulo"].unique())
+        por_clave = {dotacion.clave(o): o for o in opciones}
+
+        st.markdown("**Clasificación por grupo** · un grupo es el mismo tercero con el mismo texto (sin fechas): lo "
+                    "que elijas se guarda como regla y se aplica sola en las próximas cargas.")
+        ver = st.segmented_control("Mostrar", ["Pendientes y sugeridos", "Todos"], default="Pendientes y sugeridos",
+                                   key="dot_cont_ver") or "Pendientes y sugeridos"
+        g = directos.groupby("patron").agg(
+            tercero=("tercero", "first"), texto=("detalle", "first"), rubro=("sub_rubro", "first"),
+            registros=("valor", "size"), meses=("mes", lambda m: ", ".join(MESES[int(x) - 1] for x in sorted(set(m)))),
+            valor=("valor", "sum"), origen=("origen", lambda o: " / ".join(sorted(set(o)))),
+            concepto=("concepto", "first"), estado=("estado", "first")).reset_index()
+        g["concepto"] = [por_clave.get(dotacion.clave(c)) if e_ != "sin_clasificar" else None
+                         for c, e_ in zip(g["concepto"], g["estado"])]
+        g["confirmar"] = g["origen"].eq(dotacion.ORIGEN_MANUAL)
+        if ver != "Todos":
+            g = g[~g["origen"].eq(dotacion.ORIGEN_MANUAL)]
+        g = g.sort_values("valor", ascending=False, key=abs).reset_index(drop=True)
+        if g.empty:
+            st.success("No hay grupos pendientes ni sugeridos: todo está clasificado a mano.")
+        else:
+            ed = st.data_editor(
+                g[["confirmar", "concepto", "texto", "valor", "tercero", "registros", "meses", "origen", "rubro"]],
+                hide_index=True, width="stretch", key=f"dot_cont_ed_{anio}_{ver}",
+                disabled=["tercero", "texto", "rubro", "registros", "meses", "valor", "origen"],
+                column_config={
+                    "confirmar": st.column_config.CheckboxColumn("Guardar", help="Marca los grupos cuya clasificación "
+                                                                 "quieres guardar (también se guardan los que cambies)"),
+                    "tercero": st.column_config.TextColumn("Tercero", width="medium"),
+                    "texto": st.column_config.TextColumn("Texto (ejemplo)", width="medium"),
+                    "rubro": "Rubro", "registros": st.column_config.NumberColumn("Registros", format="%d"),
+                    "meses": "Meses", "valor": st.column_config.NumberColumn("Valor", format="accounting"),
+                    "origen": "Origen actual",
+                    "concepto": st.column_config.SelectboxColumn("Concepto del presupuesto", options=opciones,
+                                                                 width="large")})
+            c1, c2 = st.columns([1, 1.4])
+            if c1.button("Guardar clasificación", type="primary", key="dot_cont_ok"):
+                pares = []
+                for i, r in ed.iterrows():
+                    cambio = (r["concepto"] or None) != (g.at[i, "concepto"] or None)
+                    if cambio or (r["confirmar"] and not g.at[i, "confirmar"]):
+                        pares.append((g.at[i, "patron"], r["concepto"] if isinstance(r["concepto"], str) else None))
+                _guardar_contable(con, emp, "patron", pares)
+                con.commit()
+                ctx.registrar_carga(usuario, "Dotación contable", "", f"{emp} · {len(pares)} grupos clasificados")
+                st.session_state["dot_cont_msg"] = f"{len(pares)} grupos guardados."
+                st.rerun()
+            sug = g[g["origen"].eq(dotacion.ORIGEN_DIRECTO) & g["concepto"].notna()]
+            if len(sug) and c2.button(f"Confirmar las {len(sug)} sugerencias tal como están", key="dot_cont_todas"):
+                _guardar_contable(con, emp, "patron", list(zip(sug["patron"], sug["concepto"])))
+                con.commit()
+                ctx.registrar_carga(usuario, "Dotación contable", "", f"{emp} · {len(sug)} sugerencias confirmadas")
+                st.session_state["dot_cont_msg"] = f"{len(sug)} sugerencias confirmadas."
+                st.rerun()
+        if st.session_state.get("dot_cont_msg"):
+            st.success(st.session_state.pop("dot_cont_msg"))
+        st.caption("Origen: 'Registro contable directo al costo' = la app sugirió el concepto por las palabras del "
+                   "texto (ya suma así en el módulo; revísalo y confírmalo); 'Clasificado manualmente' = lo guardaste "
+                   "tú; 'Sin clasificar' = no se encontró concepto. '(No comparar)' lo saca del análisis.")
+
+        with st.expander("Clasificar registro por registro (cuando un grupo mezcla conceptos)"):
+            buscar = st.text_input("Buscar", placeholder="Tercero o texto…", key="dot_cont_buscar")
+            d = directos.copy()
+            if buscar:
+                d = d[(d["tercero"] + " " + d["detalle"]).str.contains(buscar, case=False, regex=False)]
+            d = d.sort_values(["mes", "valor"], ascending=[True, False]).head(400).reset_index(drop=True)
+            d["concepto_ed"] = [por_clave.get(dotacion.clave(c)) if e_ != "sin_clasificar" else None
+                                for c, e_ in zip(d["concepto"], d["estado"])]
+            ed2 = st.data_editor(
+                d[["concepto_ed", "detalle", "valor", "fecha", "tercero", "cc", "origen"]], hide_index=True,
+                width="stretch", key=f"dot_cont_reg_{anio}_{buscar}",
+                disabled=["fecha", "tercero", "detalle", "cc", "valor", "origen"],
+                column_config={"fecha": "Fecha", "tercero": "Tercero",
+                               "detalle": st.column_config.TextColumn("Texto", width="large"),
+                               "cc": "Centro de costo", "valor": st.column_config.NumberColumn("Valor", format="accounting"),
+                               "origen": "Origen", "concepto_ed": st.column_config.SelectboxColumn(
+                                   "Concepto del presupuesto", options=opciones, width="large")})
+            if st.button("Guardar registros", key="dot_cont_reg_ok"):
+                pares = [(d.at[i, "clave"], r["concepto_ed"] if isinstance(r["concepto_ed"], str) else None)
+                         for i, r in ed2.iterrows() if (r["concepto_ed"] or None) != (d.at[i, "concepto_ed"] or None)]
+                _guardar_contable(con, emp, "registro", pares)
+                con.commit()
+                ctx.registrar_carga(usuario, "Dotación contable", "", f"{emp} · {len(pares)} registros clasificados")
+                st.session_state["dot_cont_msg"] = f"{len(pares)} registros guardados."
+                st.rerun()
+            st.caption("Un registro clasificado aquí manda sobre la regla de su grupo. Se muestran hasta 400 registros: "
+                       "usa el buscador para encontrar los demás.")
+
+
+
+
 # ------------------------------------------------------------------ cartera de usuarios
 def _cargar_cartera(ctx):
     con, leer, usuario, emp = ctx.con, ctx.leer, ctx.usuario, ctx.empresa
@@ -1978,124 +2559,68 @@ def _cargar_cartera(ctx):
                 st.rerun()
 
 
-def _sispo_validar(contenido: bytes):
-    """Lee el SISPO con el lector único y devuelve (análisis, error). Exige lo que necesitan Mantenimiento y Operaciones."""
-    try:
-        d = L.sispo_leer(io.BytesIO(contenido))
-        sispo_oper.leer(io.BytesIO(contenido))                      # Operaciones exige además Grupo, IdKardex y Codigo Articulo
-    except Exception as e:
-        return None, str(e)
-    lin, info = L.sispo_filtrar(d, L.SISPO_CUENTAS)
-    return dict(d=d, info=info, periodos=L.sispo_periodos(lin), empresa=L.sispo_empresa_probable(lin) if len(lin) else None), None
-
-
-def _cargar_sispo(ctx):
-    """SISPO del mes: se carga y se guarda UNA vez aquí; Mantenimiento y Operaciones lo toman de lo guardado."""
-    with st.container(key="card_adm_sispo"):
-        titulo_tarjeta("SISPO del mes", "Un solo archivo alimenta Mantenimiento y Operaciones. Cargar otro del mismo mes y compañía lo reemplaza.")
-        g = sispo_fuente.listar(ctx.leer)
-        if g.empty:
-            st.caption("Todavía no hay SISPO guardado.")
-        else:
-            st.dataframe(g.assign(tamano=(g["tamano"] / 1024 / 1024).round(2)), hide_index=True, width="stretch", column_config={
-                "empresa": "Compañía", "periodo": st.column_config.NumberColumn("Periodo", format="%d"), "archivo": "Archivo",
-                "usuario": "Usuario", "fecha": "Cargado", "tamano": st.column_config.NumberColumn("MB", format="%.2f")})
-        f = st.file_uploader("SISPO del mes (.xlsx)", type=["xlsx"], key="adm_sispo_up")
-        if f:
-            contenido = f.getvalue()
-            llave = (f.name, len(contenido))
-            memo = st.session_state.get("_adm_sispo_memo")
-            if memo and memo[0] == llave:
-                a, error = memo[1]
-            else:
-                with st.spinner("Leyendo el SISPO…"):
-                    a, error = _sispo_validar(contenido)
-                st.session_state["_adm_sispo_memo"] = (llave, (a, error))
-            if error:
-                st.error(f"No pude leer el SISPO: {error}")
-            elif a["info"]["en_cuenta"] == 0:
-                st.error("El SISPO no trae movimientos de las cuentas que usan Mantenimiento y Operaciones.")
-            else:
-                c1, c2, c3 = st.columns(3)
-                inferida = a["empresa"]
-                empresa = c1.selectbox("Compañía", list(EMPRESAS), index=list(EMPRESAS).index(inferida) if inferida else 0, key="adm_sispo_emp",
-                                       help="Se propone según «EmpresaAgencia» del archivo.")
-                bloqueos = []
-                if inferida and inferida != empresa:
-                    bloqueos.append(f"El archivo parece de {inferida}, pero elegiste {empresa}.")
-                periodo = None
-                if len(a["periodos"]) != 1:
-                    bloqueos.append("El SISPO debe traer un solo periodo de cierre; trae: " + (", ".join(map(str, a["periodos"])) or "ninguno") + ".")
-                else:
-                    periodo = int(a["periodos"][0])
-                    c2.metric("Periodo (cierre)", f"{MESES_L[periodo % 100 - 1].capitalize()} {periodo // 100}")
-                c3.metric("Registros", f"{a['info']['total']:,}".replace(",", "."))
-                for b in bloqueos:
-                    st.error(b, icon=":material/block:")
-                existe = periodo is not None and not g[(g["empresa"] == empresa) & (g["periodo"] == periodo)].empty
-                if st.button("Reemplazar el guardado" if existe else "Guardar SISPO", type="primary", icon=":material/upload:",
-                             disabled=bool(bloqueos), key="adm_sispo_guardar"):
-                    sispo_fuente.guardar(ctx.con, empresa, periodo, f.name, ctx.usuario, ahora().strftime("%Y-%m-%d %H:%M"), contenido)
-                    ctx.registrar_carga(ctx.usuario, "SISPO", f.name, f"{empresa} {periodo} · {a['info']['total']} registros")
-                    st.session_state.pop("_adm_sispo_memo", None)
-                    st.success("SISPO guardado. Mantenimiento y Operaciones lo toman de aquí.")
-                    st.rerun()
-        if not g.empty:
-            opciones = [f"{r.empresa} · {r.periodo}" for r in g.itertuples()]
-            c_sel, c_ok, c_btn = st.columns([2, 2, 1], vertical_alignment="bottom")
-            elegido = c_sel.selectbox("Archivo a quitar", opciones, key="adm_sispo_quitar")
-            ok = c_ok.checkbox("Confirmo quitar este archivo guardado", key="adm_sispo_quitar_ok",
-                               help="Solo borra el archivo guardado; lo ya aplicado en Mantenimiento y Operaciones no se toca.")
-            if c_btn.button("Quitar", icon=":material/delete:", disabled=not ok, key="adm_sispo_quitar_btn"):
-                emp, per_ = elegido.split(" · ")
-                sispo_fuente.borrar(ctx.con, emp, int(per_))
-                st.rerun()
-
-
-def _cargar_mantenimiento_operaciones(ctx):
-    """Todas las cargas de Mantenimiento y Operaciones en un solo lugar."""
-    s1, s2, s3 = st.tabs(["SISPO del mes", "Base maestra", "Presupuestos y datos base"], on_change="rerun", key="adm_mo")
-    with s1:
-        if s1.open:
-            _cargar_sispo(ctx)
-    with s2:
-        if s2.open:
-            with st.container(key="card_adm_maestra"):
-                titulo_tarjeta("Base maestra de referencias y conceptos", "Mantenimiento la usa para asignar concepto a cada referencia del SISPO.")
-                mod_mantenimiento.admin_base_maestra(ctx)
-    with s3:
-        if s3.open:
-            with st.container(key="card_adm_mo_datos"):
-                titulo_tarjeta("Mantenimiento · placas, presupuesto de flota, histórico y Tecnomecánica/SOAT")
-                mod_mantenimiento.admin_datos_base(ctx)
-            with st.container(key="card_adm_op_ppto"):
-                titulo_tarjeta("Operaciones · libro «3.1 operaciones»", "Se carga por compañía.")
-                for tab, e in zip(st.tabs([f"{e} · {EMPRESAS[e]}" for e in EMPRESAS]), EMPRESAS):
-                    with tab:
-                        operaciones.admin_presupuesto(ctx, e)
-
-
 def mostrar(ctx):
     con, leer, usuario, registrar_carga = ctx.con, ctx.leer, ctx.usuario, ctx.registrar_carga
     anio = (leer("SELECT MAX(anio) a FROM presupuesto")["a"][0] or datetime.now().year)
     st.html(E.encabezado("Administración", "Carga de archivos, asignación por gerencia, historial y respaldo", []))
-    t1, t2, t6, t8, t3, t9, t5, t4 = st.tabs(["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera",
-                                              "Combustible", "Mantenimiento y Operaciones", "Nómina",
-                                              "Historial y respaldo"], on_change="rerun", key="adm_tabs")
-    with t6:
-        if t6.open:   # solo se calcula la pestaña abierta
-            _empresa_adm(ctx)
-            _cargar_eeff(ctx)
+    t1, t2, t6, t8, t3, t9, t11, t5, t7, t10, t4 = st.tabs(
+        ["Presupuesto", "Flujo de caja", "Estados financieros", "Cartera", "Combustible", "Mantenimiento y Operaciones",
+         "Corte y poda", "Nómina", "Dotación y EPP", "Presentación", "Historial y respaldo"],
+        on_change="rerun", key="adm_tabs")
+    with t11:
+        if t11.open:   # solo se calcula la pestaña abierta
+            import mod_corte_poda
+            mod_corte_poda.admin_cargas(ctx)
+    with t10:
+        if t10.open:   # solo se calcula la pestaña abierta
+            _presentacion(ctx)
+    with t9:
+        if t9.open:   # solo se calcula la pestaña abierta
+            import admin_operacion
+            admin_operacion.cargas(ctx)
     with t8:
         if t8.open:   # solo se calcula la pestaña abierta
             _empresa_adm(ctx)
             _cargar_cartera(ctx)
+    with t7:
+        if t7.open:   # solo se calcula la pestaña abierta
+            v1, v2 = st.tabs(["Dotación 1", "Dotación 2"], on_change="rerun", key="adm_dot_version")
+            with v2:
+                if v2.open:
+                    import admin_operacion
+                    admin_operacion.cargar_dotacion2(ctx)
+            with v1:
+                if v1.open:
+                    _empresa_adm(ctx)
+                    d1, d2, d4, d3 = st.tabs(["Ejecución mensual", "Cruce de artículos", "Ejecución contable",
+                                             "Presupuesto"], on_change="rerun", key="adm_dot")
+                    with d4:
+                        if d4.open:
+                            _contable_dotacion(ctx)
+                    with d1:
+                        if d1.open:
+                            _cargar_dotacion_ejec(ctx)
+                    with d2:
+                        if d2.open:
+                            _cruce_dotacion(ctx)
+                    with d3:
+                        if d3.open:
+                            _cargar_dotacion(ctx)
+    with t6:
+        if t6.open:   # solo se calcula la pestaña abierta
+            _empresa_adm(ctx)
+            _cargar_eeff(ctx)
     with t5:
         if t5.open:   # solo se calcula la pestaña abierta
-            n1, n2 = st.tabs(["Cargar archivos", "Homologar cargos"], on_change="rerun", key="adm_nom")
+            n1, n3, n2 = st.tabs(["Cargar archivos", "Sin homologar", "Homologar cargos"], on_change="rerun",
+                                 key="adm_nom")
             with n1:
                 if n1.open:
                     _cargar_nomina(ctx)
+            with n3:
+                if n3.open:
+                    import mod_nomina
+                    mod_nomina.sin_homologar_admin(ctx)
             with n2:
                 if n2.open:
                     _homologar_cargos(ctx)
@@ -2132,10 +2657,6 @@ def mostrar(ctx):
     with t3:
         if t3.open:   # solo se calcula la pestaña abierta
             _cargar_combustible(ctx)
-
-    with t9:
-        if t9.open:   # solo se calcula la pestaña abierta
-            _cargar_mantenimiento_operaciones(ctx)
 
     with t4:
         if t4.open:   # solo se calcula la pestaña abierta
