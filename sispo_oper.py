@@ -205,22 +205,24 @@ def mapa_items(filas) -> dict:
 
 def hojas_de_items(ppto: pd.DataFrame) -> dict:
     """{ítem canónico: hoja} según las listas del presupuesto cargado, solo para Consumibles y Herramientas. Un ítem que aparezca en
-    las dos hojas es ambiguo y se omite (esa referencia queda con la regla por Grupo)."""
+    las dos hojas es ambiguo: queda con hoja "" (está presupuestado, pero esa referencia sigue con la regla por Grupo)."""
     if ppto is None or ppto.empty:
         return {}
     p = ppto[ppto["hoja"].isin([HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS])]
     por = p.assign(k=p["item"].map(L._canon)).groupby("k")["hoja"].agg(lambda s: set(s))
-    return {k: next(iter(h)) for k, h in por.items() if k and len(h) == 1}
+    return {k: (next(iter(h)) if len(h) == 1 else "") for k, h in por.items() if k}
 
 
 def hoja_por_item(lin: pd.DataFrame, mapa: dict, item_hoja: dict) -> pd.DataFrame:
     """La lista de ítems del presupuesto manda sobre el Grupo del SISPO: una referencia con equivalencia a un ítem que está presupuestado
-    en Consumibles o en Herramientas va a esa hoja. Solo mueve líneas que ya están en Consumibles/Herramientas (cuenta OTROS: son las que
-    SAP carga como genérico); no toca Papelería ni Bolsas. Se aplica al mostrar, sin volver a cargar el SISPO."""
+    en Consumibles o en Herramientas va a esa hoja; la que NO cruza con el presupuesto (sin ítem o ítem no presupuestado) va a
+    Herramientas, que es donde se muestra, unificado, lo que no tiene presupuesto. Así Consumibles solo queda con lo que cruza y nada se
+    duplica. Solo mueve líneas que ya están en Consumibles/Herramientas (cuenta OTROS: son las que SAP carga como genérico); no toca
+    Papelería ni Bolsas. Se aplica al mostrar, sin volver a cargar el SISPO."""
     if lin is None or lin.empty or not item_hoja:
         return lin
     item = lin["item_res"] if "item_res" in lin else lin["codigo"].map(lambda c: mapa.get(str(c), ""))
-    nueva = item.map(lambda i: item_hoja.get(L._canon(i), "") if i else "")
+    nueva = item.map(lambda i: item_hoja.get(L._canon(i), HOJA_HERRAMIENTAS) if i else HOJA_HERRAMIENTAS)   # "" = presupuestado en ambas hojas
     mueve = lin["hoja"].isin([HOJA_CONSUMIBLES, HOJA_HERRAMIENTAS]) & (nueva != "") & (nueva != lin["hoja"])
     return lin.assign(hoja=lin["hoja"].where(~mueve, nueva))
 

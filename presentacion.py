@@ -1820,6 +1820,12 @@ def _diap_operativo_items(prs, base, leer, empresa, anio, mes, R):
         g = g[(g["presupuesto"] != 0) | (g["ejecutado"] != 0)].copy()
         g["item"] = g["item"].astype(str).str.replace(" · sin ítem", "", regex=False)
         g["item"] = g["item"].str.strip().replace({"": "(ítem sin nombre)", "nan": "(ítem sin nombre)"})
+        if h == "Herramientas":             # igual que la pantalla: lo que no tiene presupuesto va junto en una sola fila
+            sp = (g["presupuesto_esc"] <= 0) & (g["item"] != OP.SIN_ITEM_SAP)
+            if sp.any():
+                junto = pd.DataFrame([dict(item=OP.SIN_PRESUPUESTO, presupuesto=0.0, presupuesto_esc=0.0, ejecutado=g.loc[sp, "ejecutado"].sum(),
+                                           variacion=g.loc[sp, "variacion"].sum(), pct=float("nan"))])
+                g = pd.concat([g[~sp], junto], ignore_index=True)
         return g if g["ejecutado"].sum() >= 1 else None
 
     g, gb = limpio("Herramientas"), limpio("Bolsas")

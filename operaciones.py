@@ -32,6 +32,8 @@ HOJAS = [OS.HOJA_PAPELERIA, OS.HOJA_CONSUMIBLES, OS.HOJA_HERRAMIENTAS, OS.HOJA_O
 RAIZ_HOJA = {"PAPELERIA": "Papelería", "CONSUMIBLE": "Consumibles", "HERRAMIENTA": "Herramientas", "BOLSA": "Bolsas"}   # sub-rubros de SAP
 RAIZ_LIBRO = {**RAIZ_HOJA, "OTROS": "Bolsas"}                    # nombres de hoja del libro (acepta «Bolsas» u «Otros»)
 SIN_HOJA = OS.SIN_HOJA
+SIN_PRESUPUESTO = "Otros artículos sin presupuesto"          # fila que reúne los ítems sin presupuesto (viven en Herramientas)
+SIN_ITEM_SAP = "Otros movimientos de SAP (sin ítem)"
 TODAS = "Consolidado"
 
 TABLAS = """
@@ -439,7 +441,7 @@ def _items(S, hoja: str) -> pd.DataFrame:
         g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0.0).astype(float)
     sap = float(e.loc[~es_s, "valor"].sum())
     if abs(sap) >= 0.5:
-        g = pd.concat([g, pd.DataFrame([dict(item="Otros movimientos de SAP (sin ítem)", cantidad=0.0, presupuesto_esc=0.0,
+        g = pd.concat([g, pd.DataFrame([dict(item=SIN_ITEM_SAP, cantidad=0.0, presupuesto_esc=0.0,
                                              presupuesto=0.0, ejecutado=sap)])], ignore_index=True)
     g["costo_unit"] = g["presupuesto_esc"] / g["cantidad"].where(g["cantidad"] > 0)
     tot = g["presupuesto_esc"].sum()
@@ -775,11 +777,20 @@ def _graficos_costo(S):
 
 
 def _filas_items(it: pd.DataFrame, tope: int | None = None) -> list[dict]:
-    """Ítems con presupuesto (al corte) o ejecución, de mayor a menor ejecutado, listos para `E.tabla_visual`. Las cifras son las de `_items`."""
+    """Ítems con presupuesto (al corte) o ejecución, de mayor a menor ejecutado, listos para `E.tabla_visual`. Las cifras son las de `_items`.
+    Los ítems SIN presupuesto en el escenario se unifican en una sola fila «Otros artículos sin presupuesto» (al final), que se abre en esos
+    ítems; el movimiento de SAP sin ítem va aparte."""
     g = it[(it["presupuesto"] > 0) | (it["ejecutado"] > 0)].sort_values(["ejecutado", "presupuesto"], ascending=False)
+    sin = (g["presupuesto_esc"] <= 0) & (g["item"] != SIN_ITEM_SAP)
+    filas = lambda d: [dict(nombre=r.item, presupuesto=float(r.presupuesto), ejecutado=float(r.ejecutado)) for r in d.itertuples()]
+    con, sp, sap = g[~sin & (g["item"] != SIN_ITEM_SAP)], g[sin], g[g["item"] == SIN_ITEM_SAP]
     if tope:
-        g = g.head(tope)
-    return [dict(nombre=r.item, presupuesto=float(r.presupuesto), ejecutado=float(r.ejecutado)) for r in g.itertuples()]
+        con = con.head(tope)
+    out = filas(con)
+    if len(sp):
+        out.append(dict(nombre=SIN_PRESUPUESTO, presupuesto=float(sp["presupuesto"].sum()), ejecutado=float(sp["ejecutado"].sum()),
+                        sub=f"{len(sp)} ítems", hijos=filas(sp)))
+    return out + filas(sap)
 
 
 def _participacion(pares: list[tuple], titulo: str, formato=None):
@@ -1507,7 +1518,7 @@ def _items_mes(S, hoja: str) -> dict:
         e = pd.Series(dtype=float)
     filas = []
     for item in it["item"]:
-        k = "__SAP__" if item == "Otros movimientos de SAP (sin ítem)" else L._canon(item)
+        k = "__SAP__" if item == SIN_ITEM_SAP else L._canon(item)
         filas.append((item, [float(p.get((k, m), 0.0)) for m in meses],
                       [float(e.get((k, m), 0.0)) if m <= S.hasta_mes else None for m in meses]))
     return dict(meses=[f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}" for m in meses], filas=filas, n_corte=S.hasta_mes - S.m0 + 1)
