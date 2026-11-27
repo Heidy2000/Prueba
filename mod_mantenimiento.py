@@ -3065,13 +3065,17 @@ def _tab_contenedores(S):
     vista = t.assign(Mes=t["mes"].map(lambda m: "Total" if m == 0 else f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}"))
     with st.container(key="mt_card_cont_tabla"):
         titulo_tarjeta("Contenedores · presupuesto vs ejecutado", f"{S.escenario} · ejecutado {S.hasta}")
-        st.dataframe(vista[["Mes", "presupuesto", "ejecutado", "saldo", "pct"]], hide_index=True, width="stretch",
-                     height=40 + 35 * len(vista), column_config={
-                         "Mes": "Mes",
-                         "presupuesto": st.column_config.NumberColumn("Presupuesto asignado", format="accounting"),
-                         "ejecutado": st.column_config.NumberColumn("Valor ejecutado", format="accounting"),
-                         "saldo": st.column_config.NumberColumn("Saldo disponible", format="accounting"),
-                         "pct": st.column_config.NumberColumn("% de ejecución", format="percent")})
+        meses = vista[vista["mes"] != 0]
+        st.html(E.tabla_visual([dict(nombre=r.Mes, presupuesto=r.presupuesto, ejecutado=r.ejecutado) for r in meses.itertuples()], "Mes"))
+        st.caption("Barra: relleno = lo ejecutado, marca = lo presupuestado del mes.")
+        with st.expander("Ver como tabla", icon=":material/table:"):
+            st.dataframe(vista[["Mes", "presupuesto", "ejecutado", "saldo", "pct"]], hide_index=True, width="stretch",
+                         height=40 + 35 * len(vista), column_config={
+                             "Mes": "Mes",
+                             "presupuesto": st.column_config.NumberColumn("Presupuesto asignado", format="accounting"),
+                             "ejecutado": st.column_config.NumberColumn("Valor ejecutado", format="accounting"),
+                             "saldo": st.column_config.NumberColumn("Saldo disponible", format="accounting"),
+                             "pct": st.column_config.NumberColumn("% de ejecución", format="percent")})
     with st.container(key="mt_card_cont_graf"):
         titulo_tarjeta("Mes a mes", "Presupuesto vs valor ejecutado (millones de pesos)")
         _grafico_ts_mensual(S, pc, ec)
