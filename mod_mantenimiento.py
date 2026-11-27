@@ -17,7 +17,9 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
-from ui import EMPRESAS, MESES, MESES_L, a_excel, ahora, estilo_grafico, figura_ppto_ejec_empresas, texto_periodo, titulo_tarjeta
+import presupuestos as P
+from ui import (EMPRESAS, MESES, MESES_L, a_db, a_excel, ahora, estilo_grafico, excel_hojas, exigir_admin, figura_ppto_ejec_empresas,
+                insertar_por_lotes, selector_escenario, texto_periodo, titulo_tarjeta, version_elegida)
 
 # Estado que dejó la prueba de octubre 2026 en `mtto_sispo_periodo` (aplicado sin conciliar con SAP). Ya no se puede generar: solo
 # sirve para reconocer esos registros heredados, excluirlos de los cálculos y avisar que hay que revertirlos y volver a aplicar.
@@ -77,17 +79,10 @@ def _asegurar_tablas(ctx):
             for c, tipo in cols.items():
                 if c not in existentes:
                     ctx.con.execute(f"ALTER TABLE {tabla} ADD COLUMN {c} {tipo}")
+        for antes, ahora_ in P.ESCENARIO_ANTERIOR.items():             # «UPA 2026» pasó a llamarse «Presupuesto 8+4»
+            ctx.con.execute("UPDATE mtto_ppto SET escenario=? WHERE escenario=?", (ahora_, antes))
         ctx.con.commit()
         st.session_state["_mtto_tablas7"] = True
-
-
-def _version_para(ctx, empresa, anio, preferida=None):
-    vs = ctx.leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?", (int(anio), empresa))["version"].tolist()
-    orden = {"Inicial": 0, "4+8": 1, "8+4": 2}
-    vs = sorted(vs, key=lambda v: (orden.get(v, 9), v))
-    if preferida in vs:
-        return preferida
-    return "8+4" if "8+4" in vs else (vs[-1] if vs else "Inicial")
 
 
 def _base(ctx, empresa, anio, version):
@@ -145,7 +140,7 @@ def _datos_empresa(ctx, empresa: str, cfg: dict, asig) -> SimpleNamespace:
     """Todo lo de UNA compañía: presupuesto base, ejecución, presupuesto de flota y de Tecnomecánica/SOAT. Cada compañía se
     carga y se lee por separado; sus movimientos salen marcados con su compañía."""
     leer = ctx.leer
-    version = _version_para(ctx, empresa, cfg["anio"])
+    version = P.version_para(leer, empresa, cfg["anio"], cfg.get("version"))
     ppto_base, ejec = _base(ctx, empresa, cfg["anio"], version)
     ppto = leer("SELECT empresa, placa, numero_interno, tipo, concepto, orden, valor, es_global, texto_original FROM mtto_ppto "
                 "WHERE empresa=? AND escenario=?", (empresa, cfg["escenario"]))
@@ -784,22 +779,8 @@ def _html_generales(S, g: pd.DataFrame, mov_gen: pd.DataFrame, abrir: set) -> st
 
 
 # ================================================================== reasignar y eliminar movimientos
-def _insertar_por_lotes(ctx, sql_cols: str, filas: list[tuple], lote=100):
-    """INSERT multi-fila en lotes (menos viajes a la base que uno por fila; lote × columnas < 999 variables)."""
-    if not filas:                                       # nada que insertar (p. ej. una cuenta aplicada sin movimientos de SAP que reemplazar)
-        return
-    n = len(filas[0])
-    for i in range(0, len(filas), lote):
-        parte = filas[i:i + lote]
-        ctx.con.execute(f"INSERT INTO {sql_cols} VALUES " + ",".join(["(" + ",".join("?" * n) + ")"] * len(parte)),
-                        tuple(v for f in parte for v in f))
 
 
-def _exigir_admin(ctx):
-    """Candado de permisos en la LÓGICA (no solo en la pantalla): toda escritura en la base y toda exportación con detalle de
-    movimientos exige administrador. Si un usuario normal llegara a ejecutar la función por otra ruta, se detiene aquí."""
-    if not getattr(ctx, "es_admin", False):
-        raise PermissionError("Acción reservada a administradores.")
 
 
 def _sin_prefijo(empresa: str, llave: str) -> str:
@@ -808,7 +789,7 @@ def _sin_prefijo(empresa: str, llave: str) -> str:
 
 def _registrar_log(ctx, log: list[dict], ahora_txt: str):
     if log:
-        _insertar_por_lotes(ctx, "mtto_clasif_log(empresa, fecha, usuario, llave, texto, valor, concepto_antes, "
+        insertar_por_lotes(ctx, "mtto_clasif_log(empresa, fecha, usuario, llave, texto, valor, concepto_antes, "
                                  "concepto_despues, placa_antes, placa_despues, accion, motivo)",
                             [(g["empresa"], ahora_txt, ctx.usuario, g["llave"], g["texto"], float(g["valor"]), g["concepto_antes"],
                               g["concepto_despues"], g["placa_antes"], g["placa_despues"], g["accion"], g.get("motivo", ""))
@@ -819,7 +800,7 @@ def _guardar_overrides(ctx, filas: list[dict], quitar: list[tuple], log: list[di
     """Guarda reasignaciones manuales y deja el rastro. Cada fila: empresa, llave, concepto ('' = el automático), placa
     ('' = la detectada), texto_tipo (para aprender), tercero. `quitar`: lista de (empresa, llave) que vuelven a automático.
     Una reasignación nueva REEMPLAZA la anterior del mismo movimiento (una sola fila por movimiento): no se duplica nada."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     por_empresa: dict[str, set] = {}
     for f in filas:
         por_empresa.setdefault(f["empresa"], set()).add(f["llave"])
@@ -833,7 +814,7 @@ def _guardar_overrides(ctx, filas: list[dict], quitar: list[tuple], log: list[di
                             + ",".join("?" * len(parte)) + ")", (e, *parte))
     ahora_txt = ahora().strftime("%Y-%m-%d %H:%M")
     if filas:
-        _insertar_por_lotes(ctx, "mtto_clasif_manual(empresa, llave, concepto, texto_tipo, tercero, origen, usuario, fecha, placa)",
+        insertar_por_lotes(ctx, "mtto_clasif_manual(empresa, llave, concepto, texto_tipo, tercero, origen, usuario, fecha, placa)",
                             [(f["empresa"], f["llave"], f["concepto"], f["texto_tipo"], L.norm_texto(f["tercero"]), "Manual",
                               ctx.usuario, ahora_txt, f["placa"]) for f in filas], lote=100)
     _registrar_log(ctx, log or [], ahora_txt)
@@ -845,7 +826,7 @@ def _guardar_overrides(ctx, filas: list[dict], quitar: list[tuple], log: list[di
 def _excluir(ctx, filas: list[dict], motivo: str):
     """Elimina movimientos de la vista SIN borrarlos de la ejecución: quedan en mtto_excluidos (con su texto, valor y
     motivo) y en el historial. Como se excluyen por su llave, no reaparecen cuando se vuelva a cargar la ejecución."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     ahora_txt = ahora().strftime("%Y-%m-%d %H:%M")
     por_empresa: dict[str, list] = {}
     for f in filas:
@@ -855,7 +836,7 @@ def _excluir(ctx, filas: list[dict], motivo: str):
             parte = llaves[i:i + 200]
             ctx.con.execute("DELETE FROM mtto_excluidos WHERE empresa=? AND llave IN (" + ",".join("?" * len(parte)) + ")",
                             (e, *parte))
-    _insertar_por_lotes(ctx, "mtto_excluidos(empresa, llave, fecha_mov, documento, tercero, texto, valor, concepto, placa, "
+    insertar_por_lotes(ctx, "mtto_excluidos(empresa, llave, fecha_mov, documento, tercero, texto, valor, concepto, placa, "
                              "motivo, usuario, fecha)",
                         [(f["empresa"], f["llave"], str(f["fecha"])[:10], str(f["documento"] or ""), str(f["tercero"] or ""),
                           str(f["texto"] or "")[:500], float(f["valor"]), f["concepto"], f["placa"], motivo, ctx.usuario, ahora_txt)
@@ -869,7 +850,7 @@ def _excluir(ctx, filas: list[dict], motivo: str):
 
 
 def _restaurar(ctx, filas: list[dict]):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     ahora_txt = ahora().strftime("%Y-%m-%d %H:%M")
     por_empresa: dict[str, list] = {}
     for f in filas:
@@ -950,7 +931,7 @@ def _reclasificacion(S):
     cambia concepto y placa, o elimina con confirmación. Nada se borra de la ejecución cargada."""
     with st.expander("Reclasificación de movimientos · todas las compañías", icon=":material/edit_note:",
                      expanded=bool(st.session_state.get("mt_del_pend"))):
-        st.caption(f"Todos los movimientos de {' y '.join(EMPRESAS)} del escenario **{S.escenario}** {S.hasta}, clasificados o pendientes. "
+        st.caption(f"Todos los movimientos de {' y '.join(EMPRESAS)} con el **{S.escenario}** {S.hasta}, clasificados o pendientes. "
                    "Cada uno muestra su compañía, placa, concepto, texto original y clasificación (Placas / Generales / "
                    "Tecnomecánica / SOAT). "
                    + ("Cambia el **concepto** (eso define la clasificación) y/o la **placa**, o marca **Eliminar**. El texto original "
@@ -1159,7 +1140,7 @@ def _memoria(S):
     borrar = ed[ed["olvidar"]]
     if es_admin and st.button(f"Olvidar {len(borrar)} entradas", icon=":material/delete:", key="mt_mem_borrar",
                               disabled=borrar.empty):
-        _exigir_admin(ctx)
+        exigir_admin(ctx)
         for r in borrar.itertuples():
             ctx.con.execute("DELETE FROM mtto_clasif_manual WHERE origen=? AND texto_tipo=? AND tercero=? AND concepto=?",
                             (r.origen, r.texto_tipo, r.tercero, r.concepto))
@@ -1222,7 +1203,7 @@ def _reglas(S, reglas, sin_guardar):
 
 
 def _guardar_reglas(ctx, df: pd.DataFrame, catalogo: list[str]):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     df = df.dropna(how="all").copy()
     for c in ("patron", "proveedor", "observacion"):
         df[c] = df[c].fillna("").astype(str).str.strip()
@@ -1330,9 +1311,9 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     por placa y concepto se carga para TODO el escenario (no por mes); el del mes se obtiene prorrateando con el peso de ese mes en el
     presupuesto mensual del sub-rubro Flota (que sí es mensual). El «Resumen» por sub-rubro usa el presupuesto mensual real."""
     pr, er = _rubro_sel(S)
-    cfg = dict(S.cfg, etiqueta=str(S.escenario).split()[0])
+    cfg = dict(S.cfg, etiqueta=P.version_de_escenario(S.escenario) or "Normal")
     nombres, orden, p_, e_ = L.serie_subrubros(pr, er, cfg)
-    ppto_u = S.ppto_sel_anual                                                         # el del escenario completo: aquí se prorratea al `mes` pedido
+    ppto_u = S.ppto_sel_anual                                                         # el presupuesto total: aquí se prorratea al `mes` pedido
     if mes:                                                                           # placas y generales por el peso del mes; Tecno/SOAT ya son mensuales
         usuario_ = None if S.ver_todo else S.ctx.usuario
         ppto_u = pd.concat([_ppto_del_mes(S.datos_e[e], S.cfg, mes, S.asig, usuario_)[0] for e in S.sel], ignore_index=True)
@@ -1405,7 +1386,7 @@ def _excel_informe_reclasificado(S, mes: int = 0) -> bytes:
     por_mes = lambda d: {int(k): float(x) for k, x in d.groupby("mes")["valor"].sum().items()}
     origen = [("Salidas de inventario (SISPO, con detalle por referencia)", por_mes(mv[mv_s]), "Kardex de SISPO ya reclasificado por placa y concepto."),
               ("Otros movimientos de SAP (facturas, servicios…)", por_mes(mv[~mv_s]), "")]
-    sub = f"Escenario {S.escenario} · " + (f"solo {MESES_L[mes - 1]} · " if mes else "") + " y ".join(MESES_L[m - 1].capitalize() for m in meses) + " por separado · Valores en pesos"
+    sub = f"{S.escenario} · " + (f"solo {MESES_L[mes - 1]} · " if mes else "") + " y ".join(MESES_L[m - 1].capitalize() for m in meses) + " por separado · Valores en pesos"
     fn_resumen = lambda ws: L.hoja_resumen_mantenimiento(ws, "Ejecución vs presupuesto · Mantenimiento · " + ", ".join(S.sel), sub, meses, nombres,
                                                          orden, p_, e_, cfg, origen, [], None)
     return _excel_informe_meses(S2, t, g_gen, mp, mg, [], [], antes={"Resumen": pd.DataFrame()},      # el contenido lo escribe fn_resumen
@@ -1801,7 +1782,7 @@ def _tab_flota(S):
     t_cats = _df_categorias(cats)
     tot = t_cats.iloc[-1] if len(t_cats) else dict(presupuesto=0.0, ejecutado=0.0, movimientos=0)
     _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), int(tot["movimientos"]), S.hasta,
-          _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
+          _sub_pres(S, f"{S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
     mp, mg = _movs(S, L.AMB_PLACAS), _movs(S, L.AMB_GEN)
     pend = mp[mp["concepto"] == L.PENDIENTE]
     if not pend.empty:
@@ -1958,7 +1939,7 @@ def _ts_concepto(S, concepto: str, k: str):
     con = [n for n in nodos if n["presupuesto"] > 0]
     sin = [n for n in nodos if n["presupuesto"] <= 0]
     tp, te, tm = _totales(nodos)
-    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"{S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
 
     resumen = _resumen_grupos(nodos, lambda n: GRUPO_CON if n["presupuesto"] > 0 else GRUPO_SIN, total=True)
     orden = {GRUPO_CON: 0, GRUPO_SIN: 1, "Total": 2}
@@ -1995,15 +1976,12 @@ def _pesos2(c) -> str:
     return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _a_db(v):
-    """Valor listo para la base: NaN/NaT -> None."""
-    return None if (not isinstance(v, str) and pd.isna(v)) else (v.item() if hasattr(v, "item") else v)
 
 
 def _sispo_cargar_maestro(ctx, m: pd.DataFrame, reemplazar: bool, archivo: str):
     """Guarda la base maestra de referencias. Por defecto ACTUALIZA (agrega las nuevas y corrige el concepto de las existentes,
     sin tocar las demás); «reemplazar» deja solo lo que trae el archivo."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     ahora_txt = ahora().strftime("%Y-%m-%d %H:%M")
     if reemplazar:
         ctx.con.execute("DELETE FROM mtto_sispo_ref")
@@ -2011,7 +1989,7 @@ def _sispo_cargar_maestro(ctx, m: pd.DataFrame, reemplazar: bool, archivo: str):
         for i in range(0, len(m), 200):
             parte = list(m["codigo"].iloc[i:i + 200])
             ctx.con.execute("DELETE FROM mtto_sispo_ref WHERE codigo IN (" + ",".join("?" * len(parte)) + ")", tuple(parte))
-    _insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha, categoria, bodega)",
+    insertar_por_lotes(ctx, "mtto_sispo_ref(codigo, articulo, concepto, usuario, fecha, categoria, bodega)",
                         [(r.codigo, r.articulo, r.concepto, ctx.usuario, ahora_txt, r.categoria, r.bodega) for r in m.itertuples()])
     ctx.con.commit()
     ctx.registrar_carga(ctx.usuario, "Base maestra SISPO", archivo, f"{len(m)} referencias" + (" (reemplazo total)" if reemplazar else ""))
@@ -2029,12 +2007,12 @@ def _sispo_guardar_lineas(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.
     deja lo mismo, y reprocesar una cuenta no toca las demás."""
     cond, par = _cond_cuenta("cuenta_nombre", cuenta)
     ctx.con.execute(f"DELETE FROM mtto_sispo_lineas WHERE empresa=? AND periodo=? AND {cond}", (empresa, int(periodo), *par))
-    _insertar_por_lotes(ctx, "mtto_sispo_lineas(empresa, periodo, id_kardex, bodega, fecha_mov, codigo, articulo, cantidad, "
+    insertar_por_lotes(ctx, "mtto_sispo_lineas(empresa, periodo, id_kardex, bodega, fecha_mov, codigo, articulo, cantidad, "
                              "costo_unidad, costo_sin_iva, costo_con_iva, centro_costo, cc_codigo, cc_nombre, cuenta_nombre, placa, "
                              "placa_estado, concepto, concepto_estado, valor_sap)",
-                        [(empresa, int(periodo), r.id_kardex, r.bodega, _a_db(r.fecha_mov), r.codigo, r.articulo, _a_db(r.cantidad),
-                          _a_db(r.costo_unidad), _a_db(r.costo_sin_iva), _a_db(r.costo_con_iva), r.centro_costo, r.cc_codigo,
-                          r.cc_nombre, cuenta, r.placa, r.placa_estado, r.concepto, r.concepto_estado, _a_db(r.valor_sap))
+                        [(empresa, int(periodo), r.id_kardex, r.bodega, a_db(r.fecha_mov), r.codigo, r.articulo, a_db(r.cantidad),
+                          a_db(r.costo_unidad), a_db(r.costo_sin_iva), a_db(r.costo_con_iva), r.centro_costo, r.cc_codigo,
+                          r.cc_nombre, cuenta, r.placa, r.placa_estado, r.concepto, r.concepto_estado, a_db(r.valor_sap))
                          for r in lin.itertuples()], lote=40)
 
 
@@ -2043,7 +2021,7 @@ def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFra
     """Aplica (o reprocesa) la reclasificación de UNA cuenta de UN periodo. Idempotente: reemplaza lo aplicado antes para esa
     compañía, periodo y cuenta, sin tocar las otras cuentas. Solo se ejecuta si la conciliación cuadra (tolerancia de redondeo de $1) y si todo lo
     que se va a guardar es de esa cuenta; las validaciones se repiten aquí, no solo en la pantalla."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     if not conc["cuadra"]:
         raise ValueError(f"{cuenta}: el total de SISPO no coincide con el de SAP; no se aplica la reclasificación.")
     if len(lin) and lin["id_kardex"].astype(str).str.startswith(L.PREFIJO_ID_SINTETICO).any():
@@ -2060,7 +2038,7 @@ def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFra
     _sispo_guardar_lineas(ctx, empresa, periodo, cuenta, guardar)
     vacia = pd.Series("", index=sap.index)
     col = lambda c: (sap[c] if c in sap else vacia).fillna("")
-    _insertar_por_lotes(ctx, "mtto_sispo_reemplazados(empresa, periodo, llave, fecha_mov, documento, cc, texto, valor, gerencia, codigo, "
+    insertar_por_lotes(ctx, "mtto_sispo_reemplazados(empresa, periodo, llave, fecha_mov, documento, cc, texto, valor, gerencia, codigo, "
                              "cuenta, sub_rubro, sub_rubro_sap)",
                         [(empresa, int(periodo), str(l), str(f)[:10], str(d), str(c), str(t), float(v), str(g), str(k), cuenta, str(sr), str(ss))
                          for l, f, d, c, t, v, g, k, sr, ss in zip(col("llave"), col("fecha"), col("documento"), col("cc"), col("texto"),
@@ -2080,7 +2058,7 @@ def _sispo_aplicar(ctx, empresa: str, periodo: int, cuenta: str, lin: pd.DataFra
 
 def _sispo_revertir(ctx, empresa: str, periodo: int, cuenta: str):
     """Quita la reclasificación de UNA cuenta de un periodo: vuelven sus movimientos genéricos de SAP tal como estaban."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     for t, col in (("mtto_sispo_lineas", "cuenta_nombre"), ("mtto_sispo_reemplazados", "cuenta"), ("mtto_sispo_periodo", "cuenta")):
         cond, par = _cond_cuenta(col, cuenta)
         ctx.con.execute(f"DELETE FROM {t} WHERE empresa=? AND periodo=? AND {cond}", (empresa, int(periodo), *par))
@@ -2091,7 +2069,7 @@ def _sispo_revertir(ctx, empresa: str, periodo: int, cuenta: str):
 def _sispo_reasignar(ctx, empresa: str, periodo: int, cuenta: str, maestro: pd.DataFrame, catalogos: dict) -> tuple[int, int]:
     """Vuelve a cruzar las líneas YA aplicadas de una cuenta y periodo con la base maestra vigente (sin necesitar el SISPO otra
     vez). Los valores no cambian, solo el concepto; devuelve (líneas que cambiaron de concepto, pendientes que quedan)."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     cond, par = _cond_cuenta("cuenta_nombre", cuenta)
     lin = ctx.leer(f"SELECT * FROM mtto_sispo_lineas WHERE empresa=? AND periodo=? AND {cond}", (empresa, int(periodo), *par))
     if lin.empty:
@@ -2108,13 +2086,6 @@ def _sispo_reasignar(ctx, empresa: str, periodo: int, cuenta: str, maestro: pd.D
     return cambios, n_pend
 
 
-def _excel_simple(hojas: dict) -> bytes:
-    from io import BytesIO
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        for nombre, df in hojas.items():
-            df.to_excel(w, sheet_name=nombre[:31], index=False)
-    return buf.getvalue()
 
 
 def _excel_historico_sispo(ctx) -> bytes:
@@ -2145,7 +2116,7 @@ def _excel_historico_sispo(ctx) -> bytes:
     per = per.rename(columns={"empresa": "Compañía", "periodo": "Periodo", "cuenta": "Cuenta", "archivo": "Archivo", "usuario": "Usuario",
                               "fecha": "Aplicado", "n_lineas": "Salidas", "n_pendientes": "Pendientes", "valor_sispo": "Valor SISPO",
                               "valor_sap": "Valor SAP", "diferencia": "Diferencia", "estado": "Estado", "n_reemplazados": "Mov. SAP reemplazados"})
-    return _excel_simple({"Histórico SISPO": hist, "Resumen": res, "Periodos aplicados": per})
+    return excel_hojas({"Histórico SISPO": hist, "Resumen": res, "Periodos aplicados": per})
 
 
 def _excel_movs_concepto(t: pd.DataFrame, mov: pd.DataFrame) -> bytes:
@@ -2175,7 +2146,7 @@ def _excel_movs_concepto(t: pd.DataFrame, mov: pd.DataFrame) -> bytes:
         piv["Total"] = piv.sum(axis=1)
         hojas["Resumen por mes"] = piv.reset_index().rename(columns={"concepto": "Concepto de gasto"})
     hojas["Resumen por concepto"] = r
-    return _excel_simple(hojas)
+    return excel_hojas(hojas)
 
 
 def _catalogos_cuentas(S) -> dict:
@@ -2203,7 +2174,7 @@ def _sispo_analizar(S, up, maestro: pd.DataFrame):
 
 def admin_base_maestra(ctx):
     """Carga de la base maestra de referencias y conceptos (se usa desde Administración)."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha, categoria FROM mtto_sispo_ref")
     if maestro.empty:
         st.warning("Aún no hay base maestra cargada: adjunta el Excel con «Bodega», «Articulo», «Texto», «Clasificación» y «ELEMENTO».",
@@ -2254,7 +2225,7 @@ def _sispo_elegir(ctx):
 
 def _sispo_panel(S):
     """Pantalla del proceso mensual: base maestra, SISPO del mes, validación, conciliación y aplicación. Solo administrador."""
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     ctx = S.ctx
     with st.expander("Cargar SISPO del mes y reemplazar las salidas de inventario (administrador)", icon=":material/inventory_2:", expanded=True):
         resultado = st.session_state.pop("_mt_sispo_msg", None)          # resultado de la última aplicación (el rerun borraría un st.success directo)
@@ -2436,12 +2407,12 @@ def _sispo_ejecutar(ctx, ev: dict, empresa: str, periodo: int, archivo: str, ops
     return hechas, falla_ops
 
 
-def datos_placas(ctx, empresa: str, anio: int, mes: int):
+def datos_placas(ctx, empresa: str, anio: int, mes: int, version=None):
     """Para la presentación: la flota de UN mes por placa y por concepto, con los mismos cálculos de la pantalla de Flota (mismo
     SISPO aplicado, reclasificaciones y presupuesto del mes prorrateado). Devuelve (vistas, escenario) o (None, motivo)."""
-    esc = next((n for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio) and c["meses"][0] <= int(mes) <= c["meses"][1]), None)
+    esc = P.escenario_para(anio, mes, version)
     if esc is None:
-        return None, f"no hay un escenario presupuestal de Flota que cubra {MESES_L[int(mes) - 1]} de {anio}"
+        return None, f"no hay un escenario presupuestal de Flota que cubra {MESES_L[int(mes) - 1]} de {anio}" + (f" con el {P.etiqueta(version)}" if version else "")
     leer = ctx.leer
     _asegurar_tablas(ctx)
     cfg = dict(L.ESCENARIOS[esc], escenario=esc, desde=int(mes))
@@ -2482,7 +2453,8 @@ def datos_placas(ctx, empresa: str, anio: int, mes: int):
 def _S_sispo(ctx, anio: int):
     """Lo mínimo de la pantalla de Mantenimiento que necesita aplicar un SISPO (presupuesto y catálogo, placas oficiales y los genéricos de SAP
     de las dos compañías), armado sin abrir la pantalla. None si el año no es de ningún escenario."""
-    cfg = next((dict(c, escenario=n) for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio)), None)
+    esc = P.escenario_anio(anio, version_elegida())
+    cfg = dict(L.ESCENARIOS[esc], escenario=esc) if esc else None
     if cfg is None:
         return None
     asig = asignacion.mapa(ctx.leer)
@@ -2501,7 +2473,7 @@ def aplicar_sispo_guardado(ctx, empresa: str, periodo: int) -> dict:
     import sispo_fuente
     res = dict(ok=[], avisos=[], errores=[])
     try:
-        _exigir_admin(ctx)
+        exigir_admin(ctx)
         _asegurar_tablas(ctx)
         maestro = ctx.leer("SELECT codigo, articulo, concepto, fecha FROM mtto_sispo_ref")
         if maestro.empty:
@@ -2645,7 +2617,7 @@ def _sispo_resultado(S, a: dict, archivo: str, maestro: pd.DataFrame, up=None):
                    "en la base maestra o su concepto pertenece a otra cuenta; no se asignan por aproximación. El Excel trae las mismas columnas "
                    "de la base maestra (más la cuenta): complétalo con el concepto, cárgalo arriba y usa «Reasignar conceptos».",
                    icon=":material/rule:")
-        st.download_button("Descargar referencias pendientes", _excel_simple({"Pendientes": pend}), f"referencias_pendientes_{periodo or ''}.xlsx",
+        st.download_button("Descargar referencias pendientes", excel_hojas({"Pendientes": pend}), f"referencias_pendientes_{periodo or ''}.xlsx",
                            icon=":material/download:", key="mt_sispo_dl_pend")
     sinp = lin[(lin["cuenta"] == L.SISPO_CUENTA) & (lin["placa"] == L.SIN_PLACA)]
     if len(sinp):
@@ -2734,7 +2706,7 @@ def _sispo_periodos(S, maestro: pd.DataFrame):
             "referencias": st.column_config.NumberColumn("Referencias", format="%d"), "placas": st.column_config.NumberColumn("Placas", format="%d"),
             "valor": st.column_config.NumberColumn("Valor (signo SAP)", format="accounting")})
     c1, c2, c3 = st.columns(3)
-    c1.download_button("Descargar trazabilidad (todas las cuentas del periodo)", _excel_simple({"Trazabilidad": traza}),
+    c1.download_button("Descargar trazabilidad (todas las cuentas del periodo)", excel_hojas({"Trazabilidad": traza}),
                        f"trazabilidad_sispo_{emp}_{per}.xlsx", icon=":material/download:", key="mt_sispo_dl_traza")
     if c2.button("Reasignar conceptos con la base maestra vigente", key="mt_sispo_reasignar", icon=":material/sync:",
                  help="Útil después de actualizar la base maestra: vuelve a cruzar las salidas ya aplicadas de esta cuenta sin necesitar el SISPO otra vez."):
@@ -3035,7 +3007,7 @@ def _tab_mantenimiento(S):
         st.info("El rubro no tiene presupuesto ni ejecución en este escenario.")
         return
     tp, te, tm = float(t["presupuesto"].sum()), float(t["ejecutado"].sum()), int(t["movimientos"].sum())
-    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"Escenario {S.escenario} · rubro completo"))
+    _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"{S.escenario} · rubro completo"))
     if S.placa:
         st.caption(f"El filtro de placa ({S.placa}) no cambia el rubro completo de esta pestaña; solo afecta la tabla de ámbitos de abajo.")
     with st.container(key="mt_card_rubro"):
@@ -3087,7 +3059,7 @@ def _tab_contenedores(S):
     t = L.tabla_mensual(pc, ec, S.cfg, S.hasta_mes, "Contenedores")
     tot = t[t["mes"] == 0].iloc[0]
     n_mov = int(((ec["mes"] >= L.desde_mes(S.cfg)) & (ec["mes"] <= S.hasta_mes)).sum()) if len(ec) else 0
-    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, _sub_pres(S, f"Escenario {S.escenario}"))
+    _kpis(float(tot["presupuesto"]), float(tot["ejecutado"]), n_mov, S.hasta, _sub_pres(S, f"{S.escenario}"))
     vista = t.assign(Mes=t["mes"].map(lambda m: "Total" if m == 0 else f"{MESES_L[m - 1].capitalize()} {S.cfg['anio']}"))
     with st.container(key="mt_card_cont_tabla"):
         titulo_tarjeta("Contenedores · presupuesto vs ejecutado", f"{S.escenario} · ejecutado {S.hasta}")
@@ -3124,7 +3096,7 @@ def _notas_encabezado(archivo, hoja: str) -> dict:
 
 
 def _admin_datos(ctx):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     oficial = set(ctx.leer("SELECT placa FROM mtto_placas")["placa"])
     with st.expander("Datos base · placas, presupuesto de flota, histórico y Tecnomecánica/SOAT (administrador)",
                      icon=":material/settings:"):
@@ -3144,7 +3116,7 @@ admin_datos_base = _admin_datos            # lo usa Administración
 
 
 def _admin_placas(ctx):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     st.markdown("**1. Listado oficial de placas** (único para todas las compañías)  \nExcel con las columnas PLACA, NÚMERO INTERNO y "
                 "TIPO DE VEHÍCULO. Reemplaza el listado actual; las placas repetidas se unifican.")
     f = st.file_uploader("Listado de placas (.xlsx)", type=["xlsx"], key="mt_up_placas")
@@ -3163,7 +3135,7 @@ def _admin_placas(ctx):
         incons = L.inconsistencias_maestro(t)           # antes de unificar: una placa con dos N° internos se conservaría solo con el primero
         t = t.groupby("placa", sort=False).agg("first").reset_index()
         ctx.con.execute("DELETE FROM mtto_placas")
-        _insertar_por_lotes(ctx, "mtto_placas(placa, numero_interno, tipo)",
+        insertar_por_lotes(ctx, "mtto_placas(placa, numero_interno, tipo)",
                             [(r.placa, r.numero_interno if pd.notna(r.numero_interno) else "",
                               r.tipo if pd.notna(r.tipo) else "") for r in t.itertuples(index=False)])
         ctx.con.commit()
@@ -3185,9 +3157,21 @@ def _admin_placas(ctx):
                      hide_index=True, width="stretch")
 
 
+def _hoja_sugerida(cfg: dict, hojas: list) -> str | None:
+    """Hoja del libro que corresponde a un escenario: la que lleva el nombre de la versión («Inicial», «4+8», «8+4»); si no, la del año
+    solo para la 8+4 y el año siguiente (así un libro de una sola hoja «2026» no se carga como las tres versiones)."""
+    v = cfg.get("version")
+    if v:
+        clave = v.upper().replace(" ", "")
+        por_nombre = next((h for h in hojas if clave in str(h).upper().replace(" ", "")), None)
+        if por_nombre:
+            return por_nombre
+    return cfg["hoja"] if cfg["hoja"] in hojas else None
+
+
 def _admin_ppto_flota(ctx, empresa, oficial):
-    _exigir_admin(ctx)
-    st.markdown(f"**2. Presupuesto de la flota · {empresa}**  \nExcel con una hoja por escenario (cada fila un "
+    exigir_admin(ctx)
+    st.markdown(f"**2. Presupuesto de la flota · {empresa}**  \nExcel con una hoja por presupuesto (Inicial, 4+8, 8+4 y Normal 2027; cada fila un "
                 "vehículo y cada columna un concepto; las filas sin placa son conceptos generales). Se transforma a "
                 "formato largo, conserva el texto original (encabezado y notas de celda) y solo se guarda si la suma "
                 f"coincide con el total del archivo. Reemplaza el escenario cargado para {empresa}.")
@@ -3198,8 +3182,9 @@ def _admin_ppto_flota(ctx, empresa, oficial):
     listos = {}
     for esc, cfg in L.ESCENARIOS.items():
         opciones = ["(no cargar)"] + xl.sheet_names
+        sugerida = _hoja_sugerida(cfg, xl.sheet_names)
         hoja = st.selectbox(f"Hoja para «{esc}»", opciones, key=f"mt_hoja_{esc}_{empresa}",
-                            index=opciones.index(cfg["hoja"]) if cfg["hoja"] in opciones else 0)
+                            index=opciones.index(sugerida) if sugerida in opciones else 0)
         if hoja == "(no cargar)":
             continue
         try:
@@ -3223,7 +3208,7 @@ def _admin_ppto_flota(ctx, empresa, oficial):
     if listos and st.button(f"Guardar presupuesto de la flota · {empresa}", key=f"mt_guardar_ppto_{empresa}", icon=":material/save:"):
         for esc, largo in listos.items():
             ctx.con.execute("DELETE FROM mtto_ppto WHERE empresa=? AND escenario=?", (empresa, esc))
-            _insertar_por_lotes(ctx, "mtto_ppto(empresa, escenario, placa, numero_interno, tipo, concepto, orden, "
+            insertar_por_lotes(ctx, "mtto_ppto(empresa, escenario, placa, numero_interno, tipo, concepto, orden, "
                                      "valor, es_global, texto_original)",
                                 [(empresa, esc, r.placa, r.numero_interno, r.tipo, r.concepto, int(r.orden),
                                   float(r.valor), int(r.es_global), r.texto_original) for r in largo.itertuples(index=False)],
@@ -3236,7 +3221,7 @@ def _admin_ppto_flota(ctx, empresa, oficial):
 
 
 def _admin_historico(ctx, empresa):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     st.divider()
     st.markdown(f"**3. Histórico de clasificación (opcional) · {empresa}**  \nExcel con columnas TEXTO, PROVEEDOR (opcional) y "
                 "CONCEPTO, con movimientos de años anteriores ya clasificados. El concepto debe llamarse igual que en el presupuesto. "
@@ -3262,7 +3247,7 @@ def _admin_historico(ctx, empresa):
     ctx.con.execute("DELETE FROM mtto_clasif_manual WHERE empresa=? AND origen='Archivo histórico'", (empresa,))
     ahora_txt = ahora().strftime("%Y-%m-%d %H:%M")
     if len(d):
-        _insertar_por_lotes(ctx, "mtto_clasif_manual(empresa, llave, concepto, texto_tipo, tercero, origen, usuario, fecha)",
+        insertar_por_lotes(ctx, "mtto_clasif_manual(empresa, llave, concepto, texto_tipo, tercero, origen, usuario, fecha)",
                             [(empresa, "", r.concepto, r.texto_tipo, L.norm_texto(r.tercero), "Archivo histórico",
                               ctx.usuario, ahora_txt) for r in d.itertuples()])
     ctx.con.commit()
@@ -3274,10 +3259,10 @@ def _admin_historico(ctx, empresa):
 
 
 def _admin_ts(ctx, empresa, oficial):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     st.divider()
     st.markdown(f"**4. Presupuesto de Tecnomecánica y SOAT · {empresa}**  \nExcel con una hoja por concepto (placa en filas, meses en "
-                "columnas, fila «TOTAL MES»). Se guardan todos los meses (UPA = sep–dic 2026; Normal 2027 = ene–dic 2027) y se "
+                "columnas, fila «TOTAL MES»). Se guardan todos los meses (el mismo archivo sirve para las tres versiones del presupuesto) y se "
                 "valida cada mes contra «TOTAL MES». Ojo: la columna TOTAL del archivo suma solo 2027. Reemplaza lo cargado "
                 f"de los conceptos que subas para {empresa}.")
     t = st.file_uploader("Tecnomecánica y SOAT (.xlsx)", type=["xlsx"], key=f"mt_up_ts_{empresa}")
@@ -3319,7 +3304,7 @@ def _admin_ts(ctx, empresa, oficial):
         conceptos = list(info["hojas"])
         ctx.con.execute("DELETE FROM mtto_ppto_ts WHERE empresa=? AND concepto IN (" + ",".join("?" * len(conceptos)) + ")",
                         (empresa, *conceptos))
-        _insertar_por_lotes(ctx, "mtto_ppto_ts(empresa, placa, concepto, anio, mes, valor, texto_original)",
+        insertar_por_lotes(ctx, "mtto_ppto_ts(empresa, placa, concepto, anio, mes, valor, texto_original)",
                             [(empresa, r.placa, r.concepto, int(r.anio), int(r.mes), float(r.valor), r.texto_original)
                              for r in largo.itertuples(index=False)])
         ctx.con.commit()
@@ -3371,13 +3356,13 @@ def _soporte(S, empresa: str, mes: int, detalle_meses: bool = False) -> bytes:
     else:
         ejec = ejec.assign(raw="")
         num_cuenta = {}
-    return L.exportar_soporte(ppto, ejec, dict(cfg, escenario=S.escenario), mes, "UPA" if S.escenario.startswith("UPA") else "PRESUPUESTO",
+    return L.exportar_soporte(ppto, ejec, dict(cfg, escenario=S.escenario), mes, P.rotulo(S.escenario),
                               detalle_meses=detalle_meses, num_cuenta=num_cuenta, sin_hoja=L.SUBRUBROS_SIN_HOJA_SOPORTE)
 
 
 def _excel_control(S, ts_mes: pd.DataFrame) -> bytes:
     """Excel de control de 3 hojas (trae el detalle de movimientos): solo administrador, también en la lógica."""
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     return L.exportar_excel({e: S.vistas_emp[e] for e in S.sel}, ts_mes, S.cfg)
 
 
@@ -3411,8 +3396,8 @@ def _mostrar(ctx, tecnico: bool = False):
             c_placa = None
         vista_emp = c_emp.selectbox("Compañía", [TODAS, *EMPRESAS], key="mt_empresa",
                                     help="Consolidado = ALDC + ALSM. " + " · ".join(f"{e}: {EMPRESAS[e]}" for e in EMPRESAS))
-        escenario = c_esc.selectbox("Escenario presupuestal", list(L.ESCENARIOS), key="mt_escenario",
-                                    help="UPA 2026: sep–dic 2026. Normal 2027: ene–dic 2027. Sus cifras nunca se mezclan.")
+        escenario = selector_escenario(c_esc, "mt_escenario", "Presupuesto",
+                                       help=P.AYUDA + " Normal 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
     cfg = dict(L.ESCENARIOS[escenario], escenario=escenario)
     sel = list(EMPRESAS) if vista_emp == TODAS else [vista_emp]
     multi = len(sel) > 1
@@ -3420,6 +3405,9 @@ def _mostrar(ctx, tecnico: bool = False):
     # ------------------------------------------------------------------ datos de cada compañía
     asig = asignacion.mapa(leer)
     datos_e = {e: _datos_empresa(ctx, e, cfg, asig) for e in EMPRESAS}
+    aviso_ppto = P.aviso_base(leer, cfg, sel)
+    if aviso_ppto:
+        st.caption(aviso_ppto)
     oficial = leer("SELECT placa, numero_interno, tipo FROM mtto_placas")
     if not ver_todo:                                    # solo ve la flota quien la tiene asignada
         tiene = False
@@ -3436,7 +3424,7 @@ def _mostrar(ctx, tecnico: bool = False):
     ult = int(en_ventana["mes"].max()) if not en_ventana.empty else m1
     sel_mes = c_hasta.selectbox("Período", [0, *range(m0, m1 + 1)], key=f"mt_mes_{escenario}",
                                 format_func=lambda m: f"Acumulado a {MESES_L[ult - 1]}" if m == 0 else MESES_L[m - 1].capitalize(),
-                                help="Un mes muestra y descarga SOLO ese mes (sin acumular): su presupuesto y su ejecución. El presupuesto por placa y concepto se carga para todo el escenario, así que se lleva al mes con el peso de ese mes en el presupuesto mensual de Flota. «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución, con el presupuesto del escenario completo.")
+                                help="Un mes muestra y descarga SOLO ese mes (sin acumular): su presupuesto y su ejecución. El presupuesto por placa y concepto se carga para todo el escenario, así que se lleva al mes con el peso de ese mes en el presupuesto mensual de Flota. «Acumulado» suma desde el inicio del escenario hasta el último mes con ejecución, con el presupuesto total.")
     hasta_mes = sel_mes or ult
     if sel_mes:                                         # un solo mes: todo el cálculo (movimientos, presupuesto, tablas, gráficos, Excel) usa ese mes
         cfg = dict(cfg, desde=sel_mes)
@@ -3447,7 +3435,7 @@ def _mostrar(ctx, tecnico: bool = False):
     else:
         hasta = f"{MESES_L[m0 - 1]}–{MESES_L[hasta_mes - 1]} {cfg['anio']}" if m0 != 1 else f"a {MESES_L[hasta_mes - 1]} {cfg['anio']}"
 
-    ppto_anual = {e: d.ppto_all for e, d in datos_e.items()}              # presupuesto del escenario completo (estructura y respaldo)
+    ppto_anual = {e: d.ppto_all for e, d in datos_e.items()}              # presupuesto total (estructura y respaldo)
     ppto_todo = pd.concat(list(ppto_anual.values()), ignore_index=True)
     ppto_emp, sin_mensual = ppto_anual, []
     if sel_mes:                                          # un mes: el presupuesto también es el de ese mes
@@ -3612,7 +3600,7 @@ def _mostrar(ctx, tecnico: bool = False):
 
     if sin_mensual:
         st.warning(f"{', '.join(sin_mensual)}: no hay presupuesto mensual de Flota cargado, así que el presupuesto por placa y concepto no se "
-                   f"puede llevar a {MESES_L[sel_mes - 1]}: se muestra el del escenario completo.", icon=":material/warning:")
+                   f"puede llevar a {MESES_L[sel_mes - 1]}: se muestra el presupuesto total.", icon=":material/warning:")
     # ------------------------------------------------------------------ pestañas
     con_cont = any(e not in L.EMPRESAS_SIN_CONTENEDORES for e in sel)       # SM no tiene Contenedores: sin pestaña si solo se ve SM
     nombres_tabs = ["Mantenimiento", "Flota y Equipo de Transporte", "Tecnomecánica y SOAT"] + (["Contenedores"] if con_cont else [])

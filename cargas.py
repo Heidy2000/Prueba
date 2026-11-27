@@ -12,6 +12,8 @@ from datetime import datetime
 
 import pandas as pd
 
+import presupuestos as P
+
 # Clases del PyG (código -> nombre). El rubro se guarda como "3.1 Compras" para que ordene y se lea igual que en SAP.
 CLASES = {   # nombres según la tabla de rubros de Financiera (1.0 = ingresos)
     "1.0": "Ingresos",
@@ -439,7 +441,7 @@ def leer_ceco_lineas(archivo) -> pd.DataFrame:
 
 def nombre_version(hoja: str) -> str:
     v = re.sub(r"^(PPTO|PRESUPUESTO)\s*", "", hoja.strip(), flags=re.I).strip()
-    return v.capitalize() if v.isalpha() else v
+    return P.canonica(v.capitalize() if v.isalpha() else v)
 
 
 def leer_presupuestos(archivo) -> pd.DataFrame:

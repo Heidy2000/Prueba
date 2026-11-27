@@ -11,9 +11,11 @@ Líneas de negocio (ALSM): de qué línea es cada movimiento y cómo se reparten
 """
 import pandas as pd
 
+import presupuestos as P
+
 COMPARTIDAS = ["ADMINISTRATIVO", "OPERATIVO", "MANTENIMIENTO", "COMERCIAL"]
 SIN_LINEA = "SIN LÍNEA"
-MESES_REALES = {"8+4": 8, "4+8": 4}
+MESES_REALES = P.MESES_REALES                     # meses reales de cada versión del presupuesto (se define en presupuestos.py)
 
 
 def mapa_ceco(leer, empresa: str) -> dict:

@@ -5,7 +5,8 @@ import streamlit as st
 
 import asignacion
 import estilo as E
-from ui import MESES, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
+import presupuestos as P
+from ui import MESES, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta, version_elegida
 
 COLOR_EMPRESA = {"ALDC": E.AZUL, "ALSM": "#e8892c"}
 COLOR_PROV = ["#1f5fc4", "#2e9e5b", "#e8892c", "#8a5cc4", "#9aa7b8"]
@@ -160,9 +161,7 @@ def mostrar(ctx):
             ve_ppto = getattr(ctx, "ver_todo", True) or ctx.usuario in asignacion.dueno_de_sub(leer, "Combustible")
             emp_pp = "ALDC" if emp_sel == "Todas" else emp_sel
             if ve_ppto and emp_pp in ("ALDC", "ALSM") and not (prov or tipos or placas or contrato != "Todos"):
-                vers = leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?",
-                            (int(anio), emp_pp))["version"].tolist()
-                v_ppto = "8+4" if "8+4" in vers else ("Inicial" if "Inicial" in vers else (vers[0] if vers else ""))
+                v_ppto = P.elegir(P.versiones_de(leer, anio, emp_pp), version_elegida())      # el presupuesto elegido en los módulos
                 pp = leer("SELECT mes, SUM(valor) v FROM presupuesto WHERE anio=? AND version=? AND empresa=? "
                           "AND sub_rubro='Combustible' GROUP BY mes", (int(anio), v_ppto, emp_pp)).set_index("mes")["v"]
                 sap = leer("SELECT mes, SUM(valor) v FROM ejecucion WHERE anio=? AND empresa=? "

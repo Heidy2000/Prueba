@@ -20,8 +20,10 @@ import cargas
 import datos
 import estilo as E
 import logica_m as L
+import presupuestos as P
 import sispo_oper as OS
-from ui import COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, ahora, estilo_grafico, figura_ppto_ejec_empresas, grafico_distribucion, texto_periodo, titulo_tarjeta
+from ui import (COLOR_EMPRESA, EMPRESAS, MESES, MESES_L, a_db, ahora, estilo_grafico, exigir_admin, figura_ppto_ejec_empresas, grafico_distribucion,
+                insertar_por_lotes, selector_escenario, texto_periodo, titulo_tarjeta)
 
 VERSION = "v3 · 9-nov-2026"          # se muestra en el encabezado: sirve para confirmar qué versión está corriendo
 RUBRO_COD = "3.1"
@@ -34,7 +36,7 @@ TODAS = "Consolidado"
 
 TABLAS = """
 CREATE TABLE IF NOT EXISTS oper_ppto(empresa TEXT, hoja TEXT, item TEXT, orden INT, anio INT, mes INT,
-    cantidad DOUBLE PRECISION, costo_unit DOUBLE PRECISION, valor DOUBLE PRECISION);
+    cantidad DOUBLE PRECISION, costo_unit DOUBLE PRECISION, valor DOUBLE PRECISION, version TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS oper_mapeo(sub_norm TEXT, sub_rubro TEXT, hoja TEXT, usuario TEXT, fecha TEXT);
 CREATE TABLE IF NOT EXISTS oper_sispo(empresa TEXT, periodo INT, hoja TEXT, id_kardex TEXT, fecha TEXT, bodega TEXT, codigo TEXT,
     articulo TEXT, grupo TEXT, cuenta TEXT, cc_codigo TEXT, cc_nombre TEXT, cantidad DOUBLE PRECISION, valor DOUBLE PRECISION, concepto TEXT);
@@ -45,9 +47,12 @@ CREATE TABLE IF NOT EXISTS oper_item_map(codigo TEXT, item TEXT, usuario TEXT, f
 
 
 def _asegurar_tablas(ctx):
-    if not st.session_state.get("_oper_tablas2"):
+    if not st.session_state.get("_oper_tablas3"):
         ctx.con.crear_tablas(TABLAS)
         ctx.con.commit()
+        if "version" not in ctx.con.columnas("oper_ppto"):         # bases creadas antes de las versiones del presupuesto: quedan «sin versión»
+            ctx.con.execute("ALTER TABLE oper_ppto ADD COLUMN version TEXT DEFAULT ''")
+            ctx.con.commit()
         try:                                              # bases creadas antes de existir la columna «concepto»
             ctx.con.execute("SELECT concepto FROM oper_sispo LIMIT 1")
         except Exception:
@@ -60,13 +65,9 @@ def _asegurar_tablas(ctx):
         for tabla in ("oper_sispo", "oper_ppto", "oper_mapeo"):     # la hoja «Otros» se llama «Bolsas»: lo guardado con el nombre anterior se actualiza
             ctx.con.execute(f"UPDATE {tabla} SET hoja=? WHERE hoja=?", (OS.HOJA_OTROS, "Otros"))
         ctx.con.commit()
-        st.session_state["_oper_tablas2"] = True
+        st.session_state["_oper_tablas3"] = True
 
 
-def _exigir_admin(ctx):
-    """Candado de permisos en la LÓGICA: toda escritura en la base exige administrador."""
-    if not getattr(ctx, "es_admin", False):
-        raise PermissionError("Acción reservada a administradores.")
 
 
 # ================================================================== lectura del libro de presupuesto
@@ -195,13 +196,6 @@ def leer_libro(archivo):
 
 
 # ================================================================== datos de la base
-def _version_para(ctx, empresa, anio):
-    vs = ctx.leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?", (int(anio), empresa))["version"].tolist()
-    orden = {"Inicial": 0, "4+8": 1, "8+4": 2}
-    vs = sorted(vs, key=lambda v: (orden.get(v, 9), v))
-    return "8+4" if "8+4" in vs else (vs[-1] if vs else "Inicial")
-
-
 def _base(ctx, empresa, anio, version):
     """Presupuesto (tabla presupuesto) y ejecución del año con el mismo tratamiento que el módulo Presupuesto (homologación de
     sub-rubros), para que los totales coincidan."""
@@ -334,7 +328,7 @@ def _generico_otros_sap(ejec_all: pd.DataFrame, empresa: str, periodo: int) -> p
 
 
 def _datos_empresa(ctx, empresa: str, cfg: dict, asig, mapeo: dict, sispo=None) -> SimpleNamespace:
-    version = _version_para(ctx, empresa, cfg["anio"])
+    version = P.version_para(ctx.leer, empresa, cfg["anio"], cfg.get("version"))
     ppto_base, ejec = _base(ctx, empresa, cfg["anio"], version)
     ejec_all = ejec.assign(empresa=empresa)              # todos los rubros: con esto se concilia la cuenta OTROS con el SISPO
     ppto_base = ppto_base[_es_rubro(ppto_base["codigo"])].copy() if len(ppto_base) else ppto_base
@@ -477,14 +471,14 @@ def _vista_cantidades(S):
 def _kpis(c: dict, S):
     color, fondo = _tono(c["estado"])
     st.html(E.kpis([
-        dict(label="Presupuesto del escenario", valor=_fmt(S, c["presupuesto_esc"]), sub=S.escenario, icono="wallet",
+        dict(label="Presupuesto total", valor=_fmt(S, c["presupuesto_esc"]), sub=S.escenario, icono="wallet",
              color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="Presupuesto al corte", valor=_fmt(S, c["presupuesto"]), sub=f"meses hasta {MESES_L[S.hasta_mes - 1]}",
              icono="wallet", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label=f"Ejecutado {S.hasta}", valor=_fmt(S, c["ejecutado"]),
              sub=f"{c['movimientos']:,} movimientos".replace(",", "."), icono="receipt", color=E.AZUL, fondo=E.AZUL_SUAVE),
         dict(label="% ejecución vs presupuesto al corte", valor=f'<span style="color:{color}">{E.pct_txt(c["pct"])}</span>',
-             sub=f"{c['estado']} · saldo del escenario {_fmt(S, c['saldo'])}",
+             sub=f"{c['estado']} · saldo del presupuesto {_fmt(S, c['saldo'])}",
              icono="alert" if c["estado"] in ("Sobre ejecutado", "Sin presupuesto asignado") else "check", color=color, fondo=fondo),
     ]))
 
@@ -589,7 +583,7 @@ def _tab_hoja(S, hoja: str):
         vis = it.drop(columns=["cantidad", "costo_unit"]) if S.cant else it
         conf = {"item": "Ítem", "cantidad": nc("Cantidad presupuestada", format="localized"),
                 "costo_unit": nc("Costo unit. promedio", format="accounting"),
-                "presupuesto_esc": nc("Presupuesto escenario", format=fm), "presupuesto": nc("Presupuesto al corte", format=fm),
+                "presupuesto_esc": nc("Presupuesto total", format=fm), "presupuesto": nc("Presupuesto al corte", format=fm),
                 "ejecutado": nc("Ejecutado", format=fm), "variacion": nc("Variación", format=fm),
                 "pct": nc("% ejecución", format="percent"), "peso": nc("% del total", format="percent")}
         fv = _filas_items(it)
@@ -630,7 +624,7 @@ def _tab_hoja(S, hoja: str):
             "presupuesto": "Presupuesto", "ejecutado": "Ejecutado", "variacion": "Variación", "pct": "% ejecución",
             "ppto_acum": "Presupuesto acumulado", "ejec_acum": "Ejecutado acumulado", "pct_acum": "% acumulado"}),
         "Ítems": it.drop(columns=["costo_unit"]).rename(columns={"item": "Ítem", "cantidad": "Cantidad presupuestada",
-                                    "presupuesto_esc": "Presupuesto escenario", "presupuesto": "Presupuesto al corte",
+                                    "presupuesto_esc": "Presupuesto total", "presupuesto": "Presupuesto al corte",
                                     "ejecutado": "Ejecutado", "variacion": "Variación", "pct": "% ejecución", "peso": "% del total"}),
         "Movimientos": mov_todos}), f"operaciones_{hoja}_{S.escenario.replace(' ', '_')}_{S.hasta_mes:02d}.xlsx".replace("í", "i"),
         icon=":material/download:", key=f"op_dl_{hoja}")
@@ -808,15 +802,15 @@ def _tab_resumen(S):
         for r in cuerpo.itertuples():
             hijos = _filas_items(_items(S, r.hoja)) if r.hoja in S.hojas else []
             filas_h.append(dict(nombre=r.hoja, presupuesto=float(r.presupuesto), ejecutado=float(r.ejecutado), hijos=hijos,
-                                sub=f"escenario {E.pesos(r.presupuesto_esc)}" if r.presupuesto_esc else ""))
+                                sub=f"total {E.pesos(r.presupuesto_esc)}" if r.presupuesto_esc else ""))
         st.html(E.tabla_visual(sorted(filas_h, key=lambda f: -f["ejecutado"]), "Hoja"))
-        st.caption("Presupuesto y saldo al corte (el presupuesto del escenario completo va en gris junto al nombre). Cada hoja se abre en sus ítems.")
+        st.caption("Presupuesto y saldo al corte (el presupuesto total va en gris junto al nombre). Cada hoja se abre en sus ítems.")
         _participacion([(f["nombre"], f["ejecutado"]) for f in filas_h], "Participación de cada hoja en el gasto ejecutado")
-        with st.expander("Ver como tabla (con el saldo del escenario y el estado)", icon=":material/table:"):
+        with st.expander("Ver como tabla (con el saldo del presupuesto y el estado)", icon=":material/table:"):
             st.dataframe(_estilo(vista, "variacion"), hide_index=True, width="stretch", height=40 + 35 * len(vista), column_config={
-                "hoja": "Hoja", "presupuesto_esc": nc("Presupuesto escenario", format="accounting"), "presupuesto": nc("Presupuesto al corte", format="accounting"),
+                "hoja": "Hoja", "presupuesto_esc": nc("Presupuesto total", format="accounting"), "presupuesto": nc("Presupuesto al corte", format="accounting"),
                 "ejecutado": nc("Ejecutado", format="accounting"), "variacion": nc("Variación", format="accounting"),
-                "pct": nc("% ejecución", format="percent"), "saldo": nc("Saldo del escenario", format="accounting"), "estado": "Estado",
+                "pct": nc("% ejecución", format="percent"), "saldo": nc("Saldo del presupuesto", format="accounting"), "estado": "Estado",
                 "movimientos": nc("Movimientos", format="%d")})
         if "pend_sispo" in sin:
             pend, resto = sin[sin["pend_sispo"].fillna(False).astype(bool)], sin[~sin["pend_sispo"].fillna(False).astype(bool)]
@@ -866,44 +860,41 @@ def _tab_resumen(S):
                 vp = pd.DataFrame([dict(presupuesto_esc=c["presupuesto_esc"], presupuesto=c["presupuesto"], ejecutado=c["ejecutado"],
                                         variacion=c["variacion"], pct=c["pct"], saldo=c["saldo"], estado=c["estado"], movimientos=c["movimientos"])])
                 st.dataframe(_estilo(vp, "variacion"), hide_index=True, width="stretch", column_config={
-                    "presupuesto_esc": nc("Cantidad presupuestada (escenario)", format="localized"),
+                    "presupuesto_esc": nc("Cantidad presupuestada (total)", format="localized"),
                     "presupuesto": nc("Cantidad presupuestada al corte", format="localized"), "ejecutado": nc("Cantidad ejecutada", format="localized"),
                     "variacion": nc("Diferencia", format="localized"), "pct": nc("% ejecución", format="percent"),
-                    "saldo": nc("Saldo del escenario", format="localized"), "estado": "Estado", "movimientos": nc("Salidas", format="%d")})
+                    "saldo": nc("Saldo del presupuesto", format="localized"), "estado": "Estado", "movimientos": nc("Salidas", format="%d")})
 
 
 # ================================================================== carga y asignación (administrador)
-def _insertar_por_lotes(ctx, sql_cols: str, filas: list, lote=100):
-    n = len(filas[0])
-    for i in range(0, len(filas), lote):
-        parte = filas[i:i + lote]
-        ctx.con.execute(f"INSERT INTO {sql_cols} VALUES " + ",".join(["(" + ",".join("?" * n) + ")"] * len(parte)),
-                        tuple(v for f in parte for v in f))
 
 
-def _a_db(v):
-    return None if (not isinstance(v, str) and pd.isna(v)) else (v.item() if hasattr(v, "item") else v)
 
 
-def _guardar_presupuesto(ctx, empresa: str, largo: pd.DataFrame, archivo: str) -> int:
-    """Reemplaza, para la compañía, SOLO las hojas que trae el libro (las demás quedan como estaban). Idempotente."""
-    _exigir_admin(ctx)
+def _guardar_presupuesto(ctx, empresa: str, largo: pd.DataFrame, archivo: str, version: str = P.DEFECTO) -> int:
+    """Reemplaza, para la compañía y la versión del presupuesto, SOLO las hojas que trae el libro (las demás quedan como estaban).
+    Las filas del año con versiones (2026) se guardan con la versión elegida; las de otros años, sin versión. Cargar la 8+4 también reemplaza lo
+    que se guardó antes de las versiones (era el «UPA»). Idempotente."""
+    exigir_admin(ctx)
     n = 0
     for hoja, g in largo.groupby("hoja"):
-        ctx.con.execute("DELETE FROM oper_ppto WHERE empresa=? AND hoja=?", (empresa, hoja))
-        _insertar_por_lotes(ctx, "oper_ppto(empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor)",
-                            [(empresa, hoja, r.item, int(r.orden), int(r.anio), int(r.mes), _a_db(r.cantidad), _a_db(r.costo_unit), float(r.valor))
-                             for r in g.itertuples(index=False)], lote=80)
+        for anio in sorted(g["anio"].unique()):
+            v = P.version_fila(anio, version)
+            sin_version = " OR version IS NULL OR version=''" if v in (P.V84, "") else ""      # lo guardado sin versión era el UPA (8+4) o el año siguiente
+            ctx.con.execute(f"DELETE FROM oper_ppto WHERE empresa=? AND hoja=? AND anio=? AND (version=?{sin_version})", (empresa, hoja, int(anio), v))
+        insertar_por_lotes(ctx, "oper_ppto(empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor, version)",
+                            [(empresa, hoja, r.item, int(r.orden), int(r.anio), int(r.mes), a_db(r.cantidad), a_db(r.costo_unit), float(r.valor),
+                              P.version_fila(r.anio, version)) for r in g.itertuples(index=False)], lote=80)
         n += len(g)
     ctx.registrar_carga(ctx.usuario, "Presupuesto operaciones", archivo,
-                        f"{empresa}: {', '.join(sorted(largo['hoja'].unique()))} · {n} filas · {E.pesos(largo['valor'].sum())}")
+                        f"{empresa} {P.etiqueta(version)}: {', '.join(sorted(largo['hoja'].unique()))} · {n} filas · {E.pesos(largo['valor'].sum())}")
     ctx.con.commit()
     return n
 
 
 def _guardar_mapeo(ctx, filas: list[tuple]) -> int:
     """filas: (sub_norm, sub_rubro, hoja). Guarda la decisión explícita para cada sub-rubro recibido."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     ts = ahora().strftime("%Y-%m-%d %H:%M")
     for sub_norm, sub, hoja in filas:
         ctx.con.execute("DELETE FROM oper_mapeo WHERE sub_norm=?", (sub_norm,))
@@ -914,7 +905,12 @@ def _guardar_mapeo(ctx, filas: list[tuple]) -> int:
     return len(filas)
 
 
-def _resumen_libro(info: dict) -> pd.DataFrame:
+def _escenarios_libro(version: str) -> list:
+    """Escenarios que puede traer un libro de esa versión: la propia (2026) y el año siguiente."""
+    return [P.escenario_de_version(version), P.ESCENARIO_SIGUIENTE]
+
+
+def _resumen_libro(info: dict, version: str = P.DEFECTO) -> pd.DataFrame:
     filas = []
     for hoja in HOJAS:
         i = info["hojas"].get(hoja)
@@ -936,20 +932,24 @@ def _resumen_libro(info: dict) -> pd.DataFrame:
         if i["filas_fuera_escenario"]:
             obs.append(f"{i['filas_fuera_escenario']} filas fuera de los escenarios (no se usan)")
         filas.append(dict(Hoja=hoja, Estado="Listo", Ítems=i["n_items"], Meses=i["n_meses"],
-                          **{f"Total {esc}": v for esc, v in i["por_escenario"].items()}, Observaciones=" · ".join(obs) or "—"))
+                          **{f"Total {esc}": v for esc, v in i["por_escenario"].items() if esc in _escenarios_libro(version)},
+                          Observaciones=" · ".join(obs) or "—"))
     return pd.DataFrame(filas)
 
 
 def _admin_presupuesto(ctx, empresa: str):
-    _exigir_admin(ctx)
-    cargado = ctx.leer("SELECT hoja, COUNT(*) filas, SUM(valor) total FROM oper_ppto WHERE empresa=? GROUP BY hoja", (empresa,))
+    exigir_admin(ctx)
+    cargado = ctx.leer("SELECT version, hoja, COUNT(*) filas, SUM(valor) total FROM oper_ppto WHERE empresa=? GROUP BY version, hoja", (empresa,))
     if cargado.empty:
         st.caption(f"{empresa}: todavía no hay presupuesto de Operaciones cargado.")
     else:
-        st.caption(f"{empresa} tiene cargado: " + " · ".join(f"{r.hoja} {E.pesos(r.total)}" for r in cargado.itertuples()))
+        cargado["version"] = cargado["version"].fillna("").replace("", "sin versión")
+        st.caption(f"{empresa} tiene cargado: " + " · ".join(f"{r.version} · {r.hoja} {E.pesos(r.total)}" for r in cargado.itertuples()))
+    version = st.selectbox("Presupuesto al que corresponde el libro", list(P.VERSIONES), index=list(P.VERSIONES).index(P.DEFECTO),
+                           key=f"op_ver_{empresa}", format_func=P.etiqueta, help=P.AYUDA + " Las filas de 2027 se guardan sin versión.")
     g = st.file_uploader(f"Libro «3.1 operaciones» (.xlsx) · {empresa}", type=["xlsx"], key=f"op_up_{empresa}",
                          help="Una hoja por Papelería, Consumibles, Herramientas y Bolsas: una fila por mes y, por ítem, cantidad, costo "
-                              "unitario y total. Cargar el libro reemplaza las hojas que trae para esta compañía; no toca la otra.")
+                              "unitario y total. Cargar el libro reemplaza las hojas que trae para esta compañía y esta versión del presupuesto; no toca la otra compañía ni las otras versiones.")
     if not g:
         return
     try:
@@ -957,8 +957,8 @@ def _admin_presupuesto(ctx, empresa: str):
     except Exception as e:
         st.error(f"No pude leer el libro: {e}")
         return
-    st.dataframe(_resumen_libro(info), hide_index=True, width="stretch", height=40 + 35 * len(HOJAS),
-                 column_config={c: st.column_config.NumberColumn(c, format="accounting") for c in (f"Total {x}" for x in L.ESCENARIOS)})
+    st.dataframe(_resumen_libro(info, version), hide_index=True, width="stretch", height=40 + 35 * len(HOJAS),
+                 column_config={c: st.column_config.NumberColumn(c, format="accounting") for c in (f"Total {x}" for x in _escenarios_libro(version))})
     if info["ignoradas"]:
         st.caption("Hojas del libro que no se usan: " + ", ".join(info["ignoradas"]))
     errores = {h: i["error"] for h, i in info["hojas"].items() if "error" in i}
@@ -968,9 +968,9 @@ def _admin_presupuesto(ctx, empresa: str):
         st.warning("El libro no trae: " + ", ".join(info["faltan"]) + ". Esas hojas quedan como estaban en la base.")
     if largo.empty or errores:
         return
-    if st.button(f"Guardar presupuesto de Operaciones · {empresa}", key=f"op_guardar_{empresa}", icon=":material/save:"):
-        n = _guardar_presupuesto(ctx, empresa, largo, g.name)
-        st.success(f"Presupuesto de {empresa} guardado: {n} filas de {', '.join(sorted(largo['hoja'].unique()))}.")
+    if st.button(f"Guardar presupuesto de Operaciones · {empresa} · {P.etiqueta(version)}", key=f"op_guardar_{empresa}", icon=":material/save:"):
+        n = _guardar_presupuesto(ctx, empresa, largo, g.name, version)
+        st.success(f"Presupuesto {version} de {empresa} guardado: {n} filas de {', '.join(sorted(largo['hoja'].unique()))}.")
         st.rerun()
 
 
@@ -978,7 +978,7 @@ admin_presupuesto = _admin_presupuesto           # lo usa Administración
 
 
 def _admin_mapeo(S):
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     partes = []
     for d in S.datos_e.values():
         if len(d.ppto_base):
@@ -996,7 +996,7 @@ def _admin_mapeo(S):
                         disabled=["sub_rubro", "presupuesto", "ejecutado"], column_config={
                             "sub_rubro": "Sub-rubro del rubro 3.1",
                             "presupuesto": st.column_config.NumberColumn("Presupuesto (módulo Presupuesto)", format="accounting"),
-                            "ejecutado": st.column_config.NumberColumn("Ejecutado (escenario)", format="accounting"),
+                            "ejecutado": st.column_config.NumberColumn("Ejecutado", format="accounting"),
                             "hoja": st.column_config.SelectboxColumn("Hoja", options=[SIN_HOJA, *HOJAS], required=True)})
     st.caption("Los movimientos de SAP de cada sub-rubro se comparan con la hoja elegida. Se propone una hoja cuando el nombre del sub-rubro "
                "la contiene (Papelería, Consumibles, Herramientas, Bolsas); lo demás queda en «Sin hoja asignada».")
@@ -1008,14 +1008,14 @@ def _admin_mapeo(S):
 
 def _guardar_sispo(ctx, empresa: str, periodo: int, d: pd.DataFrame, archivo: str) -> int:
     """Guarda las líneas de Operaciones del SISPO de una compañía y un periodo. Idempotente: reemplaza lo cargado antes de ese periodo."""
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     g = OS.para_guardar(d, empresa, periodo)
     ctx.con.execute("DELETE FROM oper_sispo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
     ctx.con.execute("DELETE FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
     if len(g):
-        _insertar_por_lotes(ctx, "oper_sispo(empresa, periodo, hoja, id_kardex, fecha, bodega, codigo, articulo, grupo, cuenta, cc_codigo, "
+        insertar_por_lotes(ctx, "oper_sispo(empresa, periodo, hoja, id_kardex, fecha, bodega, codigo, articulo, grupo, cuenta, cc_codigo, "
                                  "cc_nombre, cantidad, valor, concepto)",
-                            [tuple(_a_db(v) for v in r) for r in g.itertuples(index=False, name=None)], lote=40)
+                            [tuple(a_db(v) for v in r) for r in g.itertuples(index=False, name=None)], lote=40)
     ctx.con.execute("INSERT INTO oper_sispo_periodo(empresa, periodo, archivo, usuario, fecha, n_lineas, total_otros) VALUES(?,?,?,?,?,?,?)",
                     (empresa, int(periodo), archivo, ctx.usuario, ahora().strftime("%Y-%m-%d %H:%M"), len(g), OS.total_otros_c(d) / 100))
     ctx.registrar_carga(ctx.usuario, "SISPO operaciones", archivo, f"{empresa} {periodo}: {len(g)} líneas")
@@ -1067,7 +1067,7 @@ def sispo_guardar(ctx, empresa: str, periodo: int, a: dict, archivo: str) -> int
 
 
 def _revertir_sispo(ctx, empresa: str, periodo: int):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     for t in ("oper_sispo", "oper_sispo_periodo"):
         ctx.con.execute(f"DELETE FROM {t} WHERE empresa=? AND periodo=?", (empresa, int(periodo)))
     ctx.registrar_carga(ctx.usuario, "Reversión SISPO operaciones", "pantalla", f"{empresa} {periodo}")
@@ -1113,7 +1113,7 @@ def _recalcular_sispo(ctx):
 
 
 def _admin_sispo(S):
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     ctx = S.ctx
     cargado = ctx.leer("SELECT empresa, periodo, archivo, usuario, fecha, n_lineas, total_otros FROM oper_sispo_periodo ORDER BY periodo DESC, empresa")
     if cargado.empty:
@@ -1140,16 +1140,16 @@ def _admin_sispo(S):
 
 
 def _guardar_items(ctx, filas: list[tuple]):
-    _exigir_admin(ctx)
+    exigir_admin(ctx)
     ts = ahora().strftime("%Y-%m-%d %H:%M")
     ctx.con.execute("DELETE FROM oper_item_map")
-    _insertar_por_lotes(ctx, "oper_item_map(codigo, item, usuario, fecha)", [(c, i, ctx.usuario, ts) for c, i in filas], lote=80)
+    insertar_por_lotes(ctx, "oper_item_map(codigo, item, usuario, fecha)", [(c, i, ctx.usuario, ts) for c, i in filas], lote=80)
     ctx.registrar_carga(ctx.usuario, "Equivalencias referencia-ítem operaciones", "pantalla", f"{len(filas)} equivalencias")
     ctx.con.commit()
 
 
 def _admin_items(S):
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     nombres = {}
     if len(S.lin_sispo):
         nombres = dict(zip(S.lin_sispo["codigo"], S.lin_sispo["articulo"]))
@@ -1175,7 +1175,7 @@ def _admin_items(S):
 
 
 def _admin(S):
-    _exigir_admin(S.ctx)
+    exigir_admin(S.ctx)
     with st.expander("Datos base · SISPO aplicado, equivalencias y asignación de sub-rubros (administrador)", icon=":material/settings:"):
         st.markdown("**1. SISPO aplicado.** Reparte Consumibles, Herramientas y Bolsas (en pesos) y trae Papelería (en cantidades).")
         _admin_sispo(S)
@@ -1301,8 +1301,8 @@ def _X_hoja_resumen(wb, meta, r, secciones=None):
     fila = _X_seccion(ws, fila, "Indicadores del rubro 3.1 · valores en pesos (Papelería va aparte, en cantidades)", 9)
     k = r["kpis"]
     fila = _X_kpis(ws, fila, [
-        ("Presupuesto del escenario", k["presupuesto_esc"], _X_F_PESOS, None), ("Presupuesto al corte", k["presupuesto"], _X_F_PESOS, None),
-        ("Valor ejecutado", k["ejecutado"], _X_F_PESOS, None), ("Saldo disponible del escenario", k["saldo"], _X_F_PESOS, None),
+        ("Presupuesto total", k["presupuesto_esc"], _X_F_PESOS, None), ("Presupuesto al corte", k["presupuesto"], _X_F_PESOS, None),
+        ("Valor ejecutado", k["ejecutado"], _X_F_PESOS, None), ("Saldo disponible del presupuesto", k["saldo"], _X_F_PESOS, None),
         ("% de ejecución", _X_num(k["pct"]), _X_F_PCT, None), ("Variación (ejecutado − presupuesto al corte)", k["variacion"], _X_F_PESOS, None),
         ("Estado", k["estado"], None, _X_estado_color(k["estado"]))], _X_F_PESOS)
     if r.get("mensual_hojas"):
@@ -1314,8 +1314,8 @@ def _X_hoja_resumen(wb, meta, r, secciones=None):
     if r.get("papeleria"):
         c = r["papeleria"]
         fila = _X_seccion(ws, fila, "Papelería · cantidades (costo cero: no hay pesos que comparar)", 9)
-        fila = _X_cabecera_tabla(ws, fila, ["Concepto", "Cantidad presupuestada (escenario)", "Cantidad presupuestada al corte", "Cantidad ejecutada",
-                                          "Diferencia", "% ejecución", "Saldo del escenario", "Estado", "Salidas"])
+        fila = _X_cabecera_tabla(ws, fila, ["Concepto", "Cantidad presupuestada (total)", "Cantidad presupuestada al corte", "Cantidad ejecutada",
+                                          "Diferencia", "% ejecución", "Saldo del presupuesto", "Estado", "Salidas"])
         fila = _X_escribir(ws, fila, ["Papelería (unidades)", c["presupuesto_esc"], c["presupuesto"], c["ejecutado"], c["variacion"], _X_num(c["pct"]),
                                     c["saldo"], c["estado"], int(c["movimientos"])],
                            [None, _X_F_CANT, _X_F_CANT, _X_F_CANT, _X_F_CANT, _X_F_PCT, _X_F_CANT, None, "#,##0"], None, {8: _X_estado_color(c["estado"])})
@@ -1345,8 +1345,8 @@ def _X_hoja_detalle(wb, meta, s):
     c = s["cifras"]
     fila = _X_seccion(ws, fila, f"Indicadores · {u}", ancho)
     fila = _X_kpis(ws, fila, [
-        ("Presupuesto del escenario", c["presupuesto_esc"], fv, None), ("Presupuesto al corte", c["presupuesto"], fv, None),
-        ("Ejecutado", c["ejecutado"], fv, None), ("Saldo disponible del escenario", c["saldo"], fv, None),
+        ("Presupuesto total", c["presupuesto_esc"], fv, None), ("Presupuesto al corte", c["presupuesto"], fv, None),
+        ("Ejecutado", c["ejecutado"], fv, None), ("Saldo disponible del presupuesto", c["saldo"], fv, None),
         ("% de ejecución", _X_num(c["pct"]), _X_F_PCT, None), ("Variación", c["variacion"], fv, None),
         ("Estado", c["estado"], None, _X_estado_color(c["estado"]))], fv)
 
@@ -1354,7 +1354,7 @@ def _X_hoja_detalle(wb, meta, s):
     fila = _X_seccion(ws, fila, "Presupuesto vs ejecución por ítem", ancho)
     it = s["items"]
     if cant:
-        fila = _X_cabecera_tabla(ws, fila, ["Ítem", "Cantidad presupuestada (escenario)", "Cantidad presupuestada al corte", "Cantidad ejecutada",
+        fila = _X_cabecera_tabla(ws, fila, ["Ítem", "Cantidad presupuestada (total)", "Cantidad presupuestada al corte", "Cantidad ejecutada",
                                           "Diferencia", "% ejecución", "% de la cantidad presupuestada"])
         fi = [None, "#,##0", "#,##0", fv, fv, _X_F_PCT, _X_F_PCT]
         for row in it.itertuples(index=False):
@@ -1363,7 +1363,7 @@ def _X_hoja_detalle(wb, meta, s):
         fila = _X_escribir(ws, fila, ["Total", it["presupuesto_esc"].sum(), pt, it["ejecutado"].sum(), it["variacion"].sum(),
                                     _X_num(it["ejecutado"].sum() / pt) if pt > 0 else None, None], fi, "tot")
     else:
-        fila = _X_cabecera_tabla(ws, fila, ["Ítem", "Cantidad presupuestada", "Presupuesto escenario", "Presupuesto al corte",
+        fila = _X_cabecera_tabla(ws, fila, ["Ítem", "Cantidad presupuestada", "Presupuesto total", "Presupuesto al corte",
                                           "% ejecución", "Ejecutado", "Variación", "% del presupuesto"])
         fi = [None, "#,##0", fv, fv, _X_F_PCT, fv, fv, _X_F_PCT]
         for row in it.itertuples(index=False):
@@ -1578,7 +1578,7 @@ def _informe(S) -> bytes:
         if abs(float(s["movs"]["valor"].sum()) - float(s["cifras"]["ejecutado"])) >= 0.5:
             notas.append(f"ADVERTENCIA: en «{s['hoja_excel']}» los movimientos no suman el ejecutado del indicador.")
     sel_txt = " + ".join(S.sel)
-    meta = dict(rotulo="UPA" if S.escenario.startswith("UPA") else "PRESUPUESTO", subtitulo=f"Compañía: {sel_txt} · {S.escenario} · ejecutado {S.hasta} · generado {ahora().strftime('%d/%m/%Y %H:%M')}", notas=notas)
+    meta = dict(rotulo=P.rotulo(S.escenario), subtitulo=f"Compañía: {sel_txt} · {S.escenario} · ejecutado {S.hasta} · generado {ahora().strftime('%d/%m/%Y %H:%M')}", notas=notas)
     return _construir_informe(meta, resumen, secciones)
 
 
@@ -1660,24 +1660,27 @@ def _cargar_datos(ctx, cfg: dict) -> SimpleNamespace:
     per_sispo["periodo"] = pd.to_numeric(per_sispo["periodo"], errors="coerce")
     per_sispo["total_otros"] = pd.to_numeric(per_sispo["total_otros"], errors="coerce")
     items_eq = OS.mapa_items(leer("SELECT codigo, item FROM oper_item_map").itertuples(index=False, name=None))
-    ppto_op = leer("SELECT empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor FROM oper_ppto")
+    ppto_op = leer("SELECT empresa, hoja, item, orden, anio, mes, cantidad, costo_unit, valor, version FROM oper_ppto")
     for c in ("anio", "mes", "orden", "cantidad", "costo_unit", "valor"):
         ppto_op[c] = pd.to_numeric(ppto_op[c], errors="coerce")
     ppto_op["hoja"] = ppto_op["hoja"].replace({"Otros": OS.HOJA_OTROS})              # datos guardados con el nombre «Otros»
+    ppto_completo = ppto_op                                      # todas las versiones: define qué ítem es de qué hoja, para que la EJECUCIÓN no cambie con la versión
+    ppto_op, ppto_usado = P.filtrar_escenario(ppto_op, cfg)                              # solo el presupuesto de la versión elegida
     lin_guardadas = lin_sispo.copy()                                                # tal cual están guardadas (para el control de líneas)
-    lin_sispo = OS.filtrar_guardado(lin_sispo, items_eq, OS.items_presupuestados(ppto_op))   # mismos filtros del SISPO sobre lo ya guardado
-    lin_sispo = OS.hoja_por_item(lin_sispo, items_eq, OS.hojas_de_items(ppto_op))      # la lista presupuestada manda sobre el Grupo
+    lin_sispo = OS.filtrar_guardado(lin_sispo, items_eq, OS.items_presupuestados(ppto_completo))   # mismos filtros del SISPO sobre lo ya guardado
+    lin_sispo = OS.hoja_por_item(lin_sispo, items_eq, OS.hojas_de_items(ppto_completo))      # la lista presupuestada manda sobre el Grupo
     datos_e = {e: _datos_empresa(ctx, e, cfg, asig, mapeo, SimpleNamespace(lin=lin_sispo, per=per_sispo, items=items_eq)) for e in EMPRESAS}
     return SimpleNamespace(mapeo=mapeo, asig=asig, lin_sispo=lin_sispo, per_sispo=per_sispo, items_eq=items_eq, ppto_op=ppto_op,
-                           lin_guardadas=lin_guardadas, datos_e=datos_e)
+                           lin_guardadas=lin_guardadas, datos_e=datos_e, ppto_usado=ppto_usado,
+                           ppto_completo=ppto_completo)
 
 
-def serie_mensual(ctx, empresa: str, anio: int, mes: int):
+def serie_mensual(ctx, empresa: str, anio: int, mes: int, version=None):
     """Para la presentación: presupuesto y ejecución mes a mes de Bolsas y Herramientas, con las mismas cifras de la página.
     Devuelve ({hoja: tabla de _mensual sin la fila de total}, escenario) o (None, motivo) si no hay escenario para ese mes."""
-    esc = next((n for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio) and c["meses"][0] <= int(mes) <= c["meses"][1]), None)
+    esc = P.escenario_para(anio, mes, version)
     if esc is None:
-        return None, f"no hay un escenario presupuestal de Operaciones que cubra {MESES_L[int(mes) - 1]} de {anio}"
+        return None, f"no hay un escenario presupuestal de Operaciones que cubra {MESES_L[int(mes) - 1]} de {anio}" + (f" con el {P.etiqueta(version)}" if version else "")
     _asegurar_tablas(ctx)
     cfg = dict(L.ESCENARIOS[esc], escenario=esc)
     B = _cargar_datos(ctx, cfg)
@@ -1691,12 +1694,12 @@ def serie_mensual(ctx, empresa: str, anio: int, mes: int):
     return out, esc
 
 
-def items_mensual(ctx, empresa: str, anio: int, mes: int):
+def items_mensual(ctx, empresa: str, anio: int, mes: int, version=None):
     """Para la presentación: Bolsas y Herramientas por ítem en UN mes (presupuesto del libro y ejecución del SISPO ligada a su ítem), con la
     misma tabla de la pantalla. Devuelve ({hoja: tabla de _items}, escenario) o (None, motivo)."""
-    esc = next((n for n, c in L.ESCENARIOS.items() if c["anio"] == int(anio) and c["meses"][0] <= int(mes) <= c["meses"][1]), None)
+    esc = P.escenario_para(anio, mes, version)
     if esc is None:
-        return None, f"no hay un escenario presupuestal de Operaciones que cubra {MESES_L[int(mes) - 1]} de {anio}"
+        return None, f"no hay un escenario presupuestal de Operaciones que cubra {MESES_L[int(mes) - 1]} de {anio}" + (f" con el {P.etiqueta(version)}" if version else "")
     _asegurar_tablas(ctx)
     cfg = dict(L.ESCENARIOS[esc], escenario=esc)
     B = _cargar_datos(ctx, cfg)
@@ -1718,8 +1721,8 @@ def _mostrar(ctx, tecnico: bool = False):
         c_emp, c_esc, c_hasta = st.columns([1, 1, 1], vertical_alignment="bottom")
         vista_emp = c_emp.selectbox("Compañía", [TODAS, *EMPRESAS], key="op_empresa",
                                     help="Consolidado = ALDC + ALSM. " + " · ".join(f"{e}: {EMPRESAS[e]}" for e in EMPRESAS))
-        escenario = c_esc.selectbox("Escenario presupuestal", list(L.ESCENARIOS), key="op_escenario",
-                                    help="UPA 2026: sep–dic 2026. Normal 2027: ene–dic 2027. Sus cifras nunca se mezclan.")
+        escenario = selector_escenario(c_esc, "op_escenario", "Presupuesto",
+                                       help=P.AYUDA + " Normal 2027: presupuesto del año siguiente. Sus cifras nunca se mezclan.")
     cfg = dict(L.ESCENARIOS[escenario], escenario=escenario)
     sel = list(EMPRESAS) if vista_emp == TODAS else [vista_emp]
     m0, m1 = cfg["meses"]
@@ -1753,7 +1756,7 @@ def _mostrar(ctx, tecnico: bool = False):
                         lin_pap=(pd.concat([datos_e[e].lin_pap for e in sel], ignore_index=True) if ver_todo else OS.papeleria(pd.DataFrame(), cfg, "", {})),
                         avisos=[a for e in sel for a in datos_e[e].avisos],
                         sel_mes=sel_mes, ult=ult, m0_esc=m0_esc, completos=completos, lin_guardadas=lin_guardadas,
-                        presup=OS.items_presupuestados(ppto_op), items_eq=items_eq)
+                        presup=OS.items_presupuestados(B.ppto_completo), items_eq=items_eq)
     zona_encabezado.html(E.encabezado(
         "Operaciones" + ("" if ver_todo else f" · {usuario}"),
         "Operaciones · Papelería · Consumibles · Herramientas · Bolsas: presupuesto vs ejecución · valores en pesos · " + VERSION,
@@ -1776,9 +1779,10 @@ def _mostrar(ctx, tecnico: bool = False):
     else:
         S.hojas = list(HOJAS)
 
-    if ppto_op.empty:
-        st.warning("Aún no hay presupuesto de Operaciones cargado." + (" Cárgalo abajo, en «Datos base»." if es_admin
-                                                                      else " El administrador lo carga en «Datos base»."), icon=":material/warning:")
+    if ppto_op.empty or B.ppto_usado is None:
+        st.warning(("Aún no hay presupuesto de Operaciones cargado." if B.ppto_completo.empty
+                    else f"No hay presupuesto de Operaciones para «{escenario}».")
+                   + (" Cárgalo abajo, en «Datos base»." if es_admin else " El administrador lo carga en «Datos base»."), icon=":material/warning:")
         if es_admin:
             _admin(S)
         return
@@ -1786,6 +1790,9 @@ def _mostrar(ctx, tecnico: bool = False):
         st.info(f"No hay ejecución del rubro {RUBRO_COD} en {escenario} para {vista_emp}: se muestra el presupuesto y la ejecución sale en cero "
                 "hasta que se cargue en el módulo de ejecución.", icon=":material/info:")
 
+    nota = (P.nota_version(B.ppto_usado, cfg["version"]) if cfg["version"] else "") or P.aviso_base(leer, cfg, sel)
+    if nota:                                            # el presupuesto cargado no tiene versión (o falta la versión en Presupuesto): se usa igual, pero se avisa
+        st.caption(nota)
     for aviso in S.avisos:                                  # SISPO que difiere de SAP, o mes con SAP y sin SISPO
         st.warning(aviso, icon=":material/rule:")
     if _tecnico():                                      # Administración: descarga del informe, detalle técnico y descargas por hoja

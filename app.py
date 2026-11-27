@@ -121,7 +121,9 @@ def conectar():
         "combustible": {c: "TEXT DEFAULT ''" for c in ["clave", "documento", "estacion", "hora", "km"]},
         "cp_ejec": {"tarifa": "REAL", "valor_corte": "REAL", "valor_poda": "REAL", "actualizado": "TEXT DEFAULT ''"},
         "nomina_homol": {"cc": "TEXT DEFAULT ''"},
-        "nomina_ppto": {c: "DOUBLE PRECISION" for c in nomina.COLS_CONCEPTO},
+        "nomina_ppto": {"empresa": "TEXT DEFAULT 'ALDC'", **{c: "DOUBLE PRECISION" for c in nomina.COLS_CONCEPTO}, "version": "TEXT DEFAULT ''"},
+        "nomina_ejec": {"empresa": "TEXT DEFAULT 'ALDC'"},
+        "cp_ppto": {"version": "TEXT DEFAULT ''"},                  # versión del presupuesto (Inicial · 4+8 · 8+4); vacía = cargado antes de las versiones
         "ejecucion": {**{c: "TEXT DEFAULT ''" for c in ["clave", "origen", "regla", "confianza", "cc_sap",
                                                        "contrapartida", "anulado", "mod_cod", "mod_sub", "mod_cc",
                                                        "raw"]}, "empresa": "TEXT DEFAULT 'ALDC'"},

@@ -11,7 +11,8 @@ import cargas
 import datos
 import estilo as E
 import lineas
-from ui import EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, estilo_grafico, titulo_tarjeta
+import presupuestos as P
+from ui import EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, estilo_grafico, selector_presupuesto, titulo_tarjeta
 
 COLS_RAW = ["Presupuesto anual", "Presupuesto al corte", "Ejecutado al corte"]
 
@@ -94,16 +95,8 @@ def mostrar(ctx):
         anio = next(cols).selectbox("Año", anios, key=f"pp_anio_{empresa}",
                                     index=anios.index(con_ej) if con_ej in anios else 0)
 
-        versiones = leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?",
-                         (anio, empresa))["version"].tolist()
-        orden_v = {"Inicial": 0, "4+8": 1, "8+4": 2}
-        versiones = sorted(versiones, key=lambda v: (orden_v.get(v, 9), v)) or ["Inicial"]
-        if st.session_state.get("pp_version") not in versiones:     # por defecto la versión más reciente (8+4)
-            st.session_state["pp_version"] = "8+4" if "8+4" in versiones else versiones[-1]
-        version = next(cols).selectbox("Comparar contra", versiones, key="pp_version",
-                                       format_func=lambda v: f"Presupuesto {v}",
-                                       help="Inicial: el aprobado. 4+8: 4 meses reales + 8 presupuestados. "
-                                            "8+4: 8 meses reales + 4 presupuestados (cierre esperado del año).")
+        versiones = P.versiones_de(leer, anio, empresa)
+        version = selector_presupuesto(next(cols), versiones, "pp_version", "Comparar contra")
 
         asig = asignacion.mapa(leer)
         todas = sorted({g for g in asig.values() if g})

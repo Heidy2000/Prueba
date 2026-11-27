@@ -7,23 +7,23 @@ import estilo as E
 import nomina
 import dotacion as D
 import logica_m as L
+import presupuestos as P
 import sispo_fuente
-from ui import MESES, MESES_L, a_excel, estilo_grafico, selector_periodo, titulo_tarjeta
+from ui import EMPRESAS, MESES, MESES_L, a_excel, estilo_grafico, excel_hojas, selector_periodo, selector_presupuesto, titulo_tarjeta, version_elegida
 
 SIN_AREA = "SIN ÁREA"
-def _excel_hojas(hojas: dict) -> bytes:
-    from io import BytesIO
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        for nombre, df in hojas.items():
-            df.to_excel(w, sheet_name=nombre[:31], index=False)
-    return buf.getvalue()
 
 
-def preparar(leer, anio: int):
-    """Presupuesto y ejecución del año con área y cargo común. También el conteo de personas reales."""
-    ppto = leer("SELECT * FROM nomina_ppto WHERE anio=?", (anio,))
-    ejec = leer("SELECT * FROM nomina_ejec WHERE anio=?", (anio,))
+def preparar(leer, anio: int, empresa: str | None = None, version: str | None = None):
+    """Presupuesto y ejecución del año con área y cargo común. También el conteo de personas reales.
+    `empresa`: solo esa compañía (sin ella, las dos, como antes). `version`: presupuesto de esa versión; si lo cargado no tiene versión se usa
+    igual. La versión realmente usada queda en `ppto.attrs["version_usada"]` (None = no hay presupuesto de esa versión)."""
+    filtro, par = (" AND COALESCE(empresa, 'ALDC')=?", (anio, empresa)) if empresa else ("", (anio,))
+    ppto = leer("SELECT * FROM nomina_ppto WHERE anio=?" + filtro, par)
+    ejec = leer("SELECT * FROM nomina_ejec WHERE anio=?" + filtro, par)
+    usada = version
+    if version is not None:
+        ppto, usada = P.filtrar(ppto, version)
     ceco = dict(leer("SELECT cc, area FROM nomina_ceco").values.tolist())
     ejec["area"] = ejec["cc"].map(ceco).fillna(SIN_AREA) if not ejec.empty else []
     ppto["area"] = ppto["area"].replace("", SIN_AREA) if not ppto.empty else []
@@ -37,6 +37,7 @@ def preparar(leer, anio: int):
         pers = base.groupby(["mes", "area", "comun", "cargo"]).size().rename("personas").reset_index()
     else:
         pers = pd.DataFrame(columns=["mes", "area", "comun", "cargo", "personas"])
+    ppto.attrs["version_usada"] = usada
     return ppto, ejec, pers
 
 
@@ -53,16 +54,20 @@ def mostrar(ctx):
     # ------------------------------------------------------------ filtros del informe
     with st.container(key="card_filtros"):
         st.html('<div class="nf-ftit">Filtros del informe</div>')
-        c = st.columns([0.7, 1.4, 0.95, 2.2], vertical_alignment="bottom")
+        c = st.columns([0.7, 1.2, 0.9, 1.1, 1.9], vertical_alignment="bottom")
         con_ejec = leer("SELECT DISTINCT anio FROM nomina_ejec")["anio"].tolist()
         anio = c[0].selectbox("Año", anios, index=anios.index(max(con_ejec)) if con_ejec else 0, key="nm_anio")
-        ppto, ejec, pers = preparar(leer, int(anio))
+        versiones = P.versiones_guardadas(leer("SELECT DISTINCT version FROM nomina_ppto WHERE anio=?", (int(anio),)))
+        version = selector_presupuesto(c[3], versiones, "nm_version", "Comparar contra") if versiones else version_elegida()
+        ppto, ejec, pers = preparar(leer, int(anio), version=version)
+        if versiones and ppto.attrs.get("version_usada") != version:
+            st.caption(P.nota_version(ppto.attrs.get("version_usada"), version))
         meses_ej = sorted(ejec["mes"].unique()) if not ejec.empty else []
         meses_pp = sorted(ppto["mes"].unique()) if not ppto.empty else [1]
         ult = int(max(meses_ej)) if meses_ej else int(max(meses_pp))
         per = selector_periodo(c[1], c[2], ult, "nm")
         areas = sorted(set(ppto["area"]) | set(ejec["area"]))
-        areas_f = c[3].multiselect("Área", areas, placeholder="Todas las áreas", key="nm_area")
+        areas_f = c[4].multiselect("Área", areas, placeholder="Todas las áreas", key="nm_area")
         c2 = st.columns([2.2, 1.3], vertical_alignment="bottom")
         if areas_f:
             ppto, ejec = ppto[ppto["area"].isin(areas_f)], ejec[ejec["area"].isin(areas_f)]
@@ -339,7 +344,7 @@ def mostrar(ctx):
                 det_x = det.reset_index().rename(columns={"cc_": "Concepto", "concepto": "Concepto SAP",
                                                           "valor": "Ejecutado"}) if not e.empty else pd.DataFrame()
                 st.download_button("Descargar variación por concepto",
-                                   lambda a=plano, b=det_x: a_excel(a) if b.empty else _excel_hojas(
+                                   lambda a=plano, b=det_x: a_excel(a) if b.empty else excel_hojas(
                                        {"Por concepto": a, "Detalle SAP": b}),
                                    f"nomina_variacion_concepto_{anio}.xlsx", icon=":material/download:")
 
@@ -573,3 +578,55 @@ def _dotacion(ctx):
                         st.info("No hay presupuesto ni ejecución en este grupo para el periodo elegido.")
                     with st.expander("Ver como tabla (cantidades y estado)", icon=":material/table:"):
                         tabla(x, sec)
+
+
+# ====================================================================== ADMINISTRACIÓN
+def sin_homologar_admin(ctx):
+    """Administración → Nómina → Sin homologar: cargos de SAP que no encontraron un cargo del presupuesto, y cargos
+    presupuestados sin nadie en la nómina del mes. Se corrigen en «Homologar cargos»."""
+    leer = ctx.leer
+    with st.container(key="card_adm_nm_sin"):
+        titulo_tarjeta("Sin homologar",
+                       "Cargos de SAP que no encontraron un cargo del presupuesto, y cargos presupuestados sin nadie en "
+                       "la nómina. Se corrigen en la pestaña «Homologar cargos».")
+        hay = leer("SELECT DISTINCT COALESCE(empresa, 'ALDC') empresa, anio, mes FROM nomina_ejec")
+        if hay.empty:
+            st.info("Aún no hay nómina ejecutada cargada.")
+            return
+        c = st.columns([1.2, .8, 1, 1.4], vertical_alignment="bottom")
+        empresas = [e for e in EMPRESAS if e in set(hay["empresa"])] or sorted(set(hay["empresa"]))
+        empresa = c[0].selectbox("Compañía", empresas, key="adm_nm_sin_emp",
+                                 format_func=lambda e: f"{e} · {EMPRESAS.get(e, e)}")
+        h_e = hay[hay["empresa"] == empresa]
+        anios = sorted(set(h_e["anio"].astype(int)), reverse=True)
+        anio = int(c[1].selectbox("Año", anios, key=f"adm_nm_sin_anio_{empresa}"))
+        meses = sorted(set(h_e.loc[h_e["anio"] == anio, "mes"].astype(int)))
+        mes = int(c[2].selectbox("Mes", meses, index=len(meses) - 1, key=f"adm_nm_sin_mes_{empresa}_{anio}",
+                                 format_func=lambda m: MESES_L[m - 1].capitalize()))
+        modo = c[3].segmented_control("Periodo", ["Solo el mes", "Acumulado"], default="Solo el mes",
+                                      key="adm_nm_sin_modo") or "Solo el mes"
+        ppto, ejec, pers = preparar(leer, anio, empresa, version_elegida())
+        ej_per = ejec[ejec["mes"] == mes] if modo == "Solo el mes" else ejec[ejec["mes"] <= mes]
+        pp_mes, re_mes = ppto[ppto["mes"] == mes], pers[pers["mes"] == mes]
+        periodo = MESES_L[mes - 1] if modo == "Solo el mes" else f"enero a {MESES_L[mes - 1]}"
+
+        s1 = ej_per[ej_per["comun"] == nomina.SIN_PPTO].groupby(["area", "cargo"]).agg(
+            Personas=("empleado_id", "nunique"), Valor=("valor", "sum")).reset_index() \
+            .sort_values("Valor", ascending=False).rename(columns={"area": "Área", "cargo": "Cargo en SAP"})
+        st.markdown(f"**En SAP sin presupuesto** ({periodo} {anio}) · {len(s1)} cargos · {E.millones(s1['Valor'].sum())}")
+        st.dataframe(s1, hide_index=True, width="stretch",
+                     column_config={"Valor": st.column_config.NumberColumn(format="accounting")})
+        con = set(zip(re_mes["area"], re_mes["comun"]))
+        s2 = pp_mes[[(a, c_) not in con for a, c_ in zip(pp_mes["area"], pp_mes["comun"])]] \
+            .groupby(["area", "comun"]).agg(Personas=("personas", "sum"), Valor=("valor", "sum")) \
+            .reset_index().query("Personas > 0").sort_values("Valor", ascending=False) \
+            .rename(columns={"area": "Área", "comun": "Cargo presupuestado"})
+        st.markdown(f"**Presupuestados sin nadie en la nómina de {MESES_L[mes - 1]} {anio}** · {len(s2)} cargos")
+        st.dataframe(s2, hide_index=True, width="stretch",
+                     column_config={"Valor": st.column_config.NumberColumn("Valor del mes", format="accounting"),
+                                    "Personas": st.column_config.NumberColumn(format="%.0f")})
+        if len(s1) or len(s2):
+            st.download_button("Descargar sin homologar", lambda a=s1, b=s2: excel_hojas(
+                {"En SAP sin presupuesto": a, "Presupuestados sin nómina": b}),
+                f"nomina_sin_homologar_{empresa}_{anio}{mes:02d}.xlsx", icon=":material/download:",
+                key="adm_nm_sin_bajar")

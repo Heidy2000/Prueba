@@ -28,6 +28,7 @@ import cargas
 import datos
 import eeff
 import nomina
+import presupuestos as P
 
 PLANTILLA = Path(__file__).with_name("plantilla_presentacion.pptx")
 SECCIONES = ["Portada", "Resumen del mes", "Presupuesto", "Nómina", "Flujo de caja", "Combustible", "Facturación de aseo",
@@ -399,6 +400,16 @@ def _fila_tarjetas(s, y, tarjetas, x0=500000, x1=ANCHO - 500000, alto=1180000, t
 
 
 # ------------------------------------------------------------------ presupuesto
+def _nota_version(R, seccion: str, usada):
+    """Si una sección no pudo usar exactamente el presupuesto elegido (no está cargado en ese módulo, o se cargó sin versión), lo deja anotado
+    para avisarlo al terminar: la presentación nunca compara en silencio contra otro presupuesto."""
+    v = R["version"]
+    if usada == v or usada is None:
+        return
+    R["notas"].append(f"{seccion}: el presupuesto cargado no tiene versión; se comparó contra él como {P.etiqueta(v)}." if usada == ""
+                      else f"{seccion}: no hay {P.etiqueta(v)} cargado en este módulo; se comparó contra el {P.etiqueta(usada)}.")
+
+
 def _datos_ppto(leer, empresa, anio, mes, version):
     ppto = leer("SELECT codigo, sub_rubro, mes, valor FROM presupuesto WHERE anio=? AND version=? AND empresa=?",
                 (anio, version, empresa))
@@ -591,9 +602,10 @@ _CONC_CORTO = {"Sueldos y salarios": "Sueldos", "Horas extra y recargos": "Horas
 
 def _diap_nomina(prs, base, leer, empresa, anio, mes, R):
     import mod_nomina
-    ppto, ejec, pers = mod_nomina.preparar(leer, anio, empresa)
+    ppto, ejec, pers = mod_nomina.preparar(leer, anio, empresa, R["version"])
     if ejec.empty or not (ejec["mes"] == mes).any():
         return f"Nómina: no hay nómina ejecutada de {MESES_L[mes - 1]} {anio} para {empresa}."
+    _nota_version(R, "Nómina", ppto.attrs.get("version_usada"))
     ml = MESES_L[mes - 1]
     ejec = ejec.assign(cc_=ejec["concepto"].map(nomina.concepto_sap))
     pp, ej = ppto[ppto["mes"] == mes], ejec[ejec["mes"] == mes]
@@ -1285,7 +1297,7 @@ def _diap_resumen(prs, base, empresa, anio, mes, R):
     if not R["kpi"] and not R["dest"]:
         return "Resumen del mes: no hay información del mes para resumir."
     s = _clonar(prs, base, f"Resumen del mes {MESES_L[mes - 1]} {anio}",
-                f"{EMPRESAS.get(empresa, empresa)} · cifras principales y lo más importante del mes")
+                f"{EMPRESAS.get(empresa, empresa)} · cifras principales y lo más importante del mes · frente al {P.etiqueta(R['version'])}")
     orden = ["ing", "ebitda", "neto", "caja", "nomina", "personas", "comb", "ktnc"]
     tiles = [R["kpi"][k] for k in orden if k in R["kpi"]]
     por_fila = 4 if len(tiles) in (4, 7, 8) else (3 if len(tiles) > 2 else max(len(tiles), 1))
@@ -1324,8 +1336,11 @@ def _diap_corte(prs, base, leer, empresa, anio, mes, R):
     pp = leer("SELECT * FROM cp_ppto WHERE anio=?", (anio,))
     ej = leer("SELECT * FROM cp_ejec WHERE anio=?", (anio,))
     ml = MESES_L[mes - 1]
+    pp, usada = P.filtrar(pp, R["version"])
     if pp.empty:
-        return f"Corte de césped: no hay presupuesto de corte de {anio} (Administración → Corte y poda)."
+        return (f"Corte de césped: no hay presupuesto de corte de {anio} (Administración → Corte y poda)." if usada is not None or not len(leer("SELECT 1 FROM cp_ppto WHERE anio=? LIMIT 1", (anio,)))
+                else f"Corte de césped: no hay presupuesto de corte {R['version']} cargado para {anio} (Administración → Corte y poda).")
+    _nota_version(R, "Corte de césped", usada)
     t = CP.tabla_mensual(pp, ej if not ej.empty else pd.DataFrame(columns=["anio", "mes", "m2", "valor_corte", "arboles", "valor_poda"]))
     fila = t[t["mes"] == mes]
     if fila.empty or pd.isna(fila.iloc[0]["m2_ej"]):
@@ -1388,7 +1403,7 @@ def _diap_operativo(prs, base, leer, empresa, anio, mes, R):
     if ctx is None:
         return "Consumo operativo: faltó la conexión a la base para armarlo."
     import operaciones as OP
-    series, esc = OP.serie_mensual(ctx, empresa, anio, mes)
+    series, esc = OP.serie_mensual(ctx, empresa, anio, mes, R["version"])
     if series is None:
         return f"Consumo operativo: {esc}."
     nombres = {"Bolsas": "Bolsas", "Herramientas": "Herramientas"}
@@ -1439,11 +1454,12 @@ def _diap_operativo(prs, base, leer, empresa, anio, mes, R):
     return None
 
 
-def _flota_mensual(ctx, empresa, anio):
-    """Presupuesto y ejecución del sub-rubro «Flota y Equipo de transporte» por mes (misma base que la pantalla de Mantenimiento)."""
+def _flota_mensual(ctx, empresa, anio, version=None):
+    """Presupuesto y ejecución del sub-rubro «Flota y Equipo de transporte» por mes (misma base que la pantalla de Mantenimiento), con el
+    presupuesto de la versión elegida (si no está cargada, la más cercana)."""
     import logica_m as L
     import mod_mantenimiento as MM
-    version = MM._version_para(ctx, empresa, anio)
+    version = P.version_para(ctx.leer, empresa, anio, version)
     ppto, ejec = MM._base(ctx, empresa, anio, version)
     k = cargas.norm(L.SUBRUBRO_FLOTA)
     p = ppto[ppto["_sub"] == k].groupby("mes")["valor"].sum() if len(ppto) else pd.Series(dtype=float)
@@ -1456,7 +1472,8 @@ def _diap_flota(prs, base, leer, empresa, anio, mes, R):
     ml = MESES_L[mes - 1]
     if ctx is None:
         return "Mantenimiento de flota: faltó la conexión a la base para armarlo."
-    p, e, version = _flota_mensual(ctx, empresa, anio)
+    p, e, version = _flota_mensual(ctx, empresa, anio, R["version"])
+    _nota_version(R, "Mantenimiento de flota", version)
     e = e[e.index <= mes]
     if e.empty or mes not in e.index or abs(e.get(mes, 0.0)) < 1:
         return f"Mantenimiento de flota: no hay ejecución de {ml} {anio} para {empresa}."
@@ -1685,7 +1702,7 @@ def _diap_flota_placas(prs, base, leer, empresa, anio, mes, R):
         return "Flota por placa: faltó la conexión a la base para armarlo."
     import logica_m as L
     import mod_mantenimiento as MM
-    v, esc = MM.datos_placas(ctx, empresa, anio, mes)
+    v, esc = MM.datos_placas(ctx, empresa, anio, mes, R["version"])
     if v is None:
         return f"Flota por placa: {esc}."
     nodos = L.arbol_placas(v)
@@ -1792,7 +1809,7 @@ def _diap_operativo_items(prs, base, leer, empresa, anio, mes, R):
     if ctx is None:
         return "Operaciones por ítem: faltó la conexión a la base para armarlo."
     import operaciones as OP
-    its, esc = OP.items_mensual(ctx, empresa, anio, mes)
+    its, esc = OP.items_mensual(ctx, empresa, anio, mes, R["version"])
     if its is None:
         return f"Operaciones por ítem: {esc}."
 
@@ -1864,7 +1881,7 @@ _ARMAR = {"Presupuesto": _diap_presupuesto, "Nómina": _diap_nomina, "Flujo de c
           "Estado de resultados": _diap_pyg}
 
 
-def generar(leer, empresa: str, anio: int, mes: int, version: str = "8+4", secciones=None, ctx=None) -> tuple[bytes, list[str]]:
+def generar(leer, empresa: str, anio: int, mes: int, version: str = P.DEFECTO, secciones=None, ctx=None) -> tuple[bytes, list[str]]:
     """Presentación del mes para una compañía. Devuelve el archivo .pptx y la lista de secciones que no se pudieron
     armar (sin datos de ese mes). `ctx` (el contexto de la aplicación) lo piden las diapositivas de Operaciones y Flota,
     que usan los mismos cálculos de sus pantallas."""
@@ -1872,7 +1889,7 @@ def generar(leer, empresa: str, anio: int, mes: int, version: str = "8+4", secci
     anio, mes = int(anio), int(mes)
     prs = Presentation(str(PLANTILLA))
     base = prs.slides[0]
-    R = {"version": version, "kpi": {}, "dest": [], "ctx": ctx}
+    R = {"version": version, "kpi": {}, "dest": [], "ctx": ctx, "notas": []}
     avisos = []
     con_resumen = "Resumen del mes" in secciones
     borrador = Presentation(str(PLANTILLA)) if con_resumen else None   # temas no elegidos: solo para el resumen
@@ -1905,11 +1922,52 @@ def generar(leer, empresa: str, anio: int, mes: int, version: str = "8+4", secci
     primero = list(ids)[0]
     prs.part.drop_rel(primero.rId)
     ids.remove(primero)
+    avisos += [n for n in R["notas"] if n not in avisos]        # presupuestos que no son exactamente el elegido
     if not len(ids):
         return b"", avisos
     buf = BytesIO()
     prs.save(buf)
     return buf.getvalue(), avisos
+
+
+# diapositivas agrupadas por tema, para elegirlas en pantalla (el orden final del archivo lo fija `_ARMAR`)
+GRUPOS = {
+    "Inicio": ["Portada", "Resumen del mes"],
+    "Finanzas": ["Presupuesto", "Flujo de caja", "Balance e indicadores", "Estado de resultados"],
+    "Personal y operación": ["Nómina", "Combustible", "Facturación de aseo", "Corte de césped", "Consumo operativo", "Operaciones por ítem"],
+    "Mantenimiento": ["Mantenimiento de flota", "Flota por placa"],
+}
+
+
+def disponibilidad(leer, empresa: str, anio: int, mes: int, version: str) -> dict:
+    """Qué diapositivas tienen datos para ese mes: {nombre: (hay datos, motivo si no)}. Son consultas rápidas de existencia; no arman nada.
+    Una consulta que falla (tabla que aún no existe) cuenta como «sin datos»."""
+    def hay(sql, par) -> bool:
+        try:
+            return bool(len(leer(sql + " LIMIT 1", par)))
+        except Exception:
+            return False
+    e, a, m = empresa, int(anio), int(mes)
+    con_ppto = hay("SELECT 1 FROM presupuesto WHERE anio=? AND version=? AND empresa=?", (a, version, e))
+    con_ejec = hay("SELECT 1 FROM ejecucion WHERE anio=? AND mes=? AND empresa=? AND codigo<>''", (a, m, e))
+    res = {"Portada": (True, ""), "Resumen del mes": (True, "")}
+    res["Presupuesto"] = (con_ppto and con_ejec, "" if con_ppto and con_ejec else
+                          (f"no hay {P.etiqueta(version)} cargado" if not con_ppto else "no hay ejecución del mes"))
+    res["Nómina"] = (hay("SELECT 1 FROM nomina_ejec WHERE anio=? AND mes=? AND COALESCE(empresa,'ALDC')=?", (a, m, e)), "no hay nómina del mes")
+    res["Flujo de caja"] = (hay("SELECT 1 FROM flujo_mov WHERE anio=? AND mes=? AND COALESCE(empresa,'ALDC')=?", (a, m, e)), "no hay movimientos de caja del mes")
+    res["Combustible"] = (hay("SELECT 1 FROM combustible WHERE anio=? AND mes=? AND empresa=?", (a, m, e)), "no hay tanqueos del mes")
+    res["Facturación de aseo"] = (hay("SELECT 1 FROM facturacion_mes WHERE empresa=? AND anio=? AND mes=?", (e, a, m)) or (e, a) in FACT_HISTORICO,
+                                  "no hay facturación del mes")
+    res["Corte de césped"] = (e == "ALDC" and hay("SELECT 1 FROM cp_ejec WHERE anio=? AND mes=?", (a, m)),
+                              "solo ALDC" if e != "ALDC" else "no hay ejecución del mes")
+    sispo = hay("SELECT 1 FROM oper_sispo_periodo WHERE empresa=? AND periodo=?", (e, a * 100 + m))
+    res["Consumo operativo"] = (sispo, "no hay SISPO del mes")
+    res["Operaciones por ítem"] = (sispo, "no hay SISPO del mes")
+    res["Mantenimiento de flota"] = (con_ejec, "no hay ejecución del mes")
+    res["Flota por placa"] = (con_ejec, "no hay ejecución del mes")
+    res["Balance e indicadores"] = (hay("SELECT 1 FROM eeff WHERE empresa=? AND anio=? AND mes=?", (e, a, m)), "no hay estados financieros del mes")
+    res["Estado de resultados"] = res["Balance e indicadores"]
+    return res
 
 
 def nombre_archivo(empresa: str, anio: int, mes: int) -> str:

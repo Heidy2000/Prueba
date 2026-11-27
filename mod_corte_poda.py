@@ -10,7 +10,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import estilo as E
-from ui import MESES_L, ahora, estilo_grafico, selector_periodo, titulo_tarjeta
+import presupuestos as P
+from ui import MESES_L, ahora, estilo_grafico, selector_periodo, selector_presupuesto, titulo_tarjeta, version_elegida
 
 TABLAS = """
 CREATE TABLE IF NOT EXISTS cp_ppto(anio INT, mes INT, m2 REAL, tarifa_corte_mta REAL, tarifa_corte_nmt REAL,
@@ -173,10 +174,13 @@ def admin_cargas(ctx):
                     st.dataframe(d.drop(columns=["tarifa_corte_nmt", "valor_corte_nmt", "valor_poda_nmt"]).rename(columns={
                         "anio": "Año", "mes": "Mes", "m2": "m²", "tarifa_corte_mta": "$/m²", "valor_corte_mta": "Total corte",
                         "arboles": "Árboles", "valor_poda_mta": "Poda"}), hide_index=True, width="stretch")
-                    if st.button("Guardar presupuesto", type="primary", key="cp_g_ppto"):
+                    version = st.selectbox("Presupuesto al que corresponde el libro", list(P.VERSIONES), index=list(P.VERSIONES).index(version_elegida()),
+                                           key="cp_ver_ppto", format_func=P.etiqueta, help=P.AYUDA)
+                    if st.button(f"Guardar presupuesto · {P.etiqueta(version)}", type="primary", key="cp_g_ppto"):
+                        sin_version = " OR version IS NULL OR version=''" if version == P.V84 else ""      # lo cargado antes de las versiones era el 8+4
                         for anio in d["anio"].unique():
-                            con.execute("DELETE FROM cp_ppto WHERE anio=?", (int(anio),))
-                        d2 = d.assign(archivo=f.name)
+                            con.execute(f"DELETE FROM cp_ppto WHERE anio=? AND (version=?{sin_version})", (int(anio), version))
+                        d2 = d.assign(archivo=f.name, version=version)
                         con.anexar(d2, "cp_ppto"); con.commit()
                         ctx.registrar_carga(ctx.usuario, "Corte y poda · presupuesto", f.name, f"{len(d)} meses")
                         st.success("Presupuesto guardado.")
@@ -272,7 +276,8 @@ MOSTRAR_PODA = False        # de momento la página solo muestra el corte; la po
 # ------------------------------------------------------------------ pestaña
 def mostrar(ctx):
     leer = ctx.leer
-    ppto, ejec = leer("SELECT * FROM cp_ppto"), leer("SELECT * FROM cp_ejec")
+    ppto_todo, ejec = leer("SELECT * FROM cp_ppto"), leer("SELECT * FROM cp_ejec")
+    ppto = ppto_todo
     zona = st.container()
     if ppto.empty:
         zona.html(E.encabezado("Corte y poda", "Ejecución de área y de árboles contra el presupuesto" if MOSTRAR_PODA else "Ejecución de área cortada contra el presupuesto", []))
@@ -280,11 +285,19 @@ def mostrar(ctx):
         return
     with st.container(key="card_filtros"):
         st.html('<div class="nf-ftit">Filtros del informe</div>')
-        c = st.columns([0.8, 1.6, 0.9], vertical_alignment="bottom")
+        c = st.columns([0.8, 1.6, 0.9, 1.1], vertical_alignment="bottom")
         anios = sorted(ppto["anio"].unique())
         anio = c[0].selectbox("Año", anios, index=len(anios) - 1 if not ejec.empty and ejec["anio"].max() >= anios[-1] else 0, key="cp_anio")
         ult = int(ejec.loc[ejec["anio"] == anio, "mes"].max()) if (ejec["anio"] == anio).any() else int(ppto.loc[ppto["anio"] == anio, "mes"].min())
         per = selector_periodo(c[1], c[2], ult, "cp")
+        versiones = P.versiones_guardadas(ppto_todo)
+        version = selector_presupuesto(c[3], versiones, "cp_version", "Comparar contra") if versiones else version_elegida()
+    ppto, usada = P.filtrar(ppto_todo, version)                  # el presupuesto de la versión elegida (o el cargado sin versión)
+    if usada is None:
+        st.info(P.nota_version(usada, version))
+        return
+    if versiones and usada != version:
+        st.caption(P.nota_version(usada, version))
     t = tabla_mensual(ppto[ppto["anio"] == anio], ejec[ejec["anio"] == anio])
     t = per.filtrar(t)
     chips = [(f"{'Mes' if per.solo else 'Corte'}: {MESES_L[per.mes - 1].capitalize()} {anio}", "")]

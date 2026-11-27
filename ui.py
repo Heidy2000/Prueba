@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 
 import estilo as E
+import presupuestos as P
 
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 MESES_L = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
@@ -126,6 +127,91 @@ def selector_periodo(col_modo, col_mes, ultimo_mes: int, clave: str) -> Periodo:
                             index=ultimo_mes - 1, format_func=lambda m: MESES_L[m - 1].capitalize(),
                             key=f"{clave}_mes")
     return Periodo(modo, mes)
+
+
+# ------------------------------------------------------------------ presupuesto elegido (compartido por todos los módulos)
+def _sincronizar(key: str, valores: list, a_valor, defecto):
+    """Pone en el selector `key` el valor que corresponde a la versión compartida cuando esta cambió (o el selector aún no existe).
+    `a_valor(version)` devuelve la opción del selector para esa versión (None si no la tiene). Una elección hecha en este mismo selector
+    se respeta: su callback ya actualizó la versión compartida y lo «visto»."""
+    comp = st.session_state.get(P.CLAVE_VERSION)
+    if comp is not None and (key not in st.session_state or st.session_state.get(key + "__ppto") != comp):
+        objetivo = a_valor(comp)
+        if objetivo in valores:
+            st.session_state[key] = objetivo
+        st.session_state[key + "__ppto"] = comp
+    if st.session_state.get(key) not in valores:
+        st.session_state[key] = defecto
+
+
+def _al_elegir(key: str, a_version):
+    elegido = st.session_state.get(key)
+    v = a_version(elegido)
+    if v:
+        st.session_state[P.CLAVE_VERSION] = v
+    st.session_state[key + "__ppto"] = st.session_state.get(P.CLAVE_VERSION)
+
+
+def selector_presupuesto(contenedor, versiones, key: str, label: str = "Presupuesto", help: str = P.AYUDA) -> str:
+    """Selector de la versión del presupuesto (Inicial · 4+8 · 8+4) ligado a la elección compartida: lo que se elige aquí lo siguen
+    los demás módulos y la presentación. `versiones` = las que tiene cargadas el módulo; si falta la elegida, se muestra la más cercana
+    sin cambiar la elección compartida."""
+    versiones = P.ordenar(versiones) or [P.INICIAL]
+    _sincronizar(key, versiones, lambda v: v, P.elegir(versiones))
+    v = contenedor.selectbox(label, versiones, key=key, format_func=P.etiqueta, help=help, on_change=_al_elegir, args=(key, lambda x: x))
+    st.session_state.setdefault(P.CLAVE_VERSION, v)
+    return v
+
+
+def selector_escenario(contenedor, key: str, label: str = "Presupuesto", help: str = "") -> str:
+    """Selector del escenario de Mantenimiento y Operaciones: las tres versiones de 2026 y «Normal 2027». Sigue la versión compartida;
+    elegir una versión la comparte con los demás módulos y elegir «Normal 2027» no la cambia."""
+    nombres = list(P.ESCENARIOS)
+    _sincronizar(key, nombres, P.escenario_de_version, P.escenario_de_version(P.DEFECTO))
+    e = contenedor.selectbox(label, nombres, key=key, help=help or (P.AYUDA + " Normal 2027: presupuesto del año siguiente."),
+                             on_change=_al_elegir, args=(key, P.version_de_escenario))
+    st.session_state.setdefault(P.CLAVE_VERSION, P.version_de_escenario(e) or P.DEFECTO)
+    return e
+
+
+def version_elegida(disponibles=None) -> str:
+    """La versión compartida (sin dibujar nada), ajustada a las `disponibles` si se pasan. Para módulos sin selector propio (p. ej. la presentación)."""
+    comp = st.session_state.get(P.CLAVE_VERSION)
+    return P.elegir(disponibles, comp) if disponibles is not None else (comp or P.DEFECTO)
+
+
+# ------------------------------------------------------------------ ayudas compartidas de escritura en la base y de Excel
+def exigir_admin(ctx):
+    """Candado de permisos en la LÓGICA (no solo en la pantalla): toda escritura en la base y toda exportación con detalle de movimientos
+    exige administrador. Si un usuario normal llegara a ejecutar la función por otra ruta, se detiene aquí."""
+    if not getattr(ctx, "es_admin", False):
+        raise PermissionError("Acción reservada a administradores.")
+
+
+def a_db(v):
+    """Valor listo para la base: NaN/NaT -> None y números de numpy -> números de Python."""
+    return None if (not isinstance(v, str) and pd.isna(v)) else (v.item() if hasattr(v, "item") else v)
+
+
+def insertar_por_lotes(ctx, sql_cols: str, filas: list, lote: int = 100):
+    """INSERT de muchas filas en varias sentencias (la base remota rechaza una sola muy grande). `sql_cols` = «tabla(col1, col2…)»."""
+    if not filas:
+        return
+    n = len(filas[0])
+    for i in range(0, len(filas), lote):
+        parte = filas[i:i + lote]
+        ctx.con.execute(f"INSERT INTO {sql_cols} VALUES " + ",".join(["(" + ",".join("?" * n) + ")"] * len(parte)),
+                        tuple(v for f in parte for v in f))
+
+
+def excel_hojas(hojas: dict) -> bytes:
+    """Excel con una hoja por cada tabla de `hojas` ({nombre: DataFrame}); el nombre se recorta a 31 caracteres."""
+    from io import BytesIO
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for nombre, df in hojas.items():
+            df.to_excel(w, sheet_name=nombre[:31], index=False)
+    return buf.getvalue()
 
 
 def a_excel(df: pd.DataFrame) -> bytes:

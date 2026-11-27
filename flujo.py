@@ -716,3 +716,75 @@ def recalcular(con, empresa: str, anio: int) -> pd.DataFrame:
     con.execute("DELETE FROM flujo_lineas WHERE empresa=? AND anio=?", (empresa, int(anio)))
     con.anexar(lin, "flujo_lineas")
     return lin
+
+
+# ------------------------------------------------------------------ descarga con la estructura del reporte de cargue
+ENCABEZADO_CARGUE = ["Clase de documento", "Nº documento", "Referencia", "Fe.contabilización", "Fecha de documento",
+                     "Cuenta", "Importe en moneda local", "Texto", "Centro de coste", "Asignación",
+                     "Texto cab.documento", "Acreedor", "Deudor", "Clave referencia 1", "Clave referencia 3",
+                     "Fecha de entrada", "Nombre del usuario", "Doc.compensación", "Vencimiento neto", "Anulado con",
+                     "Modificacion manual", "Subrubro caja", "Nombre cuenta", "MES", "TERCERO"]
+ORIGEN_TXT = {"validado": "Validado en el archivo", "manual": "Corregido en el panel", "automatica": "Automática",
+              "pendiente": "Pendiente", "": "Pendiente"}
+
+
+def _fecha(x):
+    if isinstance(x, str) and x.isdigit() and 20000 < int(x) < 80000:     # número de serie de Excel
+        return (pd.Timestamp("1899-12-30") + pd.Timedelta(days=int(x))).to_pydatetime()
+    f = pd.to_datetime(x, errors="coerce")
+    return None if pd.isna(f) else f.to_pydatetime()
+
+
+def estructura_cargue(m: pd.DataFrame, cuentas: dict) -> pd.DataFrame:
+    """Movimientos guardados -> tabla con las columnas del reporte de cargue. 'Subrubro caja' lleva la
+    clasificación del panel (la que suma el flujo); 'Modificacion manual', la corrección hecha a mano en el panel.
+    Al final van el origen de la clasificación y la regla usada. Si se vuelve a cargar, entra como validado."""
+    if m.empty:
+        return pd.DataFrame(columns=ENCABEZADO_CARGUE + ["Origen de la clasificación", "Regla", "Confianza"])
+    raw = [json.loads(r) if isinstance(r, str) and r.startswith("{") else {} for r in m.get("raw", [""] * len(m))]
+    ex = lambda k: [r.get(k, "") for r in raw]  # noqa: E731
+    cod = m["cuenta_cod"].where(m["cuenta_cod"].fillna("") != "", m["cuenta"].astype(str).str.split().str[0])
+    origen = m["origen"].fillna("")
+    concepto = m["concepto"].fillna("")
+    out = pd.DataFrame({
+        "Clase de documento": m["clase"].fillna(""), "Nº documento": m["documento"].fillna(""),
+        "Referencia": m["referencia"].fillna(""), "Fe.contabilización": [_fecha(x) for x in m["fecha"]],
+        "Fecha de documento": [_fecha(x) for x in ex("fdoc")], "Cuenta": cod.fillna(""),
+        "Importe en moneda local": pd.to_numeric(m["valor"], errors="coerce"), "Texto": m["texto"].fillna(""),
+        "Centro de coste": m["cc"].fillna(""), "Asignación": ex("asignacion"),
+        "Texto cab.documento": m["cab"].fillna(""), "Acreedor": ex("acreedor"), "Deudor": ex("deudor"),
+        "Clave referencia 1": m["ref1"].fillna(""), "Clave referencia 3": m["ref3"].fillna(""),
+        "Fecha de entrada": [_fecha(x) for x in ex("fentrada")], "Nombre del usuario": ex("usuario"),
+        "Doc.compensación": m["compensacion"].fillna(""), "Vencimiento neto": [_fecha(x) for x in ex("vencimiento")],
+        "Anulado con": m["anulado"].fillna(""),
+        "Modificacion manual": concepto.where(origen == "manual", ""), "Subrubro caja": concepto,
+        "Nombre cuenta": cod.map(cuentas).fillna(""), "MES": pd.to_numeric(m["mes"], errors="coerce"),
+        "TERCERO": m["tercero"].fillna(""),
+        "Origen de la clasificación": origen.map(ORIGEN_TXT).fillna(origen),
+        "Regla": m["regla"].fillna(""), "Confianza": m["confianza"].fillna("")})
+    return out.sort_values(["Fe.contabilización", "Nº documento"], na_position="last").reset_index(drop=True)
+
+
+def excel_cargue(t: pd.DataFrame) -> bytes:
+    """Excel con una hoja 'Journal' (encabezado en la fila 1), igual al reporte que se carga."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="dd/mm/yyyy", date_format="dd/mm/yyyy") as w:
+        t.to_excel(w, sheet_name="Journal", index=False)
+        wb, ws = w.book, w.sheets["Journal"]
+        cab = wb.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#305496", "border": 1,
+                             "text_wrap": True, "valign": "vcenter"})
+        clas = wb.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#C65911", "border": 1,
+                              "text_wrap": True, "valign": "vcenter"})
+        for j, c in enumerate(t.columns):
+            ws.write(0, j, c, clas if c in ("Modificacion manual", "Subrubro caja", "Origen de la clasificación",
+                                            "Regla", "Confianza") else cab)
+        num = wb.add_format({"num_format": "#,##0.00;[Red]-#,##0.00"})
+        anchos = {"Texto": 34, "Texto cab.documento": 26, "Subrubro caja": 30, "Modificacion manual": 26,
+                  "Nombre cuenta": 34, "TERCERO": 30, "Origen de la clasificación": 22, "Referencia": 20}
+        for j, c in enumerate(t.columns):
+            ws.set_column(j, j, anchos.get(c, 14), num if c == "Importe en moneda local" else None)
+        ws.set_row(0, 30)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, len(t), len(t.columns) - 1)
+    return buf.getvalue()

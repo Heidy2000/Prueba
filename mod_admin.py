@@ -15,7 +15,8 @@ import eeff
 import flujo
 import estilo as E
 import lineas
-from ui import ADMIN, EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, ahora, empresa_de_nombre, titulo_tarjeta
+import presupuestos
+from ui import ADMIN, EMPRESAS, MESES, MESES_L, SIN_DUENO, a_excel, ahora, empresa_de_nombre, selector_presupuesto, titulo_tarjeta, version_elegida
 
 
 COLS_EJEC = ["anio", "mes", "fecha", "codigo", "rubro", "sub_rubro", "cc", "cc_nombre", "cuenta", "cuenta_nombre",
@@ -98,18 +99,15 @@ def _facturacion_manual(ctx, empresa: str, anio: int, mes: int):
 
 
 def _presentacion(ctx):
-    """Descarga la presentación financiera del mes en PowerPoint, con el fondo y la letra de la presentación de la
-    compañía: presupuesto, nómina, flujo de caja, combustible, balance y estado de resultados."""
+    """Descarga la presentación financiera del mes en PowerPoint, con el fondo y la letra de la presentación de la compañía.
+    Todos los comparativos usan el presupuesto elegido aquí (que es el mismo que se elige en los módulos)."""
     import presentacion
     leer = ctx.leer
     with st.container(key="card_presentacion"):
         titulo_tarjeta("Presentación financiera del mes",
-                       "PowerPoint con el mismo fondo y la misma letra de la presentación de la compañía. Abre con un "
-                       "resumen del mes y sigue con cada tema en diapositivas aparte, con su titular, tarjetas de "
-                       "resumen y gráficas de variaciones (verde a favor, rojo en contra). Las tablas, las gráficas "
-                       "y los "
-                       "comentarios quedan editables en PowerPoint.")
-        c = st.columns([1.3, .7, 1, 1.1], vertical_alignment="bottom")
+                       "PowerPoint con el fondo y la letra de la presentación de la compañía: un resumen del mes y cada tema en su diapositiva, con "
+                       "titular, tarjetas y gráficas de variaciones (verde a favor, rojo en contra). Todo queda editable en PowerPoint.")
+        c = st.columns([1.3, .7, 1, 1.2], vertical_alignment="bottom")
         empresa = c[0].selectbox("Compañía", list(EMPRESAS), key="pr_empresa",
                                  format_func=lambda e: f"{e} · {EMPRESAS[e]}")
         anios = sorted(set(leer("SELECT DISTINCT anio FROM ejecucion WHERE empresa=?", (empresa,))["anio"])
@@ -121,20 +119,38 @@ def _presentacion(ctx):
         ult = int(ult) if pd.notna(ult) else datetime.now().month
         mes = c[2].selectbox("Mes", list(range(1, 13)), index=ult - 1, key=f"pr_mes_{empresa}_{anio}",
                              format_func=lambda m: MESES_L[m - 1].capitalize())
-        versiones = leer("SELECT DISTINCT version FROM presupuesto WHERE anio=? AND empresa=?",
-                         (anio, empresa))["version"].tolist()
-        orden_v = {"Inicial": 0, "4+8": 1, "8+4": 2}
-        versiones = sorted(versiones, key=lambda v: (orden_v.get(v, 9), v)) or ["Inicial"]
-        version = c[3].selectbox("Presupuesto", versiones, index=len(versiones) - 1, key=f"pr_ver_{empresa}_{anio}",
-                                 format_func=lambda v: f"Presupuesto {v}")
+        version = selector_presupuesto(c[3], presupuestos.VERSIONES, "pr_version", "Comparar contra",
+                                       help=presupuestos.AYUDA + " Es el mismo presupuesto que se elige en los módulos: todas las diapositivas lo usan.")
         _facturacion_manual(ctx, empresa, anio, mes)
-        secciones = st.pills("Diapositivas", presentacion.SECCIONES, selection_mode="multi",
-                             default=presentacion.SECCIONES, key="pr_secciones")
-        clave = (empresa, anio, mes, version, tuple(secciones or ()))
-        if st.button("Preparar presentación", type="primary", icon=":material/slideshow:", key="pr_generar",
-                     disabled=not secciones):
+
+        # ---- diapositivas: por tema, con una marca de si hay datos del mes
+        disp = presentacion.disponibilidad(leer, empresa, anio, mes, version)
+        claves = {g: f"pr_sel_{g}" for g in presentacion.GRUPOS}
+        for g, nombres in presentacion.GRUPOS.items():           # primera vez: marcadas las que tienen datos
+            if claves[g] not in st.session_state:
+                st.session_state[claves[g]] = [n for n in nombres if disp[n][0]]
+
+        def _marcar(modo: str):
+            for g_, nombres_ in presentacion.GRUPOS.items():
+                st.session_state[claves[g_]] = [n for n in nombres_ if modo == "todas" or (modo == "con_datos" and disp[n][0])]
+
+        st.markdown("**Diapositivas**")
+        b = st.columns([1, 1, 1, 4])
+        b[0].button("Las que tienen datos", key="pr_b_datos", on_click=_marcar, args=("con_datos",), icon=":material/task_alt:", width="stretch")
+        b[1].button("Todas", key="pr_b_todas", on_click=_marcar, args=("todas",), icon=":material/select_all:", width="stretch")
+        b[2].button("Ninguna", key="pr_b_ninguna", on_click=_marcar, args=("ninguna",), icon=":material/deselect:", width="stretch")
+        for g, nombres in presentacion.GRUPOS.items():
+            st.pills(g, nombres, selection_mode="multi", key=claves[g], format_func=lambda n: f"{'✓' if disp[n][0] else '⚠'} {n}")
+        elegidas = [n for n in presentacion.SECCIONES if any(n in (st.session_state.get(k) or []) for k in claves.values())]
+        sin_datos = [f"{n} ({disp[n][1]})" for n in elegidas if not disp[n][0]]
+        st.caption("✓ hay datos de este mes · ⚠ faltan datos (la diapositiva se omite y se avisa al terminar)."
+                   + (" Elegidas sin datos: " + " · ".join(sin_datos) + "." if sin_datos else ""))
+
+        clave = (empresa, anio, mes, version, tuple(elegidas))
+        if st.button(f"Preparar presentación · {len(elegidas)} diapositivas · {presupuestos.etiqueta(version)}", type="primary",
+                     icon=":material/slideshow:", key="pr_generar", disabled=not elegidas):
             with st.spinner("Armando las diapositivas…"):
-                contenido, avisos = presentacion.generar(leer, empresa, anio, mes, version, secciones, ctx=ctx)
+                contenido, avisos = presentacion.generar(leer, empresa, anio, mes, version, elegidas, ctx=ctx)
             st.session_state["pr_listo"] = (clave, contenido, avisos)
         listo = st.session_state.get("pr_listo")
         if listo and listo[0] == clave:
@@ -147,7 +163,7 @@ def _presentacion(ctx):
                                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                                    icon=":material/download:", key="pr_bajar")
                 st.caption("Los comentarios se redactan solos con las mayores variaciones del mes: revísalos y "
-                           "ajústalos en PowerPoint antes de presentar. Incluye cifras de nómina por área y cargo.")
+                           "ajústalos en PowerPoint antes de presentar.")
             else:
                 st.info("No hay información de ese mes para armar las diapositivas elegidas.")
 
@@ -1265,19 +1281,23 @@ def _cargar_nomina(ctx):
                                "+ bonificación extralegal + % seg. × (salario + bonificación + horas) + % vacaciones × "
                                "(salario + bonificación) + % prestacional × (salario + bonificación + horas + "
                                "transporte)) × personas del mes.")
+                version = st.selectbox("Presupuesto al que corresponde el archivo", list(presupuestos.VERSIONES),
+                                       index=list(presupuestos.VERSIONES).index(version_elegida()), key=f"nom_ver_{archivo.name}",
+                                       format_func=presupuestos.etiqueta, help=presupuestos.AYUDA)
+                sin_version = " OR version IS NULL OR version=''" if version == presupuestos.V84 else ""       # lo cargado antes de las versiones era el 8+4
                 ya_pp = [int(a) for a in res.index
-                         if not leer("SELECT 1 FROM nomina_ppto WHERE empresa=? AND anio=? LIMIT 1",
-                                     (emp, int(a))).empty]
+                         if not leer(f"SELECT 1 FROM nomina_ppto WHERE empresa=? AND anio=? AND (version=?{sin_version}) LIMIT 1",
+                                     (emp, int(a), version)).empty]
                 if ya_pp:
-                    st.caption(f"Reemplaza el presupuesto de nómina de {emp} ya cargado para "
+                    st.caption(f"Reemplaza el presupuesto {version} de nómina de {emp} ya cargado para "
                                + ", ".join(map(str, ya_pp)) + ".")
-                if st.button(f"Cargar presupuesto de nómina de {emp}", type="primary", key="nom_ok_ppto"):
+                if st.button(f"Cargar presupuesto {version} de nómina de {emp}", type="primary", key="nom_ok_ppto"):
                     for a in res.index:
-                        con.execute("DELETE FROM nomina_ppto WHERE empresa=? AND anio=?", (emp, int(a)))
-                    con.anexar(d.assign(empresa=emp), "nomina_ppto")
+                        con.execute(f"DELETE FROM nomina_ppto WHERE empresa=? AND anio=? AND (version=?{sin_version})", (emp, int(a), version))
+                    con.anexar(d.assign(empresa=emp, version=version), "nomina_ppto")
                     con.commit()
                     ctx.registrar_carga(usuario, "Nómina presupuesto", archivo.name,
-                                        f"{emp} · {len(res)} años · {E.millones(d['valor'].sum())}")
+                                        f"{emp} {version} · {len(res)} años · {E.millones(d['valor'].sum())}")
                     st.success("Presupuesto de nómina cargado.")
                     st.rerun()
             elif tipo == "ejec":
@@ -1652,15 +1672,11 @@ def _flujo_revisar(ctx):
         buscar = c3.text_input("Buscar", placeholder="Tercero, texto, documento…", key="fl_rev_buscar")
         del_mes = mov[(mov["anio"] == per[0]) & (mov["mes"] == per[1])]
 
-        def _cargue(d=del_mes):
+        def _cargue(d):
             cu = leer("SELECT cuenta, nombre FROM flujo_cuentas WHERE empresa=?", (emp,))
             return flujo.excel_cargue(flujo.estructura_cargue(d, dict(zip(cu["cuenta"], cu["nombre"]))))
         # descargas de movimientos de caja (antes también estaban en el módulo Flujo de caja → Movimientos)
         del_anio = mov[mov["anio"] == per[0]]
-
-        def _cargue_anio(d=del_anio):
-            cu = leer("SELECT cuenta, nombre FROM flujo_cuentas WHERE empresa=?", (emp,))
-            return flujo.excel_cargue(flujo.estructura_cargue(d, dict(zip(cu["cuenta"], cu["nombre"]))))
 
         def _plano(d):
             cols = [c for c in ["fecha", "anio", "mes", "concepto", "tercero", "texto", "documento", "cuenta", "valor",
@@ -1668,13 +1684,13 @@ def _flujo_revisar(ctx):
             return a_excel(d.sort_values("fecha")[cols] if "fecha" in d.columns else d[cols])
         dl1, dl2, dl3 = st.columns(3)
         dl1.download_button(f"{MESES[per[1] - 1]} {per[0]} · estructura de cargue y clasificación",
-                            _cargue, f"flujo_caja_{emp}_{per[0]}{per[1]:02d}_journal.xlsx", key="fl_rev_cargue",
+                            lambda: _cargue(del_mes), f"flujo_caja_{emp}_{per[0]}{per[1]:02d}_journal.xlsx", key="fl_rev_cargue",
                             icon=":material/download:", width="stretch",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             help="Todos los movimientos del mes con las columnas del reporte de SAP que se carga. "
                                  "'Subrubro caja' trae la clasificación del panel; 'Modificacion manual', lo corregido "
                                  "a mano. Si lo vuelves a cargar, entra como validado.")
-        dl2.download_button(f"Año {per[0]} · estructura de cargue y clasificación", _cargue_anio,
+        dl2.download_button(f"Año {per[0]} · estructura de cargue y clasificación", lambda: _cargue(del_anio),
                             f"flujo_caja_{emp}_{per[0]}_journal.xlsx", key="fl_rev_cargue_anio",
                             icon=":material/download:", width="stretch",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

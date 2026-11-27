@@ -8,12 +8,10 @@ from io import BytesIO
 
 import pandas as pd
 
-# escenario -> año de la ejecución, meses que cubre y hoja del Excel de presupuesto
-# UPA 2026 = últimos cuatro meses de 2026 (septiembre a diciembre): SUPUESTO, confirmar con Financiera
-ESCENARIOS = {
-    "UPA 2026": dict(anio=2026, meses=(9, 12), hoja="2026"),
-    "Normal 2027": dict(anio=2027, meses=(1, 12), hoja="2027"),
-}
+import presupuestos as P
+
+# escenario -> año de la ejecución, meses que cubre, hoja del Excel de presupuesto y versión (se definen en presupuestos.py)
+ESCENARIOS = P.ESCENARIOS
 SUBRUBRO_FLOTA = "Flota y Equipo de transporte"
 CONCEPTO_TECNO = "TECNOMECANICA"
 CONCEPTO_SOAT = "SOAT"
@@ -291,7 +289,7 @@ def _es_mes(c) -> bool:
 def leer_ts(hojas: dict[str, tuple[str, pd.DataFrame]]) -> tuple[pd.DataFrame, dict]:
     """Presupuesto de Tecnomecánica y SOAT. `hojas` = {concepto: (nombre de la hoja, hoja leída con encabezado)}.
     Cada hoja: una fila por placa, una columna por mes (se conservan TODOS los meses del archivo, incluidos los
-    ceros), una columna TOTAL y una fila «TOTAL MES». OJO: la columna TOTAL del archivo suma solo 2027; el UPA
+    ceros), una columna TOTAL y una fila «TOTAL MES». OJO: la columna TOTAL del archivo suma solo 2027; el 8+4
     (sep–dic 2026) se lee mes a mes. Se valida cada mes contra la fila «TOTAL MES».
     Devuelve (largo: placa, concepto, anio, mes, valor, texto_original ; info)."""
     partes, info = [], {"hojas": {}, "duplicadas": [], "placas": set()}
@@ -338,7 +336,7 @@ def leer_ts(hojas: dict[str, tuple[str, pd.DataFrame]]) -> tuple[pd.DataFrame, d
 
 def ts_periodo(ts_mensual: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """Presupuesto de Tecnomecánica y SOAT del escenario, en el mismo formato largo del presupuesto de flota
-    (es_global = 2): suma los meses del escenario (UPA = sep–dic 2026; Normal 2027 = ene–dic 2027)."""
+    (es_global = 2): suma los meses del escenario (ventana de cada versión en presupuestos.ESCENARIOS)."""
     cols = ["placa", "numero_interno", "tipo", "concepto", "orden", "valor", "es_global", "texto_original"]
     if ts_mensual is None or ts_mensual.empty:
         return pd.DataFrame(columns=cols).astype({"valor": float, "orden": float, "es_global": int})
@@ -1507,7 +1505,7 @@ def exportar_excel(vistas_emp: dict, ts_mensual: pd.DataFrame, cfg: dict) -> byt
 
 
 # ================================================================== Excel «Soporte de ejecución de mantenimiento»
-# Réplica del archivo que hoy se arma a mano: hoja «Presupuesto» (UPA vs ejecución por sub-rubro del rubro, por mes) y una
+# Réplica del archivo que hoy se arma a mano: hoja «Presupuesto» (presupuesto 8+4 vs ejecución por sub-rubro del rubro, por mes) y una
 # hoja por sub-rubro con los movimientos de SAP tal como llegaron (mismas 23 columnas).
 SAP_COLUMNAS = ["Nº docum.r", "Denom.clase de coste", "Fecha de documento", "Nº docum.refer.", "Valor/mon.inf.",
                 "Texto de cabecera de documento", "Cta.contrapartida", "Denominacion cuenta contrapartida", "Centro de coste",
@@ -1648,7 +1646,7 @@ def desde_mes(cfg: dict) -> int:
 
 def tabla_subrubros(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, hasta_mes: int) -> pd.DataFrame:
     """Resumen por sub-rubro: presupuesto, ejecutado hasta el corte, saldo, % y estado. Con un solo mes (`cfg["desde"]`) el presupuesto es el
-    de ese mes; en el acumulado es el del escenario completo."""
+    de ese mes; en el acumulado es el presupuesto total."""
     nombres, orden, p, e = serie_subrubros(ppto, ejec, cfg)
     m0 = desde_mes(cfg)
     solo_mes = "desde" in cfg
@@ -1787,7 +1785,7 @@ def escribir_hoja_movimientos(wb, nombre: str, columnas: list, filas: list, form
     return hoja
 
 
-def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = "UPA",
+def exportar_soporte(ppto: pd.DataFrame, ejec: pd.DataFrame, cfg: dict, mes: int, rotulo: str = P.V84,
                      detalle_meses: bool = False, num_cuenta: dict | None = None, sin_hoja: tuple = ()) -> bytes:
     """Excel de ejecución de Mantenimiento de UNA compañía:
     - «Resumen»: presupuesto (`rotulo`) de todos los meses del escenario y EJECUCION mes a mes hasta `mes`, por sub-rubro. Los totales son fórmulas.
@@ -1873,9 +1871,7 @@ SISPO_OPCIONALES = {"NOMBRECTA": "cuenta", "CIERRE": "cierre", "EMPRESAAGENCIA":
 PREFIJO_ID_SINTETICO = "FILA-"
 
 
-def _canon(x) -> str:
-    """Solo letras y números en mayúsculas y sin tildes: compara nombres sin importar espacios, signos ni mayúsculas."""
-    return re.sub(r"[^A-Z0-9]", "", sin_tildes(_como_texto(x)).upper())
+_canon = norm_placa      # misma normalización (solo letras y números en mayúsculas, sin tildes): se usa para comparar nombres sin importar espacios ni signos
 
 
 def cuenta_cod(x) -> str:
