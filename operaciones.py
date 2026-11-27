@@ -944,6 +944,7 @@ def _resumen_libro(info: dict, version: str = P.DEFECTO) -> pd.DataFrame:
 
 def _admin_presupuesto(ctx, empresa: str):
     exigir_admin(ctx)
+    _asegurar_tablas(ctx)                 # agrega la columna `version` si la base es anterior a las versiones del presupuesto
     cargado = ctx.leer("SELECT version, hoja, COUNT(*) filas, SUM(valor) total FROM oper_ppto WHERE empresa=? GROUP BY version, hoja", (empresa,))
     if cargado.empty:
         st.caption(f"{empresa}: todavía no hay presupuesto de Operaciones cargado.")
@@ -1652,6 +1653,7 @@ def _descarga_ejecucion(S0):
 def _cargar_datos(ctx, cfg: dict) -> SimpleNamespace:
     """Todo lo que lee la pantalla de Operaciones de la base (presupuesto, SISPO guardado, asignaciones) y la ejecución por compañía.
     Sin elementos de pantalla: la usan la página y la presentación."""
+    _asegurar_tablas(ctx)
     leer = ctx.leer
     mapeo = {r.sub_norm: ("Bolsas" if r.hoja == "Otros" else r.hoja) for r in leer("SELECT sub_norm, hoja FROM oper_mapeo").itertuples()}
     asig = asignacion.mapa(leer)

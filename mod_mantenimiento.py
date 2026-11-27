@@ -140,6 +140,7 @@ def _universo(ejec: pd.DataFrame, asig) -> pd.DataFrame:
 def _datos_empresa(ctx, empresa: str, cfg: dict, asig) -> SimpleNamespace:
     """Todo lo de UNA compañía: presupuesto base, ejecución, presupuesto de flota y de Tecnomecánica/SOAT. Cada compañía se
     carga y se lee por separado; sus movimientos salen marcados con su compañía."""
+    _asegurar_tablas(ctx)
     leer = ctx.leer
     version = P.version_para(leer, empresa, cfg["anio"], cfg.get("version"))
     ppto_base, ejec = _base(ctx, empresa, cfg["anio"], version)
@@ -3113,6 +3114,7 @@ def _notas_encabezado(archivo, hoja: str) -> dict:
 
 def _admin_datos(ctx):
     exigir_admin(ctx)
+    _asegurar_tablas(ctx)                 # agrega la columna `version` de Tecnomecánica/SOAT si la base es anterior
     oficial = set(ctx.leer("SELECT placa FROM mtto_placas")["placa"])
     with st.expander("Datos base · placas, presupuesto de flota, histórico y Tecnomecánica/SOAT (administrador)",
                      icon=":material/settings:"):
