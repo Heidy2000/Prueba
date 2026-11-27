@@ -1950,13 +1950,14 @@ def _ts_concepto(S, concepto: str, k: str):
     tp, te, tm = _totales(nodos)
     _kpis(tp, te, tm, S.hasta, _sub_pres(S, f"{S.escenario}") + (f" · placa {S.placa}" if S.placa else ""))
 
-    resumen = _resumen_grupos(nodos, lambda n: GRUPO_CON if n["presupuesto"] > 0 else GRUPO_SIN, total=True)
-    orden = {GRUPO_CON: 0, GRUPO_SIN: 1, "Total": 2}
-    resumen = resumen.sort_values("grupo", key=lambda c: c.map(orden)).reset_index(drop=True)
-    with st.container(key=f"mt_card_ts_grupos_{k}"):
-        titulo_tarjeta(f"{concepto.capitalize() if concepto != L.CONCEPTO_SOAT else 'SOAT'}: vehículos con y sin presupuesto asignado",
-                       f"{S.escenario} · ejecutado {S.hasta} · «{GRUPO_SIN}» = placas sin presupuesto de este concepto (con o sin ejecución)")
-        _tabla_barras(resumen[["grupo", "placas", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]], "Grupo", "grupo", 40 + 35 * len(resumen))
+    if not S.es_admin:                  # el administrador ve estos mismos grupos, ya desplegables en placas, en «Detalle por vehículo»
+        resumen = _resumen_grupos(nodos, lambda n: GRUPO_CON if n["presupuesto"] > 0 else GRUPO_SIN, total=True)
+        orden = {GRUPO_CON: 0, GRUPO_SIN: 1, "Total": 2}
+        resumen = resumen.sort_values("grupo", key=lambda c: c.map(orden)).reset_index(drop=True)
+        with st.container(key=f"mt_card_ts_grupos_{k}"):
+            titulo_tarjeta(f"{concepto.capitalize() if concepto != L.CONCEPTO_SOAT else 'SOAT'}: vehículos con y sin presupuesto asignado",
+                           f"{S.escenario} · ejecutado {S.hasta} · «{GRUPO_SIN}» = placas sin presupuesto de este concepto (con o sin ejecución)")
+            _tabla_barras(resumen[["grupo", "placas", "presupuesto", "ejecutado", "saldo", "pct", "estado", "movimientos"]], "Grupo", "grupo", 40 + 35 * len(resumen))
     e = _movs(S, L.AMB_TS)
     e = e[e["concepto"] == concepto]
     if S.es_admin:
